@@ -1,6 +1,7 @@
 import math
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, Union
 
+import torch
 from lightning import pytorch as pl
 from pydantic import BaseModel, Field, field_validator
 from torch import Tensor, flatten, nn, unflatten
@@ -44,12 +45,12 @@ class Encoder(nn.Module):
         super().__init__()
         self.layer1 = ann.Layer(dfa.Linear(n_inputs, n_h1, error_features=n_inputs), nn.GELU())
         self.layer2 = ann.Layer(dfa.Linear(n_h1, n_h2, error_features=n_inputs), nn.GELU())
-        self.latent = ann.Layer(dfa.Linear(n_h2, n_latents, error_features=n_inputs), nn.GELU())
+        self.latent = ann.Layer(nn.Linear(n_h2, n_latents), nn.GELU())
 
     def forward(self, sensors: Tensor) -> Tensor:
         x = self.layer1(sensors)
         x = self.layer2(x)
-        return self.latent(x)
+        return self.latent(x.detach())
 
     def feedback(self, reconstruction_err: Tensor) -> None:
         self.layer2.synapses.feedback(reconstruction_err, context=self.layer2.neurons)
@@ -102,6 +103,14 @@ class Autoencoder(pl.LightningModule):
         latent = self.encoder(flatten(sensors, start_dim=1))
         reconstruction = unflatten(self.decoder(latent), 1, sensors.shape[1:])
         return reconstruction, latent
+
+    @torch.inference_mode()
+    def encode(self, sensors: Tensor) -> Tensor:
+        return self.encoder(flatten(sensors, start_dim=1))
+
+    @torch.inference_mode()
+    def decode(self, latent: Tensor) -> Tensor:
+        return unflatten(self.decoder(latent), 1, self.config.output_shape)
 
     # -----------------------------------------------------------------------------------
     def compute_feedback(self, outputs: Tensor, batch: Tensor) -> List[Tensor]:
