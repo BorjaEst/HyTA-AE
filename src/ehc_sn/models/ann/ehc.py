@@ -59,14 +59,14 @@ class ModelParams(BaseModel):
 
 # -------------------------------------------------------------------------------------------
 class MEC(nn.Module):
-    def __init__(self, dim_V: int, dim_III: int, dim_II: int, dim_dg: int):
+    def __init__(self, dim_V: int, dim_III: int, dim_II: int):
         super().__init__()
         self.layerIII = ann.Layer(dfa.Linear(dim_V, dim_III, error_features=dim_V), nn.GELU())
-        self.layerII = ann.Layer(dfa.Linear(dim_III, dim_II, error_features=dim_V), nn.GELU())
+        self.layerII = ann.Layer(dfa.Linear(dim_V, dim_II, error_features=dim_V), nn.GELU())
 
     def forward(self, sensors: Tensor) -> None:
-        x = self.layerIII(sensors)
-        self.layerII(x)  # !! we need to take sensors as input for layerII
+        self.layerIII(sensors)
+        self.layerII(sensors)
 
     def feedback(self, reconstruction_err: Tensor) -> None:
         self.layerII.synapses.feedback(reconstruction_err, context=self.layerII.neurons)
