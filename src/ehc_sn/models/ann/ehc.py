@@ -18,9 +18,10 @@ class ModelParams(BaseModel):
     model_config = {"extra": "forbid", "arbitrary_types_allowed": True}
 
     # MEC and hpc components
-    latent_units: int = Field(default=2024, gt=0, description="Dimensionality of the latent code.")
-    layer2_units: int = Field(default=512, gt=0, description="Number of hidden units per layer.")
-    layer1_units: int = Field(default=1024, gt=0, description="Number of hidden units per layer.")
+    dg_units: int = Field(default=2024, gt=0, description="Dimensionality of the Dentate Gyrus units.")
+    ca3_units: int = Field(default=512, gt=0, description="Number of Cornu Ammonis area 3 units.")
+    ca1_units: int = Field(default=1024, gt=0, description="Number of Cornu Ammonis area 1 units.")
+    # subiculum_units: int = Field(default=2048, gt=0, description="Number of Subiculum units.")
     output_shape: List[int] = Field([25, 25], description="Dimensionality of the input and output.")
 
     # Training parameters
@@ -30,7 +31,7 @@ class ModelParams(BaseModel):
     def units(self) -> List[int]:
         """Return list of layer sizes from input to latent."""
         output_units = math.prod(self.output_shape)
-        return [output_units, self.layer1_units, self.layer2_units, self.latent_units]
+        return [output_units, self.ca1_units, self.ca3_units, self.dg_units]
 
     @field_validator("output_shape")
     def check_output_shape(cls, v: List[int]) -> List[int]:
@@ -41,11 +42,11 @@ class ModelParams(BaseModel):
 
 # -------------------------------------------------------------------------------------------
 class MEC(nn.Module):
-    def __init__(self, n_inputs: int, n_h1: int, n_h2: int, n_latents: int):
+    def __init__(self, dim_V: int, dim_III: int, dim_II: int, dim_dg: int):
         super().__init__()
-        self.layerIII = ann.Layer(dfa.Linear(n_inputs, n_h1, error_features=n_inputs), nn.GELU())
-        self.layerII = ann.Layer(dfa.Linear(n_h1, n_h2, error_features=n_inputs), nn.GELU())
-        self.dg = ann.Layer(dfa.Linear(n_h2, n_latents, error_features=n_inputs), nn.GELU())
+        self.layerIII = ann.Layer(dfa.Linear(dim_V, dim_III, error_features=dim_V), nn.GELU())
+        self.layerII = ann.Layer(dfa.Linear(dim_III, dim_II, error_features=dim_V), nn.GELU())
+        self.dg = ann.Layer(dfa.Linear(dim_II, dim_dg, error_features=dim_V), nn.GELU())
 
     def forward(self, sensors: Tensor) -> Tensor:
         x = self.layerIII(sensors)

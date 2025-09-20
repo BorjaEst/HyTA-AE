@@ -8,6 +8,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from ehc_sn.core.datamodule import BaseDataModule, DataModuleParams
 from ehc_sn.core.trainer import TrainerParams
 from ehc_sn.data.obstacle_maps import DataGenerator, DataParams
+from ehc_sn.figures.decoder_montage import DecoderMontageFigure
+from ehc_sn.figures.decoder_montage import DecoderMontageParams as Figure3Params
 from ehc_sn.figures.reconstruction_map import ReconstructionMapFigure
 from ehc_sn.figures.reconstruction_map import ReconstructionMapParams as Figure1Params
 from ehc_sn.figures.sparsity import SparsityFigure
@@ -26,6 +28,7 @@ class Experiment(BaseSettings):
 
     figure_1: Figure1Params = Field(default_factory=Figure1Params, description="Reconstruction figure parameters")
     figure_2: Figure2Params = Field(default_factory=Figure2Params, description="Sparsity figure parameters")
+    figure_3: Figure3Params = Field(default_factory=Figure3Params, description="Decoder montage figure parameters")
 
     trainer: TrainerParams = Field(
         default_factory=lambda: TrainerParams(experiment_name="ehc"),
@@ -72,6 +75,17 @@ def gen_figures(model: EHC, datamodule: BaseDataModule, experiment: Experiment) 
 
     sparsity_figure = SparsityFigure(experiment.figure_2)
     _ = sparsity_figure.plot(activations)
+    plt.show()
+
+    latent_dim = experiment.model.latent_units  # Number of latent units
+    latents = torch.eye(latent_dim)[:18]  # One-hot encoding for each unit
+
+    # Generate decoder outputs for one-hot latents
+    reconstructions = model.decode(latents)
+
+    # Figure 3: Decoder montage showing individual latent unit reconstructions
+    decoder_montage_figure = DecoderMontageFigure(experiment.figure_3)
+    _ = decoder_montage_figure.plot(latents, reconstructions)
     plt.show()
 
 
