@@ -5,6 +5,7 @@ import torch
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from ehc_sn.augmentation.incomplete_maps import Augmentation, ComposeParams
 from ehc_sn.core.datamodule import BaseDataModule, DataModuleParams
 from ehc_sn.core.trainer import TrainerParams
 from ehc_sn.data.obstacle_maps import DataGenerator, DataParams
@@ -24,6 +25,7 @@ class Experiment(BaseSettings):
 
     model_config = SettingsConfigDict(extra="forbid", cli_parse_args=True)
 
+    augmentation: ComposeParams = Field(default_factory=ComposeParams, description="Data augmentation parameters")
     data: DataParams = Field(default_factory=DataParams, description="Data generation parameters")
     datamodule: DataModuleParams = Field(default_factory=DataModuleParams, description="Data module parameters")
     model: ModelParams = Field(default_factory=ModelParams, description="Autoencoder parameters")
@@ -41,8 +43,8 @@ class Experiment(BaseSettings):
 # -------------------------------------------------------------------------------------------
 def main(experiment: Experiment) -> None:
     """Run the hybrid autoencoder experiment."""
-    # Generate data and initialize components
-    data_gen = DataGenerator(experiment.data)
+    augmentation = Augmentation(experiment.augmentation)
+    data_gen = DataGenerator(experiment.data, augmentation)
     datamodule = BaseDataModule(data_gen, experiment.datamodule)
     trainer = FeedbackTainer(experiment.trainer)
     model = Autoencoder(experiment.model, trainer)
@@ -64,7 +66,7 @@ def gen_figures(model: Autoencoder, datamodule: BaseDataModule, experiment: Expe
     test_dataloader = datamodule.test_dataloader()
 
     try:
-        inputs, _ = next(iter(test_dataloader))
+        inputs, targets = next(iter(test_dataloader))
     except StopIteration:
         print("No test data available for plotting.")
         return
@@ -72,10 +74,12 @@ def gen_figures(model: Autoencoder, datamodule: BaseDataModule, experiment: Expe
     with torch.inference_mode():
         outputs, activations = model(inputs)
 
+    # Figure 1: Reconstruction map comparing inputs and outputs
     fig_reconstruction = ReconstructionMapFigure(experiment.figure_1)
-    _ = fig_reconstruction.plot(inputs, outputs)
+    _ = fig_reconstruction.plot(targets, outputs)
     plt.show()
 
+    # Figure 2: Sparsity plot showing latent activations
     sparsity_figure = SparsityFigure(experiment.figure_2)
     _ = sparsity_figure.plot(activations)
     plt.show()

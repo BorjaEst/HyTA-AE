@@ -132,8 +132,10 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     def apply_feedback(self, feedback: List[Tensor]) -> None:
         (sensors, labels, reconstruction, latent, mask) = feedback
-        reconstruction_err = reconstruction - labels  # Gate DFA error by observed pixels only
-        reconstruction_err = flatten(reconstruction_err, start_dim=1) * flatten(mask, start_dim=1)
+        # Gate DFA error by observed pixels only, using full labels.
+        mask_f = mask.to(reconstruction.dtype)
+        reconstruction_err = reconstruction - labels
+        reconstruction_err = flatten(reconstruction_err, start_dim=1) * flatten(mask_f, start_dim=1)
         self.encoder.feedback(reconstruction_err)
         self.sparsity_loss(latent).backward()
         self.decoder.feedback(self.encoder)

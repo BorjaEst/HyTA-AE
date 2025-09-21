@@ -5,7 +5,7 @@ Uses deterministic seeding per sample for reproducible training data.
 Environment ID determines output dimensions naturally.
 """
 
-from typing import Tuple
+from typing import Callable, Optional, Tuple
 
 import gymnasium as gym
 import minigrid.envs  # noqa: F401
@@ -37,15 +37,24 @@ class MiniGridDataset(Dataset):
     - Output size determined by environment specification
     """
 
-    def __init__(self, n_samples: int, params: MiniGridParams):
+    def __init__(
+        self,
+        n_samples: int,
+        params: MiniGridParams,
+        transform: Optional[Callable[[Tensor], Tuple[Tensor, Tensor] | Tensor]] = None,
+    ):
         """Initialize MiniGrid dataset.
 
         Args:
             n_samples: Number of samples in the dataset
             params: Map generation parameters
+            transform: Optional callable. If it returns a tuple (x, y), it is used
+                       directly. If it returns a Tensor, it is used as both input
+                       and target (autoencoder).
         """
         self.n_samples = n_samples
         self.params = params
+        self.transform = transform
 
     def __len__(self) -> int:
         """Return the number of samples in the dataset."""
@@ -69,6 +78,16 @@ class MiniGridDataset(Dataset):
             env_id=self.params.env_id,
         )
 
+        # Apply optional transform/augmentation
+        if self.transform is not None:
+            out = self.transform(map_tensor)
+            if isinstance(out, tuple) and len(out) == 2:
+                return out  # (input, target)
+            elif isinstance(out, torch.Tensor):
+                return out, out  # autoencoder identity
+            else:
+                raise TypeError("Transform must return Tensor or (Tensor, Tensor)")
+
         # For autoencoder, target is the same as input
         return map_tensor, map_tensor
 
@@ -81,13 +100,19 @@ class MiniGridGenerator:
     Lightning's DataModule and DataLoader systems.
     """
 
-    def __init__(self, params: MiniGridParams):
+    def __init__(
+        self,
+        params: MiniGridParams,
+        transform: Optional[Callable[[Tensor], Tuple[Tensor, Tensor] | Tensor]] = None,
+    ):
         """Initialize MiniGrid generator with parameters.
 
         Args:
             params: Map generation parameters
+            transform: Optional transform/augmentation callable applied in the dataset
         """
         self.params = params
+        self.transform = transform
 
     def __call__(self, n_samples: int) -> Dataset:
         """Create a dataset with the specified number of samples.
@@ -98,7 +123,7 @@ class MiniGridGenerator:
         Returns:
             Dataset object that yields individual MiniGrid map samples
         """
-        return MiniGridDataset(n_samples, self.params)
+        return MiniGridDataset(n_samples, self.params, transform=self.transform)
 
 
 # -------------------------------------------------------------------------------------------
@@ -176,6 +201,10 @@ def _extract_grid(env) -> Tensor:
 if __name__ == "__main__":
     # Test different environment sizes
     print("=== Testing Environment-First MiniGrid Generation ===")
+    import matplotlib.pyplot as plt
+
+    from ehc_sn.figures.binary_map import BinaryMapFigure
+    from ehc_sn.utils.maps import wall_density
 
     environments = [
         "MiniGrid-Empty-8x8-v0",
@@ -194,19 +223,24 @@ if __name__ == "__main__":
         map_tensor2 = generate(seed=42, env_id=env_id)
         print(f"Deterministic: {torch.equal(map_tensor, map_tensor2)}")
 
-        # Show wall density
-        from ehc_sn.utils.maps import wall_density
-
         density = wall_density(map_tensor[0:1])  # walls channel only
         print(f"Wall density: {density:.3f}")
 
     # Test dataset interface
     print(f"\n--- Testing Dataset Interface ---")
-    params = MiniGridParams(env_id="MiniGrid-MemoryS13Random-v0")
+    params = MiniGridParams(env_id="MiniGrid-MultiRoom-N6-v0")
     generator = MiniGridGenerator(params)
     dataset = generator(n_samples=3)
 
     print(f"Dataset length: {len(dataset)}")
-    for i in range(2):
-        map_tensor, target = dataset[i]
-        print(f"Sample {i}: {map_tensor.shape}")
+    for i in range(len(dataset)):
+        x, _ = dataset[i]
+        print(f"Sample {i}: {x.shape}")
+
+    # Visualize last sample
+    last_idx = len(dataset) - 1
+    map_tensor, _ = dataset[last_idx]
+    figure = BinaryMapFigure()
+    fig = figure.plot(map_tensor[0])  # walls channel
+    fig.suptitle(f"Sample {last_idx} Walls")
+    plt.show()
