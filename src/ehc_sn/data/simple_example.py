@@ -30,17 +30,28 @@ class SyntheticDataset(Dataset):
     - Generates single samples in __getitem__ (not batches)
     - Uses deterministic seeding per sample for reproducibility
     - Scales well with large datasets (no precomputation)
+
+    Optional transform contract:
+      - If provided and returns (x, y), that tuple is used.
+      - If it returns a Tensor, it is used as both input and target.
     """
 
-    def __init__(self, n_samples: int, params: DataParams):
+    def __init__(
+        self,
+        n_samples: int,
+        params: DataParams,
+        transform: Optional[Callable[[Tensor], Tuple[Tensor, Tensor] | Tensor]] = None,
+    ):
         """Initialize synthetic dataset.
 
         Args:
             n_samples: Number of samples in the dataset
             params: Data generation parameters
+            transform: Optional transform/augmentation callable
         """
         self.n_samples = n_samples
         self.params = params
+        self.transform = transform
 
         # Precompute feature group mappings for efficiency
         self.features_per_latent = self.params.input_dim // self.params.latent_dim
@@ -84,6 +95,16 @@ class SyntheticDataset(Dataset):
         noise = self.params.noise_level * torch.randn(self.params.input_dim, generator=g)
         x = torch.clamp(x + noise, 0.0, 1.0)
 
+        # Optional transform hook (generic callable)
+        if self.transform is not None:
+            out = self.transform(x)
+            if isinstance(out, tuple) and len(out) == 2:
+                return out
+            elif isinstance(out, torch.Tensor):
+                return out, out
+            else:
+                raise TypeError("Transform must return Tensor or (Tensor, Tensor)")
+
         # For autoencoder, target is the same as input
         return x, x
 
@@ -96,13 +117,17 @@ class DataGenerator:
     Lightning's DataModule and DataLoader systems.
     """
 
-    def __init__(self, params: DataParams):
+    def __init__(
+        self, params: DataParams, transform: Optional[Callable[[Tensor], Tuple[Tensor, Tensor] | Tensor]] = None
+    ):
         """Initialize data generator with parameters.
 
         Args:
             params: Data generation parameters
+            transform: Optional transform/augmentation callable applied in the dataset
         """
         self.params = params
+        self.transform = transform
 
     def __call__(self, n_samples: int) -> Dataset:
         """Create a dataset with the specified number of samples.
@@ -113,7 +138,7 @@ class DataGenerator:
         Returns:
             Dataset object that yields individual samples
         """
-        return SyntheticDataset(n_samples, self.params)
+        return SyntheticDataset(n_samples, self.params, transform=self.transform)
 
 
 # -------------------------------------------------------------------------------------------
@@ -139,6 +164,6 @@ if __name__ == "__main__":
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=0)
     print(f"Number of batches: {len(dataloader)}")
 
-    # Get first batch and visualize
+    # Get first batch
     batch_x, batch_y = next(iter(dataloader))
     print(f"Batch shapes: x={batch_x.shape}, y={batch_y.shape}")

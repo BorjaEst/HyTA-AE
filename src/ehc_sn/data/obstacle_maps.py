@@ -5,7 +5,7 @@ Maps where 1 represents obstacles/walls and 0 represents free space, providing r
 maze-like structures for spatial navigation testing.
 """
 
-from typing import Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 from pydantic import BaseModel, Field
@@ -36,17 +36,29 @@ class ObstacleMapDataset(Dataset):
 
     Extracts wall/obstacle patterns from MiniGrid environments, providing realistic
     maze-like structures. Uses deterministic seeding per sample for reproducibility.
+
+    If a transform is provided:
+      - It is called with a (C,H,W) tensor (C=1).
+      - If it returns (x, y), both are squeezed to (H,W) and returned.
+      - If it returns a Tensor, it is used as both input and target (autoencoder).
     """
 
-    def __init__(self, n_samples: int, params: DataParams):
+    def __init__(
+        self,
+        n_samples: int,
+        params: DataParams,
+        transform: Optional[Callable[[Tensor], Tuple[Tensor, Tensor] | Tensor]] = None,
+    ):
         """Initialize obstacle map dataset.
 
         Args:
             n_samples: Number of samples in the dataset
             params: Generation parameters including environment ID
+            transform: Optional transform/augmentation callable
         """
         self.n_samples = n_samples
         self.params = params
+        self.transform = transform
 
     def __len__(self) -> int:
         """Return the number of samples in the dataset."""
@@ -68,26 +80,42 @@ class ObstacleMapDataset(Dataset):
         minigrid_tensor = minigrid_generate(seed=sample_seed, env_id=self.params.env_id)
 
         # Extract walls channel (channel 0)
-        walls = minigrid_tensor[0]  # Shape: (H, W)
+        walls = minigrid_tensor[0].to(torch.float32)  # Shape: (H, W)
 
         # Apply inversion if requested
-        if self.params.invert_walls:
-            obstacle_map = 1.0 - walls  # Invert: 1=free, 0=wall
-        else:
-            obstacle_map = walls  # Keep: 1=wall, 0=free
+        obstacle_map = (1.0 - walls) if self.params.invert_walls else walls  # (H, W)
 
-        # For autoencoder, target is the same as input
+        # Optional transform expects (C,H,W)
+        if self.transform is not None:
+            x_c = obstacle_map.unsqueeze(0)  # (1,H,W)
+            out = self.transform(x_c)
+            if isinstance(out, tuple) and len(out) == 2:
+                xi, yi = out
+                return xi.squeeze(0), yi.squeeze(0)  # (H,W), (H,W)
+            elif isinstance(out, torch.Tensor):
+                xj = out.squeeze(0)
+                return xj, xj
+            else:
+                raise TypeError("Transform must return Tensor or (Tensor, Tensor)")
+
+        # No transform: input == target
         return obstacle_map, obstacle_map
 
 
 # -------------------------------------------------------------------------------------------
 class DataGenerator:
+    """Factory for obstacle-map datasets with optional transform."""
 
-    def __init__(self, params: DataParams):
+    def __init__(
+        self,
+        params: DataParams,
+        transform: Optional[Callable[[Tensor], Tuple[Tensor, Tensor] | Tensor]] = None,
+    ):
         self.params = params
+        self.transform = transform
 
     def __call__(self, n_samples: int) -> Dataset:
-        return ObstacleMapDataset(n_samples, self.params)
+        return ObstacleMapDataset(n_samples, self.params, transform=self.transform)
 
 
 # -------------------------------------------------------------------------------------------
