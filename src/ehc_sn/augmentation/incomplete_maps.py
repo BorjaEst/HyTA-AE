@@ -24,14 +24,14 @@ class ComposeParams(BaseModel):
     hflip_p: float = Field(default=0.5, ge=0.0, le=1.0, description="Horizontal flip probability")
     vflip_p: float = Field(default=0.0, ge=0.0, le=1.0, description="Vertical flip probability")
     resize_to: Optional[Tuple[int, int]] = Field(
-        default=None, description="Optional (H,W). Use NEAREST to preserve binary semantics"
+        default=None, description="Optional (H,W). Use NEAREST to preserve bin semantics"
     )
 
     # Corruption (incomplete maps)
     mask_ratio: float = Field(default=0.3, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
     mask_value: float = Field(default=0.0, description="Value used for masked-out locations")
     preserve_walls: bool = Field(
-        default=True,
+        default=False,
         description="If True, do not mask wall cells (assumes channel 0 == walls)",
     )
 
@@ -88,10 +88,14 @@ class Augmentation:
       - Apply RandomMask only to input to produce incomplete maps
     """
 
-    def __init__(self, params: ComposeParams):
-        self.params = params
-        self._geom = self._build_geometry(params)
-        self._mask = RandomMask(ratio=params.mask_ratio, value=params.mask_value, preserve_walls=params.preserve_walls)
+    def __init__(self, params: Optional[ComposeParams] = None):
+        self.params = params or ComposeParams()
+        self._geom = self._build_geometry(self.params)
+        self._mask = RandomMask(
+            ratio=self.params.mask_ratio,
+            value=self.params.mask_value,
+            preserve_walls=self.params.preserve_walls,
+        )
 
     # -----------------------------------------------------------------------------------
     def _build_geometry(self, p: ComposeParams) -> T.Compose:
@@ -118,3 +122,29 @@ class Augmentation:
         # Corruption only for the input
         x_incomplete = self._mask(y)
         return x_incomplete, y
+
+
+if __name__ == "__main__":
+    # Simple test of augmentation pipeline
+    print(f"\n--- Testing Augmentation Pipeline ---")
+    import matplotlib.pyplot as plt
+
+    from ehc_sn.data.obstacle_maps import DataGenerator, DataParams
+    from ehc_sn.figures.reconstruction_map import ReconstructionMapFigure
+
+    # Create data generator with augmentation
+    params = DataParams(env_id="MiniGrid-MultiRoom-N6-v0", seed=42, invert_walls=False)
+    generator = DataGenerator(params, transform=Augmentation())
+
+    # Generate a batch of samples
+    dataset = generator(4)
+    print(f"Dataset length: {len(dataset)}")
+    inputs, targets = zip(*(dataset[i] for i in range(len(dataset))))
+    inputs = torch.stack(inputs)  # (N,C,H,W)
+    targets = torch.stack(targets)  # (N,C,H,W)
+    print(f"Input shape: {inputs.shape}, Target shape: {targets.shape}")
+
+    # Figure reconstruction map comparing inputs and outputs
+    fig_reconstruction = ReconstructionMapFigure()
+    _ = fig_reconstruction.plot(targets, inputs)
+    plt.show()

@@ -35,7 +35,7 @@ class Experiment(BaseSettings):
     figure_3: Figure3Params = Field(default_factory=Figure3Params, description="Decoder montage figure parameters")
 
     trainer: TrainerParams = Field(
-        default_factory=lambda: TrainerParams(experiment_name="hybrid_feedback"),
+        default_factory=lambda: TrainerParams(experiment_name="datcom_feedback"),
         description="Trainer parameters",
     )
 
