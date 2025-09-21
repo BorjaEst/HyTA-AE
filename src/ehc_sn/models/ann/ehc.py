@@ -68,35 +68,23 @@ class ModelParams(BaseModel):
 
 
 # # -------------------------------------------------------------------------------------------
-# class SensorsGateway(ann.Layer):
-#     def __init__(self, synapses: nn.Module, activation: Optional[nn.Module] = None):
-#         super().__init__(synapses, activation or nn.Identity())
-#         self.reconstruction_loss = nn.BCELoss(reduction="mean")
-#         self.sensors: Tensor | None = None
+class InputGateway(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.sensors: Tensor | None = None
 
-#     def forward(self, inputs: Tensor) -> Tensor:   # This comes from subiculum layer
-#         reconstruction = super().forward(inputs)
-#         return unflatten(reconstruction, 1, self.sensors.shape[1:])
+    def forward(self, sensors: Tensor) -> Tensor:
+        self.sensors = sensors.detach()  # detach to avoid gradients
+        return flatten(self.sensors, start_dim=1)
 
-#     def process(self, inputs: Tensor) -> Tensor:
-#         self.input = inputs
-#         return flatten(inputs, start_dim=1)
-
-#     def feedback(self) -> None:
-#         mec.feedback(self.input - self.
-
-
-#         reconstruction = unflatten(signal, 1, self.neurons.shape[1:])
-#         error = reconstruction - self.neurons
-
-#         self.reconstruction_loss(reconstruction, self.neurons).backward()
+    def dfa_error(self, reconstruction: Tensor):
+        return flatten(reconstruction - self.sensors, start_dim=1)
 
 
 # -------------------------------------------------------------------------------------------
 class MEC(nn.Module):
     def __init__(self, dim_V: int, dim_III: int, dim_II: int):
         super().__init__()
-        # self.layerV = SensorsGateway(nn.Linear(dim_V, dim_V))  # Gateway layer
         self.layerIII = ann.Layer(dfa.Linear(dim_V, dim_III, error_features=dim_V), nn.GELU())
         self.layerII = ann.Layer(dfa.Linear(dim_V, dim_II, error_features=dim_V), nn.GELU())
 
@@ -153,11 +141,14 @@ class EHC(pl.LightningModule):
         self.automatic_optimization = False
         self.trainer_module = trainer
 
+        # Identity-only input gateway layer
+        self.inputs = InputGateway()
+
         # Initialize mec and hpc with DFA layers
         self.mec = MEC(**params.mec_kwargs)
         self.hpc = HPC(**params.hpc_kwargs)
 
-        # Linear-only output layer
+        # Linear-only output head layer
         self.output = OutputHead(params.subiculum_units, params.output_shape)
         self.output_loss = nn.BCELoss(reduction="mean")
 
@@ -175,15 +166,16 @@ class EHC(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def forward(self, sensors: Tensor) -> Tuple[Tensor, Tensor]:
-        mec, hpc, x = self.mec, self.hpc, flatten(sensors, start_dim=1)
+        x = self.inputs(sensors)
         self.mec(x)
-        self.hpc(mec)
+        self.hpc(self.mec)
         # !! Lets use ca1 for now to do not go too far from hybrid version
-        return self.output(hpc.ca1.neurons.detach()), hpc.dg.neurons
+        return self.output(self.hpc.ca1.neurons.detach()), self.hpc.dg.neurons
 
     @torch.inference_mode()
     def encode(self, sensors: Tensor) -> Tensor:
-        self.mec(flatten(sensors, start_dim=1))
+        x = self.inputs(sensors)
+        self.mec(x)
         self.hpc.dg(self.mec.layerII.neurons)
         return self.hpc.dg.neurons
 
@@ -204,7 +196,7 @@ class EHC(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     def apply_feedback(self, feedback: List[Tensor]) -> None:
         (sensors, reconstruction, latent) = feedback
-        reconstruction_err = flatten(reconstruction - sensors, start_dim=1)
+        reconstruction_err = self.inputs.dfa_error(reconstruction)
         self.mec.feedback(reconstruction_err)
         self.hpc.feedback(self.mec)
         self.output_loss(reconstruction, sensors).backward()
