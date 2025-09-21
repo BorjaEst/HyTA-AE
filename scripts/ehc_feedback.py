@@ -77,7 +77,7 @@ def gen_figures(model: EHC, datamodule: BaseDataModule, experiment: Experiment) 
     _ = sparsity_figure.plot(activations)
     plt.show()
 
-    latent_dim = experiment.model.dg_units  # Number of latent units
+    latent_dim = experiment.model.n_dg  # Number of latent units
     latents = torch.eye(latent_dim)[:18]  # One-hot encoding for each unit
 
     # Generate decoder outputs for one-hot latents
