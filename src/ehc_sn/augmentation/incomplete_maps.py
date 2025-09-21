@@ -1,16 +1,15 @@
 """Augmentation utilities using torchvision v2 for (incomplete) binary maps.
 
-- Geometry ops (flip/resize) are applied first.
+- Geometry ops (flip) are applied first.
 - Target is taken as the geometrically transformed map (clean).
 - Corruption (masking) is applied only to the input to create incomplete maps.
 """
 
-from typing import Callable, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 from pydantic import BaseModel, Field
 from torch import Tensor
-from torchvision.transforms import InterpolationMode
 from torchvision.transforms import v2 as T
 
 
@@ -23,34 +22,25 @@ class ComposeParams(BaseModel):
     # Geometry
     hflip_p: float = Field(default=0.5, ge=0.0, le=1.0, description="Horizontal flip probability")
     vflip_p: float = Field(default=0.0, ge=0.0, le=1.0, description="Vertical flip probability")
-    resize_to: Optional[Tuple[int, int]] = Field(
-        default=None, description="Optional (H,W). Use NEAREST to preserve bin semantics"
-    )
 
     # Corruption (incomplete maps)
-    mask_ratio: float = Field(default=0.3, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
+    mask_ratio: float = Field(default=0.6, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
     mask_value: float = Field(default=0.0, description="Value used for masked-out locations")
-    preserve_walls: bool = Field(
-        default=False,
-        description="If True, do not mask wall cells (assumes channel 0 == walls)",
-    )
 
 
 # -------------------------------------------------------------------------------------------
 class RandomMask:
-    """Randomly mask spatial locations to create incomplete maps.
+    """Randomly keep a single visible rectangle and mask the rest.
 
     Assumes input is a float tensor of shape (C, H, W) with binary channels
-    (channel 0 == walls). Applies the same mask across channels and optionally
-    preserves wall cells.
+    (channel 0 == walls). Applies the same rectangular mask across channels.
 
-    This is a simple callable that integrates in v2.Compose.
+    The rectangle area is approximately (1 - ratio) of the map area.
     """
 
-    def __init__(self, ratio: float = 0.3, value: float = 0.0, preserve_walls: bool = True):
+    def __init__(self, ratio: float = 0.3, value: float = 0.0):
         self.ratio = float(ratio)
         self.value = float(value)
-        self.preserve_walls = bool(preserve_walls)
 
     def __call__(self, x: Tensor) -> Tensor:
         if not isinstance(x, torch.Tensor):
@@ -60,20 +50,31 @@ class RandomMask:
 
         c, h, w = x.shape
         if self.ratio <= 0.0:
+            # No masking requested
             return x
 
-        # Bernoulli keep mask (1=keep, 0=mask)
-        keep = torch.rand((h, w), device=x.device, dtype=x.dtype)
-        keep = (keep > self.ratio).to(x.dtype)  # shape (H, W)
+        # Compute visible area ratio; keep a single rectangle with this area
+        visible_ratio = max(0.0, min(1.0, 1.0 - self.ratio))
 
-        if self.preserve_walls and c >= 1:
-            walls = (x[0] > 0.5).to(x.dtype)  # channel 0 assumed walls (binary)
-            keep = torch.clamp(keep + walls, max=1.0)
+        if visible_ratio <= 0.0:
+            # Fully masked
+            keep = torch.zeros((h, w), device=x.device, dtype=x.dtype)
+        else:
+            # Keep rectangle with approximately visible_ratio area.
+            # Maintain map aspect by scaling both dims by sqrt(visible_ratio).
+            scale = visible_ratio**0.5
+            vh = max(1, int(round(h * scale)))
+            vw = max(1, int(round(w * scale)))
 
-        # Broadcast to channels
+            max_i = max(0, h - vh)
+            max_j = max(0, w - vw)
+            i = 0 if max_i == 0 else int(torch.randint(0, max_i + 1, (1,), device=x.device))
+            j = 0 if max_j == 0 else int(torch.randint(0, max_j + 1, (1,), device=x.device))
+
+            keep = torch.zeros((h, w), device=x.device, dtype=x.dtype)
+            keep[i : i + vh, j : j + vw] = 1.0
+
         keep_ch = keep.unsqueeze(0).expand(c, -1, -1)
-
-        # Apply mask
         return x * keep_ch + (1.0 - keep_ch) * self.value
 
 
@@ -83,7 +84,7 @@ class Augmentation:
 
     Pipeline:
       - ToDtype(float32)
-      - Geometry ops (flip/resize; NEAREST only)
+      - Geometry ops (flip only)
       - Return target as geometrically transformed map (clean)
       - Apply RandomMask only to input to produce incomplete maps
     """
@@ -94,7 +95,6 @@ class Augmentation:
         self._mask = RandomMask(
             ratio=self.params.mask_ratio,
             value=self.params.mask_value,
-            preserve_walls=self.params.preserve_walls,
         )
 
     # -----------------------------------------------------------------------------------
@@ -104,8 +104,6 @@ class Augmentation:
             ops.append(T.RandomHorizontalFlip(p=p.hflip_p))
         if p.vflip_p > 0:
             ops.append(T.RandomVerticalFlip(p=p.vflip_p))
-        if p.resize_to is not None:
-            ops.append(T.Resize(p.resize_to, interpolation=InterpolationMode.NEAREST, antialias=False))
         return T.Compose(ops)
 
     # -----------------------------------------------------------------------------------
