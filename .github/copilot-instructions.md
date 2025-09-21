@@ -9,7 +9,7 @@ Develop a Python library to model the entorhinal-hippocampal circuit for spatial
 
 This library will:
 
-- Support training using Backpropagation (BP) and Direct Random Target Projection (DRTP)
+- Support training using Backpropagation (BP), DFA, and other biologically plausible learning rules
 - Integrate key regions of the entorhinal-hippocampal circuit to simulate information flow
 - Be distributed via PyPI (`pip install ehc-sn`)
 - Provide network definition and parameters via TOML files loaded with Pydantic 2
@@ -25,12 +25,11 @@ This library will:
   - `core/` - Implementation of core library components (neurons, synapses, etc.)
   - `data/` - Data module for generating and managing Lightning data modules (cognitive maps, grid maps, etc.)
   - `figures/` - Module containing figure classes to visualize experiment results
-  - `losses/` - Custom loss modules for the library (e.g., reconstruction loss, error loss)
+  - `hooks/` - Custom PyTorch Lightning callbacks and hooks
   - `models/` - Implementation of library models (CANModel, Autoencoder, etc.)
+  - `modules/` - Reusable PyTorch modules (layers, loss functions, etc.)
+  - `trainers/` - Training routines and experiment management
   - `utils/` - Utility functions for the library
-  - `parameters.py` - Global parameters for synapses types, neuron types, etc.
-  - `settings.py` - Global settings and configurations
-  - `simulations.py` - Class functions for running simulations
 - `requirements-dev.txt` - Development dependencies
 - `requirements.txt` - Core package dependencies
 - `tests/` - Unit and integration tests
@@ -57,9 +56,7 @@ This library will:
 ### Data Module
 
 - Provide generatators and lightning data modules for obstacle and cognitive maps.
-- Include plot generators for visualizing generated data (to be used on figures module)
-- Plot generators should accept axes as input and generate plots on those axes
-- Visualization should be implemented using Seaborn and Matplotlib
+-
 
 ### Figures Module
 
@@ -67,25 +64,10 @@ This library will:
 - Implement visualization objects using Matplotlib and Seaborn
 - Structure with:
 
-1. Proper separation of plotting functions and figure classes
+1. Class for figure with plot method to generate plots
 2. Consistent use of Pydantic for parameter management
 3. Good handling of tensor conversion and visualization options
 4. Comprehensive visualization capabilities for different map types
-
-- Design figure classes that:
-
-1. Encapsulate plotting logic and parameters into a single object
-2. Initialize subplot figure and axes in the constructor
-3. Have a specific and fixed title
-
-- Plot generators should accept axes as input and generate plots on those axes
-
-### Losses Module
-
-- This module should contain submodules for different types of scenarios (e.g., autoencoders, reconstruction tasks)
-- Each submodule should implement a specific loss function relevant to the scenario
-- Loss functions should be designed to work with the entorhinal-hippocampal circuit models
-- Losses should be implemented as PyTorch modules to integrate seamlessly with the training process
 
 ### Models Module
 
@@ -93,7 +75,6 @@ This library will:
 - Each model should encapsulate the structure and behavior of the entorhinal-hippocampal circuit
 - Models should be designed to support both training and inference modes
 - Models should be modular and extensible to allow for future enhancements and variations
-- Submodule autoencoder serves as a baseline for evaluation, implementing a general sparse autoencoder
 
 ### Utils Module
 
@@ -107,29 +88,11 @@ This library will:
 - It should include functions for handling configuration files, such as loading and validating TOML files with Pydantic
 - It should provide functions for managing parameters and settings across the library
 
-### Parameters Module
-
-- This module should define global parameters for synapse types, neuron types, and other fixed parameters
-- It should use the `constants` module as a reference for defining parameter types
-
-### Settings Module
-
-- This module should define global settings and configurations for the library
-- It should provide a centralized location for managing library-wide settings
-- It should include settings for logging, debugging, and other global configurations
-- It should be designed to allow easy modification of settings without changing the core library code
-
-### Simulations Module
-
-- This module should provide functions for running simulations of the entorhinal-hippocampal circuit
-- It should include functions for initializing simulations, running experiments, and collecting results
-- It should be designed to work with the library's models and trainers
-- It should provide a framework for running different types of simulations
-
 ## Modeling Framework
 
 - PyTorch with custom neuron models for the entorhinal-hippocampal circuit
-- PyTorch Lightning for training, data loading and callbacks
+- PyTorch Lightning for training, data loading and callbacks (but using manual optimization)
+- Torchvision for data transformations and utilities
 - Norse for spiking neuron models and event-based processing
 - Optuna for hyperparameter optimization
 - TorchRL for reinforcement learning components, if needed
@@ -143,77 +106,34 @@ The models are structured as autoencoders, where:
 - Medial Entorhinal Cortex (MEC) layers act as encoder for extracting features from sensory inputs
 - Hippocampal regions act as a decoder for reconstructing cognitive maps
 
-### Medial Entorhinal Cortex (MEC) - Encoder
+### Entorhinal-Hippocampal Circuit Regions
 
-- **MEC Layer II**:
+| Region / Layer         | Inputs                                              | Computations / Roles                                                                                        | Outputs                                                         |
+| ---------------------- | --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| **MEC Layer II**       | From MEC Vb, sensory inputs                         | Trajectory & position coding; attractor dynamics; feedback signals                                          | To DG, CA3, CA2, MEC Vb                                         |
+| **MEC Layer III**      | From MEC Vb, sensory inputs                         | Heading direction & speed coding; computes reconstruction error                                             | To CA1, Subiculum                                               |
+| **MEC Layer Va**       | From internal MEC processing                        | Low excitability; integrator behavior; hidden state representation                                          | To neocortex/other brain areas (not core EHC loop)              |
+| **MEC Layer Vb**       | From MEC II, Subiculum, reconstructed maps from CA1 | Hidden state integration; error relay                                                                       | Projects errors to MEC II (fixed weights); feeds MEC II and III |
+| **Dentate Gyrus (DG)** | From MEC II                                         | Sparse feature embeddings of cognitive map; neurogenesis (expansion)                                        | To CA3                                                          |
+| **CA3**                | From DG (plastic), MEC II (fixed)                   | Hidden state computation; recurrent attractor network; pattern completion; place cells                      | To CA2, CA1                                                     |
+| **CA2**                | From CA3 (plastic), MEC II (fixed)                  | Hidden state computation; modulates HPC dynamics; supports SWRs; unique plasticity                          | To CA1                                                          |
+| **CA1**                | From CA3 & CA2 (plastic), MEC III (error signals)   | Cognitive map reconstruction; compare expected (CA3) vs actual (EC) inputs; contextual encoding & retrieval | To MEC Vb, Subiculum                                            |
+| **Subiculum**          | From CA1 (plastic), MEC III (errors)                | Output reconstruction; diverse cell types (head direction, grid-like)                                       | To MEC Vb, broader cortical outputs                             |
 
-  - Receives information from MEC Layer Vb and sensory inputs
-  - Calculates encoding hidden states
-  - Attractor dynamics behavior
-  - Projects signal to hippocampal subregions DG, CA3, CA2 and MEC Layer Vb
+### Entorhinal-Hippocampal External Inputs
 
-- **MEC Layer III**:
-
-  - Receives information from Layer Vb and sensory inputs
-  - Calculates reconstruction errors based on input from Layer Vb
-  - Projects reconstruction error to CA1 and Subiculum (Sub)
-
-- **MEC Layer Va**:
-
-  - Lower excitability with integrator behavior
-  - Calculates hidden states for MEC Layer Va
-  - Projects signals to other brain areas (neocortex, etc.)
-  - Optional implementation as it does not project to EHC circuit
-
-- **MEC Layer Vb**:
-  - Receives information from MEC Layer II and Subiculum (Sub)
-  - Receives the reconstructed cognitive map from CA1
-  - Calculates hidden states for MEC Layer Vb
-  - Projects errors to MEC Layer II with fixed (no learning) weights
-
-### Hippocampal Circuit - Decoder
-
-- **DG (Dentate Gyrus)**:
-
-  - Receives input from MEC Layer II
-  - Calculates the features space (embeddings) for the cognitive map sensed by MEC
-  - Projects the features to CA3
-  - Neurogenesis; This layer dimensions can be increased after learning to allow for new cognitive maps
-  - Contains mossy cells and GABAergic interneurons
-
-- **CA3**:
-
-  - Receives input from DG using training weights (might include recurrent connections)
-  - Receives input from MEC Layer II using fixed weights
-  - Calculates the decoder hidden states
-  - Projects the hidden states to CA2 and CA1
-  - Has extensive recurrent connections within itself
-  - Association network; Pattern completion; One-shot learning; Place cells
-
-- **CA2**:
-
-  - Receives input from CA3 using training weights
-  - Receives input from MEC Layer II using fixed weights
-  - Calculates decoder hidden states
-  - Projects hidden states to CA1
-  - Modulates HPC dynamics; SWR generation; Unique plasticity profile
-
-- **CA1**:
-
-  - Receives input from CA3 and CA2 using training weights
-  - Receives errors from MEC Layer III
-  - Calculates the cognitive map reconstruction
-  - Projects reconstructed cognitive map to MEC Layer Vb and Subiculum
-  - HPC output; Contextual encoding and retrieval; Memory consolidation (via SWRs);
-  - Compares "expected" (CA3-memories) with "actual" sensory information (EC-observations)
-
-- **Subiculum (Sub)**:
-
-  - Receives input from CA1 using training weights
-  - Receives errors from MEC Layer III
-  - Calculates output reconstruction
-  - Projects reconstructed output to MEC Layer Vb
-  - Specialized cells (head directions, grid cells, etc.)
+| External Area          | Target in EHC                 | Info Carried                                |
+| ---------------------- | ----------------------------- | ------------------------------------------- |
+| Postrhinal cortex      | MEC (II/III, V/VI)            | Spatial scenes, landmarks                   |
+| Retrosplenial cortex   | MEC (II/III, V/VI)            | Head direction, visual-spatial integration  |
+| Medial prefrontal      | MEC (V/VI), LEC (V/VI)        | Task, goals, executive/mnemonic context     |
+| Perirhinal cortex      | LEC (II/III)                  | Object/“what” info, recognition             |
+| Visual/parietal cortex | MEC superficial (via POR/RSC) | Visual scenes, egocentric space, optic flow |
+| Thalamus               | MEC (I–III)                   | Head direction, orientation                 |
+| Septum                 | MEC & HPC (broad)             | Theta rhythm, cholinergic modulation        |
+| Amygdala               | LEC (II/III, V/VI)            | Emotional/motivational salience             |
+| Presubiculum           | MEC superficial               | Head direction signals                      |
+| Parasubiculum          | MEC & LEC                     | Border/spatial context                      |
 
 ## Models and Experiments
 
