@@ -90,18 +90,8 @@ class Autoencoder(pl.LightningModule):
 
         # Loss functions
         # Use elementwise BCE so we can mask unknown pixels and normalize by observed count.
-        self.reconstruction_loss = nn.BCELoss(reduction="none")
+        self.reconstruction_loss = nn.BCELoss(reduction="mean")
         self.sparsity_loss = SparsityLoss(center=True)
-
-    # -----------------------------------------------------------------------------------
-    def _masked_mean(self, x: Tensor, mask: Tensor) -> Tensor:
-        """
-        Compute mean over observed elements only.
-        mask: boolean tensor (True = observed). Reduces across batch and spatial dims.
-        """
-        m = mask.to(dtype=x.dtype)
-        denom = m.sum().clamp_min(1.0)
-        return (x * m).sum() / denom
 
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
@@ -126,23 +116,17 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     def compute_feedback(self, outputs: Tensor, batch: Tensor) -> List[Tensor]:
         reconstruction, latent = outputs
-        sensors, labels, mask = batch
-        return [sensors, labels, reconstruction, latent, mask]
+        sensors, labels = batch
+        return [sensors, labels, reconstruction, latent]
 
     # -----------------------------------------------------------------------------------
     def apply_feedback(self, feedback: List[Tensor]) -> None:
-        (sensors, labels, reconstruction, latent, mask) = feedback
-        # Gate DFA error by observed pixels only, using full labels.
-        mask_f = mask.to(reconstruction.dtype)
-        reconstruction_err = reconstruction - labels
-        reconstruction_err = flatten(reconstruction_err, start_dim=1) * flatten(mask_f, start_dim=1)
+        (sensors, labels, reconstruction, latent) = feedback
+        reconstruction_err = flatten(reconstruction - labels, start_dim=1)
         self.encoder.feedback(reconstruction_err)
         self.sparsity_loss(latent).backward()
         self.decoder.feedback(self.encoder)
-        # Masked BCE vs full labels, normalized by observed count.
-        per_elem_bce = self.reconstruction_loss(reconstruction, labels)
-        recon_loss = self._masked_mean(per_elem_bce, mask)
-        recon_loss.backward()
+        self.reconstruction_loss(reconstruction, labels).backward()
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
@@ -150,7 +134,7 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def validation_step(self, batch: Tensor, batch_idx: int) -> List[Tensor]:
-        sensors, labels, mask = batch
+        sensors, labels = batch
         outputs = self(sensors)
         reconstruction_loss = nn.MSELoss(reduction="mean")(outputs[0], labels)
         sparsity_rate = (outputs[1] > 0.01).float().mean()
