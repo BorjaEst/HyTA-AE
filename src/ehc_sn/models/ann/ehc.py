@@ -20,7 +20,7 @@ class ModelParams(BaseModel):
     # MEC and hpc components
     dg_units: int = Field(default=2024, gt=0, description="Dimensionality of the Dentate Gyrus units.")
     ca3_units: int = Field(default=512, gt=0, description="Number of Cornu Ammonis area 3 units.")
-    ca1_units: int = Field(default=1024, gt=0, description="Number of Cornu Ammonis area 1 units.")
+    ca1_units: int = Field(default=625, gt=0, description="Number of Cornu Ammonis area 1 units.")
     # subiculum_units: int = Field(default=2048, gt=0, description="Number of Subiculum units.")
     output_shape: List[int] = Field([25, 25], description="Dimensionality of the input and output.")
 
@@ -29,6 +29,7 @@ class ModelParams(BaseModel):
     dg_lr: float = Field(2e-6, description="Learning rate for the Dentate Gyrus parameters.")
     ca_lr: float = Field(1e-4, description="Learning rate for the Cornu Ammonis parameters.")
     subiculum_lr: float = Field(1e-4, description="Learning rate for the subiculum parameters.")
+    output_lr: float = Field(1e-4, description="Learning rate for the output layer parameters.")
 
     @field_validator("output_shape")
     def check_output_shape(cls, v: List[int]) -> List[int]:
@@ -37,30 +38,65 @@ class ModelParams(BaseModel):
         return v
 
     @property
+    def input_units(self) -> int:
+        """Return number of input units."""
+        return math.prod(self.output_shape)
+
+    @property
+    def subiculum_units(self) -> int:
+        """Return number of subiculum units."""
+        return self.input_units
+
+    @property
     def mec_kwargs(self) -> Dict[str, int]:
         """Return dictionary of mec layer sizes."""
         return {
-            "dim_V": math.prod(self.output_shape),
+            "dim_V": self.input_units,
             "dim_III": self.ca1_units,
             "dim_II": self.ca3_units,
-            "dim_dg": self.dg_units,
         }
 
     @property
     def hpc_kwargs(self) -> Dict[str, int]:
         """Return dictionary of hpc layer sizes."""
         return {
-            "dim_subiculum": math.prod(self.output_shape),
-            "dim_ca1": self.ca1_units,
-            "dim_ca3": self.ca3_units,
             "dim_dg": self.dg_units,
+            "dim_ca3": self.ca3_units,
+            "dim_ca1": self.ca1_units,
+            "dim_subiculum": self.subiculum_units,
         }
+
+
+# # -------------------------------------------------------------------------------------------
+# class SensorsGateway(ann.Layer):
+#     def __init__(self, synapses: nn.Module, activation: Optional[nn.Module] = None):
+#         super().__init__(synapses, activation or nn.Identity())
+#         self.reconstruction_loss = nn.BCELoss(reduction="mean")
+#         self.sensors: Tensor | None = None
+
+#     def forward(self, inputs: Tensor) -> Tensor:   # This comes from subiculum layer
+#         reconstruction = super().forward(inputs)
+#         return unflatten(reconstruction, 1, self.sensors.shape[1:])
+
+#     def process(self, inputs: Tensor) -> Tensor:
+#         self.input = inputs
+#         return flatten(inputs, start_dim=1)
+
+#     def feedback(self) -> None:
+#         mec.feedback(self.input - self.
+
+
+#         reconstruction = unflatten(signal, 1, self.neurons.shape[1:])
+#         error = reconstruction - self.neurons
+
+#         self.reconstruction_loss(reconstruction, self.neurons).backward()
 
 
 # -------------------------------------------------------------------------------------------
 class MEC(nn.Module):
     def __init__(self, dim_V: int, dim_III: int, dim_II: int):
         super().__init__()
+        # self.layerV = SensorsGateway(nn.Linear(dim_V, dim_V))  # Gateway layer
         self.layerIII = ann.Layer(dfa.Linear(dim_V, dim_III, error_features=dim_V), nn.GELU())
         self.layerII = ann.Layer(dfa.Linear(dim_V, dim_II, error_features=dim_V), nn.GELU())
 
@@ -77,7 +113,10 @@ class MEC(nn.Module):
 class HPC(nn.Module):
     def __init__(self, dim_subiculum: int, dim_ca1: int, dim_ca3: int, dim_dg: int):
         super().__init__()
-        self.dg = ann.Layer(nn.Linear(dim_ca3, dim_dg), nn.GELU())  # !! we are assuming dim_ca3==dim_II
+        self.sparsity_loss = SparsityLoss(center=True)
+
+        # Initialize layers
+        self.dg = ann.Layer(nn.Linear(dim_ca3, dim_dg), nn.ReLU())  # !! we are assuming dim_ca3==dim_II
         self.ca3 = ann.Layer(srtp.Linear(dim_dg, dim_ca3), nn.GELU())
         self.ca1 = ann.Layer(srtp.Linear(dim_ca3, dim_ca1), nn.GELU())
         self.subiculum = ann.Layer(nn.Linear(dim_ca1, dim_subiculum), nn.Sigmoid())
@@ -89,8 +128,20 @@ class HPC(nn.Module):
         self.subiculum(self.ca1.neurons.detach())  # !! we need to add output for the backprop loss and fix detach
 
     def feedback(self, mec: MEC) -> None:
+        self.sparsity_loss(self.dg.neurons).backward()
         self.ca3.synapses.feedback(mec.layerII.neurons, context=self.dg.neurons)
         self.ca1.synapses.feedback(mec.layerIII.neurons, context=mec.layerII.neurons)
+
+
+class OutputHead(nn.Linear):
+    def __init__(self, in_features: int, output_shape: List[int], **kwargs: Any):
+        super().__init__(in_features, math.prod(output_shape), **kwargs)
+        self.output_shape = output_shape
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        x = super().forward(inputs)
+        x = torch.sigmoid(x)
+        return unflatten(x, 1, self.output_shape)
 
 
 # -------------------------------------------------------------------------------------------
@@ -106,9 +157,9 @@ class EHC(pl.LightningModule):
         self.mec = MEC(**params.mec_kwargs)
         self.hpc = HPC(**params.hpc_kwargs)
 
-        # Loss functions
-        self.reconstruction_loss = nn.BCELoss(reduction="mean")
-        self.sparsity_loss = SparsityLoss(center=True)
+        # Linear-only output layer
+        self.output = OutputHead(params.subiculum_units, params.output_shape)
+        self.output_loss = nn.BCELoss(reduction="mean")
 
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
@@ -118,28 +169,31 @@ class EHC(pl.LightningModule):
             {"params": self.hpc.ca3.parameters(), "lr": self.config.ca_lr},
             {"params": self.hpc.ca1.parameters(), "lr": self.config.ca_lr},
             {"params": self.hpc.subiculum.parameters(), "lr": self.config.subiculum_lr},
+            {"params": self.output.parameters(), "lr": self.config.output_lr},
         ]
         return Adam(optm_params)
 
     # -----------------------------------------------------------------------------------
     def forward(self, sensors: Tensor) -> Tuple[Tensor, Tensor]:
-        mec, hpc = self.mec, self.hpc
-        mec(flatten(sensors, start_dim=1))
-        hpc(mec)
-        reconstruction = unflatten(hpc.subiculum.neurons, 1, sensors.shape[1:])
-        return reconstruction, hpc.dg.neurons
+        mec, hpc, x = self.mec, self.hpc, flatten(sensors, start_dim=1)
+        self.mec(x)
+        self.hpc(mec)
+        # !! Lets use ca1 for now to do not go too far from hybrid version
+        return self.output(hpc.ca1.neurons.detach()), hpc.dg.neurons
 
     @torch.inference_mode()
     def encode(self, sensors: Tensor) -> Tensor:
         self.mec(flatten(sensors, start_dim=1))
         self.hpc.dg(self.mec.layerII.neurons)
+        return self.hpc.dg.neurons
 
     @torch.inference_mode()
     def decode(self, latent: Tensor) -> Tensor:
         self.hpc.ca3(latent)
         self.hpc.ca1(self.hpc.ca3.neurons)
-        x = self.hpc.subiculum(self.hpc.ca1.neurons)
-        return unflatten(x, 1, self.config.output_shape)
+        self.hpc.subiculum(self.hpc.ca1.neurons)
+        # !! Lets use ca1 for now to do not go too far from hybrid version
+        return self.output(self.hpc.ca1.neurons)
 
     # -----------------------------------------------------------------------------------
     def compute_feedback(self, outputs: Tensor, batch: Tensor) -> List[Tensor]:
@@ -152,9 +206,8 @@ class EHC(pl.LightningModule):
         (sensors, reconstruction, latent) = feedback
         reconstruction_err = flatten(reconstruction - sensors, start_dim=1)
         self.mec.feedback(reconstruction_err)
-        self.sparsity_loss(latent).backward()
         self.hpc.feedback(self.mec)
-        self.reconstruction_loss(reconstruction, sensors).backward()
+        self.output_loss(reconstruction, sensors).backward()
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
