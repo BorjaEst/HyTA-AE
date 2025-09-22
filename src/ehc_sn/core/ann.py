@@ -1,4 +1,4 @@
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Optional
 
 from torch import Tensor, nn
 
@@ -17,6 +17,19 @@ class Layer(nn.Module):
         return self.neurons
 
 
+class GrowingLayer(Layer):
+    def __init__(self, init: int, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.active_units: int = int(init)
+
+    def forward(self, input: Tensor) -> Tensor:
+        output = super().forward(input)
+        # TODO: FIx as post-synaptic layer might have fixed in_features
+        return output[: self.active_units]
+
+    def grow(self, n: int) -> None:
+        self.active_units = self.active_units + int(n)
+
+
 if __name__ == "__main__":
-    # Usage example
-    pass  # TODO
+    pass
