@@ -106,34 +106,36 @@ The models are structured as autoencoders, where:
 - Medial Entorhinal Cortex (MEC) layers act as encoder for extracting features from sensory inputs
 - Hippocampal regions act as a decoder for reconstructing cognitive maps
 
-### Entorhinal-Hippocampal Circuit Regions
+### Master EHC Wiring Summary Table
 
-| Region / Layer         | Inputs                                              | Computations / Roles                                                                                        | Outputs                                                         |
-| ---------------------- | --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
-| **MEC Layer II**       | From MEC Vb, sensory inputs                         | Trajectory & position coding; attractor dynamics; feedback signals                                          | To DG, CA3, CA2, MEC Vb                                         |
-| **MEC Layer III**      | From MEC Vb, sensory inputs                         | Heading direction & speed coding; computes reconstruction error                                             | To CA1, Subiculum                                               |
-| **MEC Layer Va**       | From internal MEC processing                        | Low excitability; integrator behavior; hidden state representation                                          | To neocortex/other brain areas (not core EHC loop)              |
-| **MEC Layer Vb**       | From MEC II, Subiculum, reconstructed maps from CA1 | Hidden state integration; error relay                                                                       | Projects errors to MEC II (fixed weights); feeds MEC II and III |
-| **Dentate Gyrus (DG)** | From MEC II                                         | Sparse feature embeddings of cognitive map; neurogenesis (expansion)                                        | To CA3                                                          |
-| **CA3**                | From DG (plastic), MEC II (fixed)                   | Hidden state computation; recurrent attractor network; pattern completion; place cells                      | To CA2, CA1                                                     |
-| **CA2**                | From CA3 (plastic), MEC II (fixed)                  | Hidden state computation; modulates HPC dynamics; supports SWRs; unique plasticity                          | To CA1                                                          |
-| **CA1**                | From CA3 & CA2 (plastic), MEC III (error signals)   | Cognitive map reconstruction; compare expected (CA3) vs actual (EC) inputs; contextual encoding & retrieval | To MEC Vb, Subiculum                                            |
-| **Subiculum**          | From CA1 (plastic), MEC III (errors)                | Output reconstruction; diverse cell types (head direction, grid-like)                                       | To MEC Vb, broader cortical outputs                             |
-
-### Entorhinal-Hippocampal External Inputs
-
-| External Area          | Target in EHC                 | Info Carried                                |
-| ---------------------- | ----------------------------- | ------------------------------------------- |
-| Postrhinal cortex      | MEC (II/III, V/VI)            | Spatial scenes, landmarks                   |
-| Retrosplenial cortex   | MEC (II/III, V/VI)            | Head direction, visual-spatial integration  |
-| Medial prefrontal      | MEC (V/VI), LEC (V/VI)        | Task, goals, executive/mnemonic context     |
-| Perirhinal cortex      | LEC (II/III)                  | Object/“what” info, recognition             |
-| Visual/parietal cortex | MEC superficial (via POR/RSC) | Visual scenes, egocentric space, optic flow |
-| Thalamus               | MEC (I–III)                   | Head direction, orientation                 |
-| Septum                 | MEC & HPC (broad)             | Theta rhythm, cholinergic modulation        |
-| Amygdala               | LEC (II/III, V/VI)            | Emotional/motivational salience             |
-| Presubiculum           | MEC superficial               | Head direction signals                      |
-| Parasubiculum          | MEC & LEC                     | Border/spatial context                      |
+| Region / Layer                                    | Inputs                                                                  | Computations / Roles                                                                         | Outputs                                                    |
+| ------------------------------------------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| **External Inputs**                               |                                                                         |                                                                                              |                                                            |
+| **Perirhinal Cortex (PER)**                       | Sensory cortices                                                        | Object identity, “what” info                                                                 | To **LEC II/III (plastic)**                                |
+| **Postrhinal Cortex (POR)**                       | Visual/parietal                                                         | Scene-based spatial info, landmarks                                                          | To **MEC II/III, V/VI (plastic)**                          |
+| **Retrosplenial Cortex (RSC)**                    | Visual/parietal, head direction system                                  | Head direction, egocentric–allocentric transformation                                        | To **MEC II/III, V/VI (plastic)**                          |
+| **Medial Prefrontal Cortex (mPFC)**               | Association cortices                                                    | Task demands, goals, executive modulation                                                    | To **MEC V/VI, LEC V/VI (plastic)**                        |
+| **Thalamus (anterodorsal, laterodorsal)**         | Subcortical head direction system                                       | Orientation, direction                                                                       | To **MEC I–III (plastic)**                                 |
+| **Septum (MS/DBB)**                               | Subcortical modulatory                                                  | Theta rhythm, cholinergic/GABAergic modulation                                               | To **HPC + EC (plastic)**                                  |
+| **Amygdala**                                      | Limbic                                                                  | Emotional/motivational salience                                                              | To **LEC II/III, V/VI (plastic)**                          |
+| **Presubiculum**                                  | Head-direction system                                                   | Head direction signals                                                                       | To **MEC superficial (plastic)**                           |
+| **Parasubiculum** Master EHC Wiring Summary Table | Entorhinal–hippocampal                                                  | Spatial boundaries, context                                                                  | To **MEC & LEC (plastic)**                                 |
+| **LEC – Lateral Entorhinal Cortex**               |                                                                         |                                                                                              |                                                            |
+| **LEC Layer II**                                  | From PER, amygdala, sensory cortices (plastic)                          | Encodes object, “what” features                                                              | To DG (plastic), CA3 (fixed), CA2 (fixed)                  |
+| **LEC Layer III**                                 | From PER/multimodal cortices (plastic)                                  | Object–context associations, temporal sequence input                                         | To **CA1 (fixed)**, **Subiculum (fixed)**                  |
+| **LEC Layer Va**                                  | From internal LEC processing (plastic)                                  | Integrates non-spatial context, sends to cortex                                              | To neocortex (plastic)                                     |
+| **LEC Layer Vb**                                  | From Subiculum, CA1 (plastic)                                           | Integrates hippocampal output with object/context input                                      | To LEC II/III (fixed-weight relay)                         |
+| **MEC – Medial Entorhinal Cortex (Encoder)**      |                                                                         |                                                                                              |                                                            |
+| **MEC Layer II**                                  | From MEC Vb, POR/RSC, thalamus (plastic)                                | Position & trajectory coding; attractor dynamics                                             | To DG (plastic), **CA3 (fixed)**, **CA2 (fixed)**, MEC Vb  |
+| **MEC Layer III**                                 | From MEC Vb, POR/RSC, thalamus (plastic)                                | Heading direction & speed coding; provides feedforward drive                                 | To **CA1 (fixed)**, **Subiculum (fixed)**                  |
+| **MEC Layer Va**                                  | From internal MEC processing (plastic)                                  | Low-excitability integrator; hidden states; gateway to cortex                                | To neocortex (plastic)                                     |
+| **MEC Layer Vb**                                  | From MEC II, Subiculum, CA1 (plastic)                                   | Integrates hippocampal reconstructions; hidden states; relay                                 | To MEC II/III (fixed-weight relay)                         |
+| **Hippocampal Circuit (Decoder)**                 |                                                                         |                                                                                              |                                                            |
+| **Dentate Gyrus (DG)**                            | From MEC II (plastic), LEC II (plastic)                                 | Sparse embeddings, pattern separation; neurogenesis expands coding                           | To CA3 (plastic)                                           |
+| **CA3**                                           | From DG (plastic), **MEC II/LEC II (fixed)**                            | Attractor dynamics, recurrent collaterals; pattern completion; place cells                   | To CA2 (plastic), CA1 (plastic)                            |
+| **CA2**                                           | From CA3 (plastic), **MEC II/LEC II (fixed)**                           | Specialized integration; SWR modulation; unique plasticity                                   | To CA1 (plastic)                                           |
+| **CA1**                                           | From CA3 & CA2 (plastic), **MEC III/LEC III (fixed feedforward drive)** | Compares predictions (CA3) vs. sensory (EC); reconstructs cognitive map; contextual encoding | To MEC Vb (plastic), LEC Vb (plastic), Subiculum (plastic) |
+| **Subiculum**                                     | From CA1 (plastic), **MEC III/LEC III (fixed)**                         | Major hippocampal output hub; border cells, head direction, grid-like coding                 | To MEC Vb, LEC Vb (plastic); neocortex                     |
 
 ## Models and Experiments
 
