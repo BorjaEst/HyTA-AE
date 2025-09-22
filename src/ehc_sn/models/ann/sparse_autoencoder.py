@@ -108,10 +108,10 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def compute_loss(self, outputs: Tensor, batch: Tensor) -> List[Tensor]:
-        sensors, *_ = batch
+        _sensors, targets = batch
         reconstruction, latent = outputs
         sparsity_loss = self.sparsity_loss(latent)
-        reconstruction_loss = self.reconstruction_loss(reconstruction, sensors)
+        reconstruction_loss = self.reconstruction_loss(reconstruction, targets)
         return [reconstruction_loss, self.config.sparsity_weight * sparsity_loss]
 
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
