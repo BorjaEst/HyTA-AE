@@ -9,7 +9,7 @@ from torch.optim import Adam, Optimizer
 
 from ehc_sn.core import ann
 from ehc_sn.core.trainer import BaseTrainer
-from ehc_sn.modules import dfa, srtp
+from ehc_sn.modules import dfa, htl
 from ehc_sn.modules.loss import GramianOrthogonalityLoss as SparsityLoss
 
 
@@ -84,8 +84,8 @@ class HPC(nn.Module):
         super().__init__()
         self.sparsity_loss = SparsityLoss(center=True)
         self.dg = ann.Layer(nn.Linear(n_layerII, n_dg), nn.ReLU())
-        self.ca3 = ann.Layer(srtp.Linear(n_dg, n_ca3), nn.GELU())
-        self.ca1 = ann.Layer(srtp.Linear(n_ca3, n_ca1), nn.GELU())
+        self.ca3 = ann.Layer(htl.Linear(n_dg, n_ca3), nn.GELU())
+        self.ca1 = ann.Layer(htl.Linear(n_ca3, n_ca1), nn.GELU())
         self.subiculum = ann.Layer(nn.Linear(n_ca1, n_subiculum), nn.GELU())
 
     def forward(self, mec: MEC) -> None:

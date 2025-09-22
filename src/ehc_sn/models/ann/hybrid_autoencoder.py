@@ -9,7 +9,7 @@ from torch.optim import Adam, Optimizer
 
 from ehc_sn.core import ann
 from ehc_sn.core.trainer import BaseTrainer
-from ehc_sn.modules import dfa, srtp
+from ehc_sn.modules import dfa, htl
 from ehc_sn.modules.loss import GramianOrthogonalityLoss as SparsityLoss
 
 
@@ -61,8 +61,8 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, n_outputs: int, n_h1: int, n_h2: int, n_latents: int):
         super().__init__()
-        self.layer2 = ann.Layer(srtp.Linear(n_latents, n_h2), nn.GELU())
-        self.layer1 = ann.Layer(srtp.Linear(n_h2, n_h1), nn.GELU())
+        self.layer2 = ann.Layer(htl.Linear(n_latents, n_h2), nn.GELU())
+        self.layer1 = ann.Layer(htl.Linear(n_h2, n_h1), nn.GELU())
         self.output = ann.Layer(nn.Linear(n_h1, n_outputs), nn.Sigmoid())
 
     def forward(self, latent: Tensor) -> Tensor:

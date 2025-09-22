@@ -9,7 +9,7 @@ from torch.optim import Adam, Optimizer
 
 from ehc_sn.core import ann
 from ehc_sn.core.trainer import BaseTrainer
-from ehc_sn.modules import dfa, srtp
+from ehc_sn.modules import dfa, htl
 from ehc_sn.modules.loss import GramianOrthogonalityLoss as SparsityLoss
 
 
@@ -61,8 +61,9 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, n_outputs: int, n_h1: int, n_h2: int, n_latents: int):
         super().__init__()
-        self.layer2 = ann.Layer(srtp.Linear(n_latents, n_h2), nn.GELU())
-        self.layer1 = ann.Layer(srtp.Linear(n_h2, n_h1), nn.GELU())
+        synapses_2 = {"input": htl.Linear(n_latents, n_h2), "rcc": htl.Linear(n_h2, n_h2)}
+        self.layer2 = ann.Layer(synapses_2, nn.GELU())
+        self.layer1 = ann.Layer(htl.Linear(n_h2, n_h1), nn.GELU())
         self.output = ann.Layer(nn.Linear(n_h1, n_outputs), nn.Sigmoid())
 
     def forward(self, latent: Tensor) -> Tensor:
@@ -131,6 +132,11 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
         self.trainer_module.training_step(self, batch, batch_idx)
+        outputs = self(batch[0])
+        reconstruction_loss = nn.MSELoss(reduction="mean")(outputs[0], batch[0])
+        sparsity_rate = (outputs[1] > 0.01).float().mean()
+        self.log("train/sparsity_rate", sparsity_rate, prog_bar=True)
+        self.log("train/reconstruction_loss", reconstruction_loss, prog_bar=True)
 
     # -----------------------------------------------------------------------------------
     def validation_step(self, batch: Tensor, batch_idx: int) -> List[Tensor]:

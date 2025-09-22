@@ -13,7 +13,7 @@ in real neural systems.
 Key Features:
     - Biologically-inspired loss functions for sparse coding and homeostasis
     - Custom autograd functions for alternative learning algorithms
-    - Specialized neural network layers (DFA, DRTP, SRTP)
+    - Specialized neural network layers (DFA, DRTP, HTL)
     - Mathematical formulations based on neuroscience principles
     - Integration with PyTorch's automatic differentiation system
 
@@ -21,7 +21,7 @@ Components:
     loss: Loss functions for biological constraints (sparsity, orthogonality, homeostasis)
     dfa: Direct Feedback Alignment implementation with custom autograd
     drtp: Direct Random Target Projection learning mechanisms
-    srtp: Symmetric Random Target Projection algorithms
+    htl: Hierarchical Target Learning algorithms
     zo: Zeroth-order optimization methods
 
 Biological Motivation:

@@ -19,18 +19,18 @@ class Linear(nn.Linear):
 
 # -------------------------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Example usage of SRTP in a simple neural network
-    print("=== SRTP Layer Example ===")
+    # Example usage of HTL in a simple neural network
+    print("=== HTL Layer Example ===")
     torch.manual_seed(0)
 
     # Network parameters
     input_dim, hidden1_dim, hidden2_dim, output_dim = 5, 4, 3, 2
     batch_size = 2
 
-    # Create network layers with SRTP
+    # Create network layers with HTL
     layer1 = Linear(input_dim, hidden1_dim, error_features=output_dim)
     layer2 = Linear(hidden1_dim, hidden2_dim, error_features=output_dim)
-    layer3 = nn.Linear(hidden2_dim, output_dim)  # Output layer (no SRTP)
+    layer3 = nn.Linear(hidden2_dim, output_dim)  # Output layer (no HTL)
 
     # Optimizer
     parameters = list(layer1.parameters()) + list(layer2.parameters()) + list(layer3.parameters())
@@ -51,7 +51,7 @@ if __name__ == "__main__":
     h2 = torch.relu(layer2(h1))  # (batch_size, hidden2_dim)
     output = torch.sigmoid(layer3(h2.detach()))  # detach to isolate output path
 
-    # Retain grads to verify SRTP deltas
+    # Retain grads to verify HTL deltas
     h1.retain_grad()
     h2.retain_grad()
 
@@ -64,10 +64,10 @@ if __name__ == "__main__":
     loss = nn.MSELoss()(output, target)
     print(f"  Loss: {loss.item():.6f}")
 
-    # Global error for SRTP
+    # Global error for HTL
     global_error = (output - target).detach()  # (batch_size, output_dim)
 
-    # SRTP feedback (hidden layers)
+    # HTL feedback (hidden layers)
     layer1.feedback(global_error, context=h1)
     layer2.feedback(global_error, context=h2)
 
@@ -79,7 +79,7 @@ if __name__ == "__main__":
     print(f"  Layer2 grad shape: {tuple(layer2.weight.grad.shape)}")
     print(f"  Layer3 grad shape: {tuple(layer3.weight.grad.shape)}")
 
-    # Verify SRTP projections equal activation grads
+    # Verify HTL projections equal activation grads
     expected_grad1 = global_error @ layer1.fb_weight
     expected_grad2 = global_error @ layer2.fb_weight
     print("\nSRTP projection vs activation grad (norm diffs):")
