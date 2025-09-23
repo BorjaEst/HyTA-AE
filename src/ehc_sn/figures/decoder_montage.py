@@ -4,7 +4,7 @@ This module provides visualization for decoder weight montages showing the
 reconstructed patterns when individual latent units are activated.
 """
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 from matplotlib.axes import Axes
@@ -146,7 +146,7 @@ class DecoderMontageFigure(BaseFigure):
 
         return fig
 
-    def _compute_color_limits(self, maps: np.ndarray) -> tuple[float, float]:
+    def _compute_color_limits(self, maps: np.ndarray) -> Tuple[float, float]:
         """Compute color limits for the montage.
 
         Args:
