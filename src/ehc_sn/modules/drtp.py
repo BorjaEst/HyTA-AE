@@ -1,32 +1,71 @@
 import math
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
-from torch import Size, Tensor, nn
+from torch import Size, Tensor, autograd, nn
 
 
 # -------------------------------------------------------------------------------------------
-class Linear(nn.Linear):
-    def __init__(self, *args, target_features: int, device=None, dtype=None, **kwargs) -> None:
-        super().__init__(*args, device=device, dtype=dtype, **kwargs)
-        self.target_features = target_features
-        fb_weights = torch.zeros(target_features, self.out_features, device=device, dtype=dtype)
-        self.register_buffer("fb_weight", fb_weights)
-        self.reset_feedback()  # Initialize weights properly
+def apply(activations: Tensor, fb_weight: Tensor, target: Tensor) -> None:
+    """
+    Apply DRTP by broadcasting the target through a fixed random matrix and
+    backpropagating the resulting local gradient from the post-activation node.
+
+    Parameters
+    ----------
+    activations: Tensor
+        Post-activation tensor to serve as backward root (requires grad and NOT detached).
+    fb_weight: Tensor
+        Fixed feedback matrix of shape (target_features, units).
+    target: Tensor
+        Supervised targets of shape (batch, target_features). Detached internally.
+
+    Notes
+    -----
+    - Autograd will incorporate the activation derivative automatically because
+      we backprop from the post-activation node.
+    - This performs a backward pass rooted at `activations` only; graphs must be
+      decoupled across layers (use detach in forward).
+    """
+    delta = torch.matmul(target.detach(), fb_weight)  # (batch, units)
+    autograd.backward(activations, delta)
+    return None
+
+
+# -------------------------------------------------------------------------------------------
+class Linear(nn.Module):
+    """
+    DRTP projector module. Stores a fixed random projection from targets to a layer's units,
+    and triggers a local backward rooted at the given post-activation tensor.
+    """
+
+    def __init__(self, target_features: int, out_features: int, device=None, dtype=None) -> None:
+        super().__init__()
+        fb_weights = torch.zeros(target_features, out_features, device=device, dtype=dtype)
+        self.register_buffer("fb_weight", fb_weights)  # (target_features, units)
+        self.reset_feedback()
+        self.last_input: Optional[Tensor] = None
+
+    @property
+    def target_features(self) -> int:
+        return self.fb_weight.shape[0]
+
+    @property
+    def out_features(self) -> int:
+        return self.fb_weight.shape[1]
 
     def forward(self, input: Tensor) -> Tensor:
-        # Detach to enforce locality (no upstream gradient)
-        return super().forward(input.detach())
+        # Store non-detached activation for backward; return detached for feedforward isolation
+        self.last_input = input
+        return input.detach()
 
-    def feedback(self, target: Tensor, context: Tensor) -> None:
-        delta = target.detach() @ self.fb_weight  # (batch_size, out_features)
-        torch.autograd.backward(context, delta)
+    def feedback(self, target: Tensor) -> None:
+        if self.last_input is None:
+            raise RuntimeError("feedback() called before forward; no stored activation.")
+        apply(self.last_input, self.fb_weight, target)
 
     def extra_repr(self) -> str:
-        return (
-            f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"target_features={self.target_features}"
-        )
+        return f"target_features={self.target_features}, out_features={self.out_features}"
 
     def reset_feedback(self) -> None:
         limit = 1.0 / math.sqrt(self.target_features)
@@ -44,9 +83,11 @@ if __name__ == "__main__":
     batch_size = 2
 
     # Create network layers
-    layer1 = Linear(input_dim, hidden1_dim, target_features=output_dim)
-    layer2 = Linear(hidden1_dim, hidden2_dim, target_features=output_dim)
-    layer3 = nn.Linear(hidden2_dim, output_dim)  # Output layer (no DRTP)
+    layer1 = nn.Linear(input_dim, hidden1_dim)
+    fb1 = Linear(output_dim, hidden1_dim)  # (target_features=output_dim, units=hidden1_dim)
+    layer2 = nn.Linear(hidden1_dim, hidden2_dim)
+    fb2 = Linear(output_dim, hidden2_dim)  # (target_features=output_dim, units=hidden2_dim)
+    layer3 = nn.Linear(hidden2_dim, output_dim)
 
     # Optimizer
     parameters = list(layer1.parameters()) + list(layer2.parameters()) + list(layer3.parameters())
@@ -54,51 +95,48 @@ if __name__ == "__main__":
     optimizer.zero_grad()
 
     # Create input and target
-    x = torch.randn(batch_size, input_dim, requires_grad=True)
-    target = torch.randn(batch_size, output_dim)
+    x = torch.randn(batch_size, input_dim)
+    target = torch.randint(0, 2, (batch_size, output_dim), dtype=torch.float32)  # simple binary targets
 
-    print(f"Input shape: {x.shape}")
-    print(f"Target shape: {target.shape}")
-    print(f"DRTP1 projection matrix shape: {layer1.fb_weight.shape}")
-    print(f"DRTP2 projection matrix shape: {layer2.fb_weight.shape}")
+    # Forward pass (projector variant)
+    h1 = torch.relu(layer1(x))
+    h1_ = fb1(h1)  # returns detached view
+    h2 = torch.relu(layer2(h1_))
+    h2_ = fb2(h2)  # returns detached view
+    logits = layer3(h2_)
+    output = torch.sigmoid(logits)
 
-    # Forward pass
-    h1 = torch.relu(layer1(x))  # (batch_size, hidden1_dim)
-    h2 = torch.relu(layer2(h1))  # (batch_size, hidden2_dim)
-    output = torch.sigmoid(layer3(h2.detach()))  # detach to isolate output path
-
-    # Retain grads to verify DFA deltas
     h1.retain_grad()
     h2.retain_grad()
 
-    print(f"\nForward pass:")
+    print("\nForward pass:")
     print(f"  Hidden 1 shape: {h1.shape}")
     print(f"  Hidden 2 shape: {h2.shape}")
     print(f"  Output shape: {output.shape}")
 
     # Compute loss
-    loss = nn.MSELoss()(output, target)
+    loss = nn.BCELoss()(output, target)
     print(f"  Loss: {loss.item():.6f}")
 
-    # Feedback pass
-    layer1.feedback(target, context=h1)
-    layer2.feedback(target, context=h2)
-    loss.backward()  # Backprop through output layer
+    # DRTP feedback for hidden layers
+    fb1.feedback(target)
+    fb2.feedback(target)
 
-    # Feedback pass
-    print(f"\After backward:")
-    print(f"  Layer1 grad: {layer1.weight.grad}")
-    print(f"  Layer2 grad: {layer2.weight.grad}")
-    print(f"  Layer3 grad: {layer3.weight.grad}")
+    # Standard backward for output layer
+    loss.backward()
 
-    # Verify DRTP projections
-    print(f"\nDRTP projections:")
-    expected_grad1 = torch.matmul(target, layer1.fb_weight)  # Should match h1 gradients
-    expected_grad2 = torch.matmul(target, layer2.fb_weight)  # Should match h2 gradients
-    print(f"  Expected DRTP1 gradient shape: {expected_grad1.shape}")
-    print(f"  Expected DRTP2 gradient shape: {expected_grad2.shape}")
+    print("\nAfter backward:")
+    print(f"  Layer1 grad norm: {layer1.weight.grad.norm():.4f}")
+    print(f"  Layer2 grad norm: {layer2.weight.grad.norm():.4f}")
+    print(f"  Layer3 grad norm: {layer3.weight.grad.norm():.4f}")
 
-    # Optimize weights
+    # Verify DRTP projections have expected shapes
+    proj1 = torch.matmul(target, fb1.fb_weight)
+    proj2 = torch.matmul(target, fb2.fb_weight)
+    print("\nDRTP projections:")
+    print(f"  DRTP1 projection shape: {proj1.shape} (should match h1 shape)")
+    print(f"  DRTP2 projection shape: {proj2.shape} (should match h2 shape)")
+
     optimizer.step()
 
-    print(f"\nDRTP Layer example completed successfully!")
+    print("\nDRTP Layer example completed successfully!")
