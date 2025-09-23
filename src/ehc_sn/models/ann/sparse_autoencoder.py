@@ -116,6 +116,11 @@ class Autoencoder(pl.LightningModule):
 
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
         self.trainer_module.training_step(self, batch, batch_idx)
+        outputs = self(batch[0])
+        reconstruction_loss = nn.MSELoss(reduction="mean")(outputs[0], batch[0])
+        sparsity_rate = (outputs[1] > 0.01).float().mean()
+        self.log("train/sparsity_rate", sparsity_rate, prog_bar=True)
+        self.log("train/reconstruction_loss", reconstruction_loss, prog_bar=True)
 
     def validation_step(self, batch: Tensor, batch_idx: int) -> List[Tensor]:
         outputs = self(batch[0])
