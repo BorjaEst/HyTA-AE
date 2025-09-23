@@ -205,14 +205,14 @@ class VectorHaSH(nn.Module):
 
 # -------------------------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Test hippocampal state generation with position and context
-    print("=== Testing VectorHaSH with position and context ===")
+    # Test hippocampal state generation with a batch of positions and contexts
+    print("=== Testing VectorHaSH with batched input ===")
 
     params = ModelParams(grid_sizes=[2, 3, 6], contexts_size=[4, 5, 3])
     model = VectorHaSH(params)
 
-    positions: List[Tuple[int, int]] = [(0, 0), (17, 5), (35, 35)]
-    context_inputs: List[List[int]] = [[0, 2, 1], [3, 4, 0], [1, 1, 2]]
+    batch_positions: List[Tuple[int, int]] = [(0, 0), (17, 5), (35, 35)]
+    batch_contexts: List[List[int]] = [[0, 2, 1], [3, 4, 0], [1, 1, 2]]
 
     print("VectorHaSH demo")
     print(f"MEC scales={model.mec_layerII._s.tolist()}, period={model.mec_layerII.period}")
@@ -223,8 +223,11 @@ if __name__ == "__main__":
     for i, c in enumerate(model.lec_layerII._c):
         print(f"  context[{i}] size={c.item()}")
 
-    for pos, ctx in zip(positions, context_inputs):
-        y = model.forward(pos, ctx)  # CA3 output (concatenated predictions)
+    batch_outputs: List[Tensor] = []
+    for pos, ctx in zip(batch_positions, batch_contexts):
+        y = model.forward(pos, ctx)  # CA3 output for one sample
+        batch_outputs.append(y.unsqueeze(0))  # collect as batch
+
         mec_cells = [grid_tools.extract_cell_coords(g) for g in model.mec_targets]
         mec_decoded = model.mec_layerII.decode(model.mec_targets)
         lec_decoded = model.lec_layerII.decode(model.lec_targets)
@@ -233,4 +236,7 @@ if __name__ == "__main__":
         print(f"  MEC active cells per scale: {mec_cells}")
         print(f"  MEC decoded position: {mec_decoded}")
         print(f"  LEC decoded context: {lec_decoded}")
-        print(f"  CA3 output shape: {tuple(y.shape) if isinstance(y, torch.Tensor) else 'N/A'}")
+        print(f"  CA3 sample output shape: {tuple(y.shape)}")
+
+    Y = torch.cat(batch_outputs, dim=0)
+    print(f"\nBatched CA3 output shape: {tuple(Y.shape)}")
