@@ -26,7 +26,7 @@ class ModelParams(BaseModel):
 
     # Toroidal manifold shapes
     grid_sizes: List[int] = Field([2, 3, 6], description="List of grid scales.")
-    contexts_size: int = Field([30] * 4, description="List of context vector sizes.")
+    contexts_size: List[int] = Field([30] * 4, description="List of context vector sizes.")
 
     @property
     def ec_clusters(self) -> int:
@@ -88,10 +88,10 @@ class LECLayerII:
 
 # -------------------------------------------------------------------------------------------
 class DG(nn.Module):
-    def __init__(self, latent_size: int, mec_units: List[int], lec_units: List[int]):
+    def __init__(self, latent_size: int, mec_units: int, lec_units: int):
         super().__init__()
-        syn_mec = nn.Linear(sum(mec_units), latent_size)
-        syn_lec = nn.Linear(sum(lec_units), latent_size)
+        syn_mec = nn.Linear(mec_units, latent_size)
+        syn_lec = nn.Linear(lec_units, latent_size)
         self.synapses = nn.ModuleDict({"mec": syn_mec, "lec": syn_lec})
         self.activation = nn.ReLU()
 
@@ -106,21 +106,21 @@ class CA3Cluster(nn.Module):
         super().__init__()
         self.input_syn = nn.Linear(latent_units, cluster_size)
         self.recurrent_syn = nn.Linear(ca3_units, cluster_size)
-        self.target_syn = drtp.Linear(cluster_size, target_size)  # TODO this is not correct
         self.activation = nn.ReLU()
+        self.target_syn = drtp.Linear(target_size, cluster_size)
         self.state: Optional[Tensor] = None
 
     # -----------------------------------------------------------------------------------
-    def forward(self, dg_input: Tensor, recurrent_input: Optional[Tensor] = None) -> Tensor:
+    def forward(self, dg_input: Tensor, recurrent_input: Tensor) -> Tensor:
         x = self.input_syn(dg_input)
         if recurrent_input is not None:
             x = x + self.recurrent_syn(recurrent_input)
         self.state = self.activation(x)
-        return self.state
+        return self.target_syn(self.state)  # Store state for feedback
 
     # -----------------------------------------------------------------------------------
     def feedback(self, target: Tensor) -> None:
-        return  # TODO
+        self.target_syn.feedback(target)
 
 
 # -------------------------------------------------------------------------------------------
@@ -134,21 +134,35 @@ class CA3(nn.Module):
         self.clusters = nn.ModuleDict(clusters_dict)
 
     # -----------------------------------------------------------------------------------
-    @property
-    def state(self) -> Optional[Tensor]:
-        if self.clusters[0].state is None:  # If 1 None, all None
-            return None
-        return cat([c.state for c in self.clusters], dim=-1)
+    def _build_recurrent_input(self, batch: int, device: torch.device) -> Tensor:
+        # Concatenate states from all clusters; zeros if state is None. Shape: (B, total_ca3_units)
+        parts: List[Tensor] = []
+        for c in self.clusters["mec"] + self.clusters["lec"]:
+            if c.state is None:
+                parts.append(torch.zeros(batch, self.cluster_size, device=device))
+            else:
+                parts.append(c.state)
+        return cat(parts, dim=-1)  # (B, n_clusters * cluster_size)
 
     # -----------------------------------------------------------------------------------
     def forward(self, dg_pattern: Tensor) -> Tensor:
-        pass  # TODO: Implement recurrent CA3 forward pass
+        # Ensure batch dimension
+        squeeze_out = False
+        if dg_pattern.ndim == 1:
+            dg_pattern = dg_pattern.unsqueeze(0)
+            squeeze_out = True
+        B = dg_pattern.shape[0]
+        device = dg_pattern.device
 
-    # -----------------------------------------------------------------------------------
-    def set_targets(self, mec_targets: List[Tensor], lec_targets: List[Tensor]) -> None:
-        all_targets = mec_targets + lec_targets
-        for cluster, target in zip(self.clusters, all_targets):
-            cluster.set_target(flatten(target))
+        recurrent_input = self._build_recurrent_input(B, device)  # (B, total_ca3_units)
+
+        outputs: List[Tensor] = []
+        for cluster in self._all_clusters():
+            out = cluster(dg_pattern, recurrent_input)  # (B, target_size_i)
+            outputs.append(out)
+
+        y = cat(outputs, dim=-1)  # (B, sum(target_sizes))
+        return y.squeeze(0) if squeeze_out else y
 
     # -----------------------------------------------------------------------------------
     def feedback_mec(self, targets: List[Tensor]) -> None:
@@ -164,7 +178,7 @@ class CA3(nn.Module):
 class VectorHaSH(nn.Module):
     def __init__(self, params: Optional[ModelParams] = None):
         super().__init__()
-        self.params = params or ModelParams()
+        self.params = params = params or ModelParams()
         self.mec_layerII = MECLayerII(scales=params.grid_sizes)
         self.lec_layerII = LECLayerII(contexts=params.contexts_size)
         self.dg = DG(params.latent_size, *params.ec_units)
@@ -172,16 +186,19 @@ class VectorHaSH(nn.Module):
 
     # -----------------------------------------------------------------------------------
     def forward(self, position: Tuple[int, int], context: List[int]) -> Tensor:
-        self.mec_targets = self.mec_layerII.encode(position)
-        self.lec_targets = self.lec_layerII.encode(context)
-        mec_flat = flatten(cat(self.mec_targets))
-        lec_flat = flatten(cat(self.lec_targets))
+        # Targets from EC
+        self.mec_targets = self.mec_layerII.encode(position)  # list[Si x Si]
+        self.lec_targets = self.lec_layerII.encode(context)  # list[Ci]
 
+        # Flatten and concatenate EC targets for DG input
+        mec_flat = cat([g.reshape(-1) for g in self.mec_targets], dim=0)
+        lec_flat = cat([g.reshape(-1) for g in self.lec_targets], dim=0)
+
+        # DG and CA3 dynamics
         dg_pattern = self.dg(mec_flat, lec_flat)
-        for _loop in range(self.params.state_loops):
-            ca3_output = self.ca3(dg_pattern)  # Recurrent CA3 updates
-
-        return ca3_output
+        for _ in range(self.params.state_loops):
+            y = self.ca3(dg_pattern)  # recurrent updates use internal cluster states
+        return y
 
     # -----------------------------------------------------------------------------------
     def feedback(self) -> None:
@@ -194,7 +211,6 @@ if __name__ == "__main__":
     # Test hippocampal state generation with position and context
     print("=== Testing VectorHaSH with position and context ===")
 
-    # Create VectorHaSH model with parameters
     params = ModelParams(grid_sizes=[2, 3, 6], contexts_size=[4, 5, 3])
     model = VectorHaSH(params)
 
@@ -203,7 +219,7 @@ if __name__ == "__main__":
 
     print("VectorHaSH demo")
     print(f"MEC scales={model.mec_layerII._s.tolist()}, period={model.mec_layerII.period}")
-    for i, s in enumerate(model.mec_layerII._s):
+    for s in model.mec_layerII._s:
         print(f"  scale={s.item()} -> grid shape=({s.item()}, {s.item()})")
 
     print(f"\nLEC contexts={model.lec_layerII._c.tolist()}")
@@ -211,20 +227,13 @@ if __name__ == "__main__":
         print(f"  context[{i}] size={c.item()}")
 
     for pos, ctx in zip(positions, context_inputs):
-        # Use VectorHaSH forward method
-        mec_targets, lec_targets = model.forward(pos, ctx)
-
-        # Extract information for display
-        mec_cells = [grid_tools.extract_cell_coords(g) for g in mec_targets]
-        mec_decoded = model.mec_layerII.decode(mec_targets)
-        mec_re_cells = [grid_tools.extract_cell_coords(g) for g in model.mec_layerII.encode(mec_decoded)]
-
-        lec_decoded = model.lec_layerII.decode(lec_targets)
-        lec_re_encoded = model.lec_layerII.decode(model.lec_layerII.encode(lec_decoded))
+        y = model.forward(pos, ctx)  # CA3 output (concatenated predictions)
+        mec_cells = [grid_tools.extract_cell_coords(g) for g in model.mec_targets]
+        mec_decoded = model.mec_layerII.decode(model.mec_targets)
+        lec_decoded = model.lec_layerII.decode(model.lec_targets)
 
         print(f"\nposition={pos}, context={ctx}")
         print(f"  MEC active cells per scale: {mec_cells}")
         print(f"  MEC decoded position: {mec_decoded}")
-        print(f"  MEC re-encoded cells: {mec_re_cells}")
         print(f"  LEC decoded context: {lec_decoded}")
-        print(f"  LEC re-encoded context: {lec_re_encoded}")
+        print(f"  CA3 output shape: {tuple(y.shape) if isinstance(y, torch.Tensor) else 'N/A'}")
