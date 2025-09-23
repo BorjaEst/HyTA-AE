@@ -25,7 +25,7 @@ def create_grid(digit: int, scale: Tensor) -> Tensor:
 
 
 # -------------------------------------------------------------------------------------------
-def extract_cell_coords(grid: Tensor) -> tuple[int, int]:
+def extract_cell_coords(grid: Tensor) -> Tuple[int, int]:
     """Extract row, col coordinates from a grid's active cell."""
     idx = int(grid.argmax().item())
     s = grid.shape[0]
