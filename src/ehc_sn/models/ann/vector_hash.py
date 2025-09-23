@@ -211,6 +211,10 @@ if __name__ == "__main__":
     params = ModelParams(grid_sizes=[2, 3, 6], contexts_size=[4, 5, 3])
     model = VectorHaSH(params)
 
+    # Optimizer and loss
+    optimizer = Adam(model.parameters(), lr=1e-3)
+    criterion = nn.MSELoss()
+
     batch_positions: List[Tuple[int, int]] = [(0, 0), (17, 5), (35, 35)]
     batch_contexts: List[List[int]] = [[0, 2, 1], [3, 4, 0], [1, 1, 2]]
 
@@ -225,7 +229,22 @@ if __name__ == "__main__":
 
     batch_outputs: List[Tensor] = []
     for pos, ctx in zip(batch_positions, batch_contexts):
+        # Forward
         y = model.forward(pos, ctx)  # CA3 output for one sample
+
+        # Build EC target vector to match CA3 output
+        target_vec = cat(
+            [g.reshape(-1).float() for g in (model.mec_targets + model.lec_targets)],
+            dim=0,
+        )
+
+        # Optimization step (Adam) + DRTP feedback
+        optimizer.zero_grad()
+        loss = criterion(y, target_vec)
+        loss.backward()
+        optimizer.step()
+        model.feedback()
+
         batch_outputs.append(y.unsqueeze(0))  # collect as batch
 
         mec_cells = [grid_tools.extract_cell_coords(g) for g in model.mec_targets]
@@ -237,6 +256,7 @@ if __name__ == "__main__":
         print(f"  MEC decoded position: {mec_decoded}")
         print(f"  LEC decoded context: {lec_decoded}")
         print(f"  CA3 sample output shape: {tuple(y.shape)}")
+        print(f"  Loss: {loss.item():.6f}")
 
     Y = torch.cat(batch_outputs, dim=0)
     print(f"\nBatched CA3 output shape: {tuple(Y.shape)}")
