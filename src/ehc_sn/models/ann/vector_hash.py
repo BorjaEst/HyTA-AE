@@ -10,7 +10,7 @@ from torch.optim import Adam, Optimizer
 
 from ehc_sn.core import ann
 from ehc_sn.core.trainer import BaseTrainer
-from ehc_sn.modules import dfa, htl
+from ehc_sn.modules import dfa, drtp, htl
 from ehc_sn.modules.loss import GramianOrthogonalityLoss as SparsityLoss
 from ehc_sn.utils import grid_tools
 
@@ -21,14 +21,21 @@ class ModelParams(BaseModel):
 
     # Dentate Gyrus parameters
     latent_size: int = Field(256, gt=0, description="Dimensionality of the DG latent space.")
+    substate_size: int = Field(32, gt=0, description="Dimensionality of each CA3 subcluster.")
 
     # Toroidal manifold shapes
     grid_sizes: List[int] = Field([2, 3, 6], description="List of grid scales.")
     contexts_size: int = Field([30] * 4, description="List of context vector sizes.")
 
-    # HPC CA3 parameters
-    states_size: int = Field(32, gt=0, description="Number of clusters each CA3 cluster.")
-    n_states: int = Field(16, gt=0, description="Number of CA3 clusters.")
+    @property
+    def ec_clusters(self) -> int:
+        """Return number of CA3 clusters (one per MEC scale and LEC context)."""
+        return len(self.grid_sizes) + len(self.contexts_size)
+
+    @property
+    def ec_units(self) -> Tuple[int, int]:
+        """Return total number of EC outputs (MEC + LEC)."""
+        return (sum(s * s for s in self.grid_sizes), sum(self.contexts_size))
 
 
 # -------------------------------------------------------------------------------------------
@@ -59,6 +66,7 @@ class MECLayerII:
         return len(self._s)
 
 
+# -------------------------------------------------------------------------------------------
 class LECLayerII:
     def __init__(self, contexts: List[int]):
         self._c = torch.tensor(contexts, dtype=torch.long)
@@ -77,21 +85,42 @@ class LECLayerII:
         return len(self._c)
 
 
+# -------------------------------------------------------------------------------------------
+class CA3(nn.Module):
+    def __init__(self, latent_size: int, n: int, mec_units: List[int], lec_units: List[int]):
+        super().__init__()
+        syn_mec = [drtp.Linear(latent_size, n, target_features=x) for x in mec_units]
+        syn_lec = [drtp.Linear(latent_size, n, target_features=x) for x in lec_units]
+        self.synapses = nn.ModuleDict({"mec": nn.ModuleList(syn_mec), "lec": nn.ModuleList(syn_lec)})
+        self.targets_store: List[Tensor] | None = None
+
+    def save_targets(self, targets: List[Tensor]) -> None:
+        self.targets_store = targets
+
+
+# -------------------------------------------------------------------------------------------
 class VectorHaSH(nn.Module):
     def __init__(self, params: ModelParams):
         super().__init__()
         self.params = params
+        self.dg = ann.Layer(nn.Linear(sum(params.ec_units), params.latent_size), nn.ReLU())
         self.mec_layerII = MECLayerII(scales=params.grid_sizes)
         self.lec_layerII = LECLayerII(contexts=params.contexts_size)
+        self.ca3 = CA3(params.latent_size, params.substate_size, *params.ec_units)
 
     # -----------------------------------------------------------------------------------
     def forward(self, position: Tuple[int, int], context: List[int]) -> None:
         mec_targets = self.mec_layerII.encode(position)  # One-hot grids per scale
         lec_targets = self.lec_layerII.encode(context)  # One-hot vectors per context
-        # Further processing can be added here
-        return mec_targets, lec_targets
+        self.ca3_targets = [flatten(g) for g in mec_targets] + [flatten(c) for c in lec_targets]
+
+    # -----------------------------------------------------------------------------------
+    def learn(self) -> None:
+        for cluster, target in zip(self.ca3.clusters, self.ca3_targets):
+            cluster.feedback(target)
 
 
+# -------------------------------------------------------------------------------------------
 if __name__ == "__main__":
     # Test hippocampal state generation with position and context
     print("=== Testing VectorHaSH with position and context ===")
