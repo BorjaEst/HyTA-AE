@@ -1,18 +1,11 @@
-import math
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, Union
+from typing import List, Optional, Tuple
 
 import torch
-from lightning import pytorch as pl
-from pydantic import BaseModel, Field, field_validator
-from torch import Tensor, cat, flatten, nn, unflatten
-from torch.nn.functional import one_hot
-from torch.optim import Adam, Optimizer
+from pydantic import BaseModel, Field
+from torch import Tensor, cat, nn
 
-from ehc_sn.core import ann
-from ehc_sn.core.trainer import BaseTrainer
-from ehc_sn.modules import dfa, drtp, htl
-from ehc_sn.modules.loss import GramianOrthogonalityLoss as SparsityLoss
-from ehc_sn.utils import grid_tools
+from ehc_sn.modules import drtp
+from ehc_sn.utils import encoding_utils
 
 
 # -------------------------------------------------------------------------------------------
@@ -36,48 +29,35 @@ class ModelParams(BaseModel):
 # -------------------------------------------------------------------------------------------
 class MECLayerII:
     def __init__(self, scales: List[int]):
-        self._s = torch.tensor(scales, dtype=torch.long)
-        self._strides = grid_tools.compute_strides(self._s)
-        self.period = int(torch.prod(self._s).item())
+        self.scales = torch.tensor(scales, dtype=torch.long)
+        self.strides = encoding_utils.compute_strides(self.scales)
+        self.period = int(torch.prod(self.scales).item())
 
-    # -----------------------------------------------------------------------------------
-    def encode(self, position: Tuple[int, int]) -> List[torch.Tensor]:
-        rs = grid_tools.extract_digits(position[0], self._strides, self._s)
-        cs = grid_tools.extract_digits(position[1], self._strides, self._s)
-        idx = rs * self._s + cs
-        return [grid_tools.create_grid(idx[i], self._s[i]) for i in range(len(self._s))]
+    def encode(self, positions: Tensor) -> List[Tensor]:
+        indices = encoding_utils.extract_grid_digits(positions, self.strides, self.scales, self.period)
+        return encoding_utils.encode_grid_batch(indices, self.scales)
 
-    # -----------------------------------------------------------------------------------
-    def decode(self, grids: List[torch.Tensor]) -> Tuple[int, int]:
-        coords = [grid_tools.extract_cell_coords(g) for g in grids]
-        r_digits = torch.tensor([r for r, _ in coords], dtype=torch.long)
-        c_digits = torch.tensor([c for _, c in coords], dtype=torch.long)
-        r = int((r_digits * self._strides).sum().item())
-        c = int((c_digits * self._strides).sum().item())
-        return r, c
+    def decode(self, grids: List[torch.Tensor]) -> torch.Tensor:
+        return encoding_utils.decode_grid_batch(grids, self.scales, self.strides)
 
-    # -----------------------------------------------------------------------------------
     def __len__(self) -> int:
-        return len(self._s)
+        return len(self.scales)
 
 
 # -------------------------------------------------------------------------------------------
 class LECLayerII:
     def __init__(self, contexts: List[int]):
-        self._c = torch.tensor(contexts, dtype=torch.long)
+        self.contexts = torch.tensor(contexts, dtype=torch.long)
 
-    # -----------------------------------------------------------------------------------
-    def encode(self, context: List[int]) -> List[Tensor]:
-        seq = enumerate(torch.tensor(context, dtype=torch.long))
-        return [one_hot(ctx, num_classes=self._c[i].item()).float() for i, ctx in seq]
+    def encode(self, contexts: torch.Tensor) -> List[Tensor]:
+        return encoding_utils.encode_categorical_batch(contexts, self.contexts)
 
-    # -----------------------------------------------------------------------------------
-    def decode(self, contexts: List[Tensor]) -> List[int]:
-        return [int(torch.argmax(ctx).item()) for ctx in contexts]
+    def decode(self, contexts: List[Tensor]) -> torch.Tensor:
+        """Decode contexts using shared categorical decoding utilities."""
+        return encoding_utils.decode_categorical_batch(contexts)
 
-    # -----------------------------------------------------------------------------------
     def __len__(self) -> int:
-        return len(self._c)
+        return len(self.contexts)
 
 
 # -------------------------------------------------------------------------------------------
@@ -101,20 +81,13 @@ class CA3Cluster(nn.Module):
         self.input_syn = nn.Linear(latent_units, cluster_size)
         self.recurrent_syn = nn.Linear(ca3_units, cluster_size)
         self.activation = nn.ReLU()
-        self.target_syn = drtp.Linear(target_size, cluster_size)
+        self.target_syn = drtp.Linear(cluster_size, target_features=target_size)
         self.state: Optional[Tensor] = None
 
-    # -----------------------------------------------------------------------------------
     def forward(self, dg_input: Tensor, recurrent_input: Tensor) -> Tensor:
-        x = self.input_syn(dg_input)
-        if recurrent_input is not None:
-            x = x + self.recurrent_syn(recurrent_input)
+        x = self.input_syn(dg_input) + self.recurrent_syn(recurrent_input)
         self.state = self.activation(x)
-        return self.target_syn(self.state)  # Store state for feedback
-
-    # -----------------------------------------------------------------------------------
-    def feedback(self, target: Tensor) -> None:
-        self.target_syn.feedback(target)
+        return self.target_syn(self.state)
 
 
 # -------------------------------------------------------------------------------------------
@@ -132,43 +105,26 @@ class CA3(nn.Module):
     def units(self) -> int:
         return self.n_clusters * self.cluster_size
 
-    # -----------------------------------------------------------------------------------
-    def _build_recurrent_input(self, batch: int, device: torch.device) -> Tensor:
-        parts: List[Tensor] = []
+    def reset_states(self) -> None:
         for c in list(self.clusters["mec"]) + list(self.clusters["lec"]):
-            if c.state is None:
-                parts.append(torch.zeros(batch, self.cluster_size, device=device))
-            else:
-                parts.append(c.state)
+            c.state = None
+
+    def _build_recurrent_input(self, batch: int, device: torch.device) -> Tensor:
+        parts = [
+            c.state.detach() if c.state is not None else torch.zeros(batch, self.cluster_size, device=device)
+            for c in list(self.clusters["mec"]) + list(self.clusters["lec"])
+        ]
         return cat(parts, dim=-1)
 
-    # -----------------------------------------------------------------------------------
     def forward(self, dg_pattern: Tensor) -> Tensor:
-        squeeze_out = False
-        if dg_pattern.ndim == 1:
-            dg_pattern = dg_pattern.unsqueeze(0)
-            squeeze_out = True
         B = dg_pattern.shape[0]
         device = dg_pattern.device
-
         recurrent_input = self._build_recurrent_input(B, device)
 
-        outputs: List[Tensor] = []
-        for cluster in list(self.clusters["mec"]) + list(self.clusters["lec"]):
-            out = cluster(dg_pattern, recurrent_input)
-            outputs.append(out)
-
-        y = cat(outputs, dim=-1)
-        return y.squeeze(0) if squeeze_out else y
-
-    # -----------------------------------------------------------------------------------
-    def feedback_mec(self, targets: List[Tensor]) -> None:
-        for i, cluster in enumerate(self.clusters["mec"]):
-            cluster.feedback(targets[i].reshape(-1).float())
-
-    def feedback_lec(self, targets: List[Tensor]) -> None:
-        for i, cluster in enumerate(self.clusters["lec"]):
-            cluster.feedback(targets[i].reshape(-1).float())
+        outputs = [
+            cluster(dg_pattern, recurrent_input) for cluster in list(self.clusters["mec"]) + list(self.clusters["lec"])
+        ]
+        return cat(outputs, dim=-1)
 
 
 # -----------------------------------------------------------------------------------
@@ -181,82 +137,87 @@ class VectorHaSH(nn.Module):
         self.dg = DG(params.latent_size, *params.ec_shapes)
         self.ca3 = CA3(params.latent_size, params.substate_size, *params.ec_shapes)
 
-    # -----------------------------------------------------------------------------------
-    def forward(self, position: Tuple[int, int], context: List[int]) -> Tensor:
-        # Targets from EC
-        self.mec_targets = self.mec_layerII.encode(position)  # list[Si x Si]
-        self.lec_targets = self.lec_layerII.encode(context)  # list[Ci]
+    def forward(self, positions: Tensor, contexts: Tensor) -> Tensor:
+        self.mec_targets = self.mec_layerII.encode(positions)
+        self.lec_targets = self.lec_layerII.encode(contexts)
 
         # Flatten and concatenate EC targets for DG input
-        mec_flat = cat([g.reshape(-1) for g in self.mec_targets], dim=0)
-        lec_flat = cat([g.reshape(-1) for g in self.lec_targets], dim=0)
+        mec_flat = cat(self.mec_targets, dim=-1)
+        lec_flat = cat(self.lec_targets, dim=-1)
 
         # DG and CA3 dynamics
         dg_pattern = self.dg(mec_flat, lec_flat)
+        self.ca3.reset_states()
         for _ in range(self.params.state_loops):
-            y = self.ca3(dg_pattern)  # recurrent updates use internal cluster states
-        return y
+            y = self.ca3(dg_pattern)
 
-    # -----------------------------------------------------------------------------------
+        return y.detach()
+
     def feedback(self) -> None:
-        self.ca3.feedback_mec(self.mec_targets)
-        self.ca3.feedback_lec(self.lec_targets)
+        activations = []
+        deltas = []
+
+        # MEC feedback
+        for i, cluster in enumerate(self.ca3.clusters["mec"]):
+            t = self.mec_targets[i]
+            delta = torch.matmul(t.detach().float(), cluster.target_syn.fb_weight)
+            activations.append(cluster.target_syn.last_input)
+            deltas.append(delta)
+
+        # LEC feedback
+        for i, cluster in enumerate(self.ca3.clusters["lec"]):
+            t = self.lec_targets[i]
+            delta = torch.matmul(t.detach().float(), cluster.target_syn.fb_weight)
+            activations.append(cluster.target_syn.last_input)
+            deltas.append(delta)
+
+        torch.autograd.backward(activations, deltas)
 
 
 # -------------------------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Test hippocampal state generation with a batch of positions and contexts
-    print("=== Testing VectorHaSH with batched input ===")
+    # Test hippocampal state generation with tensor-only API
+    print("=== Testing VectorHaSH with tensor-only encoder API ===")
+    from torch.optim import Adam
+
+    torch.manual_seed(0)
 
     params = ModelParams(grid_sizes=[2, 3, 6], contexts_size=[4, 5, 3])
     model = VectorHaSH(params)
 
-    # Optimizer and loss
+    # Optimizer
     optimizer = Adam(model.parameters(), lr=1e-3)
-    criterion = nn.MSELoss()
 
-    batch_positions: List[Tuple[int, int]] = [(0, 0), (17, 5), (35, 35)]
-    batch_contexts: List[List[int]] = [[0, 2, 1], [3, 4, 0], [1, 1, 2]]
+    batch_positions = torch.tensor([(0, 0), (17, 5), (35, 35)], dtype=torch.long)
+    batch_contexts = torch.tensor([[0, 2, 1], [3, 4, 0], [1, 1, 2]], dtype=torch.long)
 
     print("VectorHaSH demo")
-    print(f"MEC scales={model.mec_layerII._s.tolist()}, period={model.mec_layerII.period}")
-    for s in model.mec_layerII._s:
+    print(f"MEC scales={model.mec_layerII.scales.tolist()}, period={model.mec_layerII.period}")
+    for s in model.mec_layerII.scales:
         print(f"  scale={s.item()} -> grid shape=({s.item()}, {s.item()})")
 
-    print(f"\nLEC contexts={model.lec_layerII._c.tolist()}")
-    for i, c in enumerate(model.lec_layerII._c):
+    print(f"\nLEC contexts={model.lec_layerII.contexts.tolist()}")
+    for i, c in enumerate(model.lec_layerII.contexts):
         print(f"  context[{i}] size={c.item()}")
 
-    batch_outputs: List[Tensor] = []
-    for pos, ctx in zip(batch_positions, batch_contexts):
-        # Forward
-        y = model.forward(pos, ctx)  # CA3 output for one sample
+    # Forward on full batch using tensor-only API
+    Y = model.forward(batch_positions, batch_contexts)
 
-        # Build EC target vector to match CA3 output
-        target_vec = cat(
-            [g.reshape(-1).float() for g in (model.mec_targets + model.lec_targets)],
-            dim=0,
-        )
+    # DRTP feedback + update
+    optimizer.zero_grad()
+    model.feedback()
+    optimizer.step()
 
-        # Optimization step (Adam) + DRTP feedback
-        optimizer.zero_grad()
-        loss = criterion(y, target_vec)
-        loss.backward()
-        optimizer.step()
-        model.feedback()
+    # Decode batch for inspection using tensor-only API
+    mec_decoded_t = model.mec_layerII.decode(model.mec_targets)  # (B, 2)
+    lec_decoded_t = model.lec_layerII.decode(model.lec_targets)  # (B, K)
 
-        batch_outputs.append(y.unsqueeze(0))  # collect as batch
-
-        mec_cells = [grid_tools.extract_cell_coords(g) for g in model.mec_targets]
-        mec_decoded = model.mec_layerII.decode(model.mec_targets)
-        lec_decoded = model.lec_layerII.decode(model.lec_targets)
-
-        print(f"\nposition={pos}, context={ctx}")
-        print(f"  MEC active cells per scale: {mec_cells}")
-        print(f"  MEC decoded position: {mec_decoded}")
-        print(f"  LEC decoded context: {lec_decoded}")
-        print(f"  CA3 sample output shape: {tuple(y.shape)}")
-        print(f"  Loss: {loss.item():.6f}")
-
-    Y = torch.cat(batch_outputs, dim=0)
-    print(f"\nBatched CA3 output shape: {tuple(Y.shape)}")
+    print(f"\nBatched CA3 output shape across {batch_positions.shape[0]} samples: {tuple(Y.shape)}")
+    for i in range(batch_positions.shape[0]):
+        pos = tuple(batch_positions[i].tolist())
+        ctx = batch_contexts[i].tolist()
+        mec_dec = tuple(mec_decoded_t[i].tolist())
+        lec_dec = lec_decoded_t[i].tolist()
+        print(f"Sample {i+1}:")
+        print(f"  Input position={pos}, context={ctx}")
+        print(f"  Decoded MEC position={mec_dec}, decoded LEC context={lec_dec}")

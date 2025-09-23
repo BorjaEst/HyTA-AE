@@ -39,9 +39,9 @@ class Linear(nn.Module):
     and triggers a local backward rooted at the given post-activation tensor.
     """
 
-    def __init__(self, target_features: int, out_features: int, device=None, dtype=None) -> None:
+    def __init__(self, units: int, target_features: int, device=None, dtype=None) -> None:
         super().__init__()
-        fb_weights = torch.zeros(target_features, out_features, device=device, dtype=dtype)
+        fb_weights = torch.zeros(target_features, units, device=device, dtype=dtype)
         self.register_buffer("fb_weight", fb_weights)  # (target_features, units)
         self.reset_feedback()
         self.last_input: Optional[Tensor] = None
@@ -52,6 +52,10 @@ class Linear(nn.Module):
 
     @property
     def out_features(self) -> int:
+        return self.fb_weight.shape[1]
+
+    @property
+    def in_features(self) -> int:
         return self.fb_weight.shape[1]
 
     def forward(self, input: Tensor) -> Tensor:
@@ -65,7 +69,10 @@ class Linear(nn.Module):
         apply(self.last_input, self.fb_weight, target)
 
     def extra_repr(self) -> str:
-        return f"target_features={self.target_features}, out_features={self.out_features}"
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"target_features={self.target_features}"
+        )
 
     def reset_feedback(self) -> None:
         limit = 1.0 / math.sqrt(self.target_features)
