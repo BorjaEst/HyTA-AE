@@ -33,20 +33,20 @@ class ModelParams(BaseModel):
 
 # -------------------------------------------------------------------------------------------
 class MECLayerII:
-    def __init__(self, scales: list[int]):
+    def __init__(self, scales: List[int]):
         self._s = torch.tensor(scales, dtype=torch.long)
         self._strides = grid_tools.compute_strides(self._s)
         self.period = int(torch.prod(self._s).item())
 
     # -----------------------------------------------------------------------------------
-    def encode(self, position: tuple[int, int]) -> list[torch.Tensor]:
+    def encode(self, position: Tuple[int, int]) -> List[torch.Tensor]:
         rs = grid_tools.extract_digits(position[0], self._strides, self._s)
         cs = grid_tools.extract_digits(position[1], self._strides, self._s)
         idx = rs * self._s + cs
         return [grid_tools.create_grid(idx[i], self._s[i]) for i in range(len(self._s))]
 
     # -----------------------------------------------------------------------------------
-    def decode(self, grids: list[torch.Tensor]) -> tuple[int, int]:
+    def decode(self, grids: List[torch.Tensor]) -> Tuple[int, int]:
         coords = [grid_tools.extract_cell_coords(g) for g in grids]
         r_digits = torch.tensor([r for r, _ in coords], dtype=torch.long)
         c_digits = torch.tensor([c for _, c in coords], dtype=torch.long)
@@ -60,16 +60,16 @@ class MECLayerII:
 
 
 class LECLayerII:
-    def __init__(self, contexts: list[int]):
+    def __init__(self, contexts: List[int]):
         self._c = torch.tensor(contexts, dtype=torch.long)
 
     # -----------------------------------------------------------------------------------
-    def encode(self, context: list[int]) -> list[Tensor]:
+    def encode(self, context: List[int]) -> List[Tensor]:
         seq = enumerate(torch.tensor(context, dtype=torch.long))
         return [one_hot(ctx, num_classes=self._c[i].item()) for i, ctx in seq]
 
     # -----------------------------------------------------------------------------------
-    def decode(self, contexts: list[Tensor]) -> list[int]:
+    def decode(self, contexts: List[Tensor]) -> List[int]:
         return [int(torch.argmax(ctx).item()) for ctx in contexts]
 
     # -----------------------------------------------------------------------------------
@@ -77,35 +77,56 @@ class LECLayerII:
         return len(self._c)
 
 
-if __name__ == "__main__":
-    mec = MECLayerII(scales=[2, 3, 6])
-    lec = LECLayerII(contexts=[4, 5, 3])
-    positions: list[tuple[int, int]] = [(0, 0), (17, 5), (35, 35)]
-    context_inputs: list[list[int]] = [[0, 2, 1], [3, 4, 0], [1, 1, 2]]
+class VectorHaSH(nn.Module):
+    def __init__(self, params: ModelParams):
+        super().__init__()
+        self.params = params
+        self.mec_layerII = MECLayerII(scales=params.grid_sizes)
+        self.lec_layerII = LECLayerII(contexts=params.contexts_size)
 
-    print("MECLayerII demo")
-    print(f"scales={mec._s.tolist()}, period={mec.period}")
-    for i, s in enumerate(mec._s):
+    # -----------------------------------------------------------------------------------
+    def forward(self, position: Tuple[int, int], context: List[int]) -> None:
+        mec_targets = self.mec_layerII.encode(position)  # One-hot grids per scale
+        lec_targets = self.lec_layerII.encode(context)  # One-hot vectors per context
+        # Further processing can be added here
+        return mec_targets, lec_targets
+
+
+if __name__ == "__main__":
+    # Test hippocampal state generation with position and context
+    print("=== Testing VectorHaSH with position and context ===")
+
+    # Create VectorHaSH model with parameters
+    params = ModelParams(grid_sizes=[2, 3, 6], contexts_size=[4, 5, 3])
+    model = VectorHaSH(params)
+
+    positions: List[Tuple[int, int]] = [(0, 0), (17, 5), (35, 35)]
+    context_inputs: List[List[int]] = [[0, 2, 1], [3, 4, 0], [1, 1, 2]]
+
+    print("VectorHaSH demo")
+    print(f"MEC scales={model.mec_layerII._s.tolist()}, period={model.mec_layerII.period}")
+    for i, s in enumerate(model.mec_layerII._s):
         print(f"  scale={s.item()} -> grid shape=({s.item()}, {s.item()})")
 
-    print(f"\nLECLayerII demo")
-    print(f"contexts={lec._c.tolist()}")
-    for i, c in enumerate(lec._c):
+    print(f"\nLEC contexts={model.lec_layerII._c.tolist()}")
+    for i, c in enumerate(model.lec_layerII._c):
         print(f"  context[{i}] size={c.item()}")
 
     for pos, ctx in zip(positions, context_inputs):
-        grids = mec.encode(pos)
-        cells = [grid_tools.extract_cell_coords(g) for g in grids]
-        decoded = mec.decode(grids)
-        re_cells = [grid_tools.extract_cell_coords(g) for g in mec.encode(decoded)]
+        # Use VectorHaSH forward method
+        mec_targets, lec_targets = model.forward(pos, ctx)
 
-        ctx_tensors = lec.encode(ctx)
-        decoded_ctx = lec.decode(ctx_tensors)
-        re_ctx = lec.decode(lec.encode(decoded_ctx))
+        # Extract information for display
+        mec_cells = [grid_tools.extract_cell_coords(g) for g in mec_targets]
+        mec_decoded = model.mec_layerII.decode(mec_targets)
+        mec_re_cells = [grid_tools.extract_cell_coords(g) for g in model.mec_layerII.encode(mec_decoded)]
+
+        lec_decoded = model.lec_layerII.decode(lec_targets)
+        lec_re_encoded = model.lec_layerII.decode(model.lec_layerII.encode(lec_decoded))
 
         print(f"\nposition={pos}, context={ctx}")
-        print(f"  MEC active cells per scale: {cells}")
-        print(f"  MEC decoded position: {decoded}")
-        print(f"  MEC re-encoded cells: {re_cells}")
-        print(f"  LEC decoded context: {decoded_ctx}")
-        print(f"  LEC re-encoded context: {re_ctx}")
+        print(f"  MEC active cells per scale: {mec_cells}")
+        print(f"  MEC decoded position: {mec_decoded}")
+        print(f"  MEC re-encoded cells: {mec_re_cells}")
+        print(f"  LEC decoded context: {lec_decoded}")
+        print(f"  LEC re-encoded context: {lec_re_encoded}")
