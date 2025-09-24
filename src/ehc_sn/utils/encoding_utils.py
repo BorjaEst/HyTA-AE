@@ -1,33 +1,34 @@
 """
-Encoding utilities for entorhinal cortex layers.
+Tensor transformation utilities for neural network operations.
 
-This module provides shared encoding/decoding utilities for both:
-- MECLayerII: Grid cell encoding with mixed-radix positional representations
-- LECLayerII: Categorical context encoding with one-hot representations
+This module provides generic tensor transformation utilities including:
+- One-hot encoding/decoding operations for categorical data
+- Coordinate transformations and mixed-radix decomposition
+- Tensor concatenation and state management utilities
+- Neural module application patterns
 
-The module centralizes common patterns like batched tensor operations,
-one-hot encoding/decoding, and maintains backward compatibility with
-the original grid_tools interface.
+The utilities are designed to be generic and reusable across different
+neural network architectures and domains.
 """
 
-from typing import List, Tuple, Union
+from typing import List, Union
 
 import torch
 from torch import Tensor
 from torch.nn.functional import one_hot
 
 # -------------------------------------------------------------------------------------------
-# Shared encoding utilities for both MEC and LEC layers
+# One-hot encoding/decoding utilities
 # -------------------------------------------------------------------------------------------
 
 
-def encode_categorical_batch(contexts: Tensor, num_classes: Tensor) -> List[Tensor]:
+def batch_to_onehot(batch_indices: Tensor, num_classes: Tensor) -> List[Tensor]:
     """
-    Encode batch of categorical contexts to one-hot representations.
+    Convert batch of categorical indices to one-hot tensor representations.
 
     Parameters
     ----------
-    contexts : Tensor
+    batch_indices : Tensor
         Tensor of shape (B, K) with categorical indices
     num_classes : Tensor
         Tensor of shape (K,) with number of classes for each dimension
@@ -37,13 +38,13 @@ def encode_categorical_batch(contexts: Tensor, num_classes: Tensor) -> List[Tens
     List[Tensor]
         List over K dimensions with tensors of shape (B, C_i)
     """
-    B, K = contexts.shape
-    return [one_hot(contexts[:, i], num_classes=int(num_classes[i].item())).float() for i in range(K)]
+    B, K = batch_indices.shape
+    return [one_hot(batch_indices[:, i], num_classes=int(num_classes[i].item())).float() for i in range(K)]
 
 
-def decode_categorical_batch(encodings: List[Tensor]) -> Tensor:
+def onehot_to_indices(encodings: List[Tensor]) -> Tensor:
     """
-    Decode batch of one-hot categorical encodings to indices.
+    Convert one-hot tensor encodings back to categorical indices.
 
     Parameters
     ----------
@@ -59,7 +60,26 @@ def decode_categorical_batch(encodings: List[Tensor]) -> Tensor:
 
 
 # -------------------------------------------------------------------------------------------
-# Grid-specific utilities for MEC layers
+# Tensor utilities for neural network operations
+# -------------------------------------------------------------------------------------------
+
+
+def create_zero_tensor(batch_size: int, feature_size: int, device: torch.device) -> Tensor:
+    """Create a zero tensor with specified dimensions."""
+    return torch.zeros(batch_size, feature_size, device=device)
+
+
+def concat_states(states: List[Tensor], batch_size: int, feature_size: int, device: torch.device) -> Tensor:
+    """Concatenate a list of state tensors, replacing None states with zeros."""
+    tensors = [
+        state.detach() if state is not None else create_zero_tensor(batch_size, feature_size, device)
+        for state in states
+    ]
+    return torch.cat(tensors, dim=-1)
+
+
+# -------------------------------------------------------------------------------------------
+# Coordinate transformation and mixed-radix utilities
 # -------------------------------------------------------------------------------------------
 
 
@@ -68,9 +88,9 @@ def compute_strides(scales: Tensor) -> Tensor:
     return torch.cumprod(torch.cat([torch.ones(1, dtype=torch.long), scales[:-1]]), dim=0)
 
 
-def extract_grid_digits(positions: Tensor, strides: Tensor, scales: Tensor, period: int) -> Tensor:
+def coordinates_to_indices(positions: Tensor, strides: Tensor, scales: Tensor, period: int) -> Tensor:
     """
-    Extract mixed-radix digits from batch of positions using vectorized operations.
+    Convert 2D coordinates to flattened indices using mixed-radix decomposition.
 
     Parameters
     ----------
@@ -86,7 +106,7 @@ def extract_grid_digits(positions: Tensor, strides: Tensor, scales: Tensor, peri
     Returns
     -------
     Tensor
-        Digit indices of shape (B, S) for flattened grid positions
+        Flattened indices of shape (B, S)
     """
     r = positions[:, 0].long() % period
     c = positions[:, 1].long() % period
@@ -97,14 +117,14 @@ def extract_grid_digits(positions: Tensor, strides: Tensor, scales: Tensor, peri
     return r_digits * scales + c_digits  # (B, S)
 
 
-def encode_grid_batch(indices: Tensor, scales: Tensor) -> List[Tensor]:
+def indices_to_onehot(indices: Tensor, scales: Tensor) -> List[Tensor]:
     """
-    Create batch of one-hot grids from digit indices.
+    Convert flattened indices to one-hot tensor representations.
 
     Parameters
     ----------
     indices : Tensor
-        Digit indices of shape (B, S)
+        Flattened indices of shape (B, S)
     scales : Tensor
         Scale sizes (S,)
 
@@ -116,9 +136,9 @@ def encode_grid_batch(indices: Tensor, scales: Tensor) -> List[Tensor]:
     return [one_hot(indices[:, i], num_classes=int(scales[i].item() ** 2)).float() for i in range(len(scales))]
 
 
-def decode_grid_batch(grids: List[Tensor], scales: Tensor, strides: Tensor) -> Tensor:
+def onehot_to_coordinates(grids: List[Tensor], scales: Tensor, strides: Tensor) -> Tensor:
     """
-    Extract coordinates from batch of grid activations.
+    Convert one-hot tensor representations back to 2D coordinates.
 
     Parameters
     ----------

@@ -34,11 +34,11 @@ class MECLayerII:
         self.period = int(torch.prod(self.scales).item())
 
     def encode(self, positions: Tensor) -> List[Tensor]:
-        indices = encoding_utils.extract_grid_digits(positions, self.strides, self.scales, self.period)
-        return encoding_utils.encode_grid_batch(indices, self.scales)
+        indices = encoding_utils.coordinates_to_indices(positions, self.strides, self.scales, self.period)
+        return encoding_utils.indices_to_onehot(indices, self.scales)
 
     def decode(self, grids: List[torch.Tensor]) -> torch.Tensor:
-        return encoding_utils.decode_grid_batch(grids, self.scales, self.strides)
+        return encoding_utils.onehot_to_coordinates(grids, self.scales, self.strides)
 
     def __len__(self) -> int:
         return len(self.scales)
@@ -50,11 +50,11 @@ class LECLayerII:
         self.contexts = torch.tensor(contexts, dtype=torch.long)
 
     def encode(self, contexts: torch.Tensor) -> List[Tensor]:
-        return encoding_utils.encode_categorical_batch(contexts, self.contexts)
+        return encoding_utils.batch_to_onehot(contexts, self.contexts)
 
     def decode(self, contexts: List[Tensor]) -> torch.Tensor:
-        """Decode contexts using shared categorical decoding utilities."""
-        return encoding_utils.decode_categorical_batch(contexts)
+        """Decode contexts using shared one-hot decoding utilities."""
+        return encoding_utils.onehot_to_indices(contexts)
 
     def __len__(self) -> int:
         return len(self.contexts)
@@ -105,26 +105,22 @@ class CA3(nn.Module):
     def units(self) -> int:
         return self.n_clusters * self.cluster_size
 
+    @property
+    def state(self) -> Tensor:
+        states = [cluster.state for cluster in list(self.clusters["mec"]) + list(self.clusters["lec"])]
+        B = states[0].shape[0] if states[0] is not None else 1
+        device = states[0].device if states[0] is not None else torch.device("cpu")
+        return encoding_utils.concat_states(states, B, self.cluster_size, device)
+
     def reset_states(self) -> None:
         for c in list(self.clusters["mec"]) + list(self.clusters["lec"]):
             c.state = None
 
-    def _build_recurrent_input(self, batch: int, device: torch.device) -> Tensor:
-        parts = [
-            c.state.detach() if c.state is not None else torch.zeros(batch, self.cluster_size, device=device)
-            for c in list(self.clusters["mec"]) + list(self.clusters["lec"])
-        ]
-        return cat(parts, dim=-1)
-
     def forward(self, dg_pattern: Tensor) -> Tensor:
-        B = dg_pattern.shape[0]
-        device = dg_pattern.device
-        recurrent_input = self._build_recurrent_input(B, device)
-
-        outputs = [
-            cluster(dg_pattern, recurrent_input) for cluster in list(self.clusters["mec"]) + list(self.clusters["lec"])
-        ]
-        return cat(outputs, dim=-1)
+        recurrent_input = self.state  # Get the concatenated state for recurrent input
+        outputs_mec = [module(dg_pattern, recurrent_input) for module in self.clusters["mec"]]
+        outputs_lec = [module(dg_pattern, recurrent_input) for module in self.clusters["lec"]]
+        return cat(outputs_mec + outputs_lec, dim=-1)
 
 
 # -----------------------------------------------------------------------------------
@@ -142,8 +138,8 @@ class VectorHaSH(nn.Module):
         self.lec_targets = self.lec_layerII.encode(contexts)
 
         # Flatten and concatenate EC targets for DG input
-        mec_flat = cat(self.mec_targets, dim=-1)
-        lec_flat = cat(self.lec_targets, dim=-1)
+        mec_flat = torch.cat(self.mec_targets, dim=-1)
+        lec_flat = torch.cat(self.lec_targets, dim=-1)
 
         # DG and CA3 dynamics
         dg_pattern = self.dg(mec_flat, lec_flat)
@@ -154,24 +150,26 @@ class VectorHaSH(nn.Module):
         return y.detach()
 
     def feedback(self) -> None:
-        activations = []
-        deltas = []
+        # Collect MEC feedback data
+        mec_activations, mec_deltas = [], []
+        for i, cluster in enumerate(list(self.ca3.clusters["mec"])):
+            target = self.mec_targets[i]
+            delta = torch.matmul(target.detach().float(), cluster.target_syn.fb_weight)
+            mec_activations.append(cluster.target_syn.last_input)
+            mec_deltas.append(delta)
 
-        # MEC feedback
-        for i, cluster in enumerate(self.ca3.clusters["mec"]):
-            t = self.mec_targets[i]
-            delta = torch.matmul(t.detach().float(), cluster.target_syn.fb_weight)
-            activations.append(cluster.target_syn.last_input)
-            deltas.append(delta)
+        # Collect LEC feedback data
+        lec_activations, lec_deltas = [], []
+        for i, cluster in enumerate(list(self.ca3.clusters["lec"])):
+            target = self.lec_targets[i]
+            delta = torch.matmul(target.detach().float(), cluster.target_syn.fb_weight)
+            lec_activations.append(cluster.target_syn.last_input)
+            lec_deltas.append(delta)
 
-        # LEC feedback
-        for i, cluster in enumerate(self.ca3.clusters["lec"]):
-            t = self.lec_targets[i]
-            delta = torch.matmul(t.detach().float(), cluster.target_syn.fb_weight)
-            activations.append(cluster.target_syn.last_input)
-            deltas.append(delta)
-
-        torch.autograd.backward(activations, deltas)
+        # Apply single backward pass
+        all_activations = mec_activations + lec_activations
+        all_deltas = mec_deltas + lec_deltas
+        torch.autograd.backward(all_activations, all_deltas)
 
 
 # -------------------------------------------------------------------------------------------
