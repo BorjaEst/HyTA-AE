@@ -137,10 +137,10 @@ class CA3(nn.Module):
 
     def forward(self, dg_pattern: Tensor) -> Tensor:
         recurrent_input = self.recurrent_syn(self.state.detach())  # Shared recurrent transformation
-        # Split recurrent input for each cluster
-        cluster_inputs = torch.split(recurrent_input, self.cluster_size, dim=-1)
-        outputs_mec = [m(dg_pattern, cluster_inputs[i]) for i, m in enumerate(self.clusters["mec"])]
-        outputs_lec = [m(dg_pattern, cluster_inputs[i]) for i, m in enumerate(self.clusters["lec"], i)]
+        inputs = torch.split(recurrent_input, self.cluster_size, dim=-1)  # Split rcc input for clusters
+        ix = (0, len(self.clusters["mec"]))  # Indices to separate MEC and LEC clusters
+        outputs_mec = [m(dg_pattern, inputs[i]) for i, m in enumerate(self.clusters["mec"], ix[0])]
+        outputs_lec = [m(dg_pattern, inputs[i]) for i, m in enumerate(self.clusters["lec"], ix[1])]
         return cat(outputs_mec + outputs_lec, dim=-1)
 
     def feedback(self, cluster_id: str, targets: List[Tensor]) -> None:
