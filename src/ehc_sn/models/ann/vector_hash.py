@@ -32,10 +32,11 @@ class ModelParams(BaseModel):
 
 
 # -------------------------------------------------------------------------------------------
-class MECLayerII:
+class MECLayerII(nn.Module):
     def __init__(self, scales: List[int]):
-        self.scales = torch.tensor(scales, dtype=torch.long)
-        self.strides = encoding_utils.compute_strides(self.scales)
+        super().__init__()
+        self.register_buffer("scales", torch.tensor(scales, dtype=torch.long))
+        self.register_buffer("strides", encoding_utils.compute_strides(self.scales))
         self.period = int(torch.prod(self.scales).item())
 
     def encode(self, positions: Tensor) -> List[Tensor]:
@@ -50,9 +51,10 @@ class MECLayerII:
 
 
 # -------------------------------------------------------------------------------------------
-class LECLayerII:
+class LECLayerII(nn.Module):
     def __init__(self, contexts: List[int]):
-        self.contexts = torch.tensor(contexts, dtype=torch.long)
+        super().__init__()
+        self.register_buffer("contexts", torch.tensor(contexts, dtype=torch.long))
 
     def encode(self, contexts: torch.Tensor) -> List[Tensor]:
         return encoding_utils.batch_to_onehot(contexts, self.contexts)
