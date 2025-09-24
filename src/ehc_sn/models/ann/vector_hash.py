@@ -93,6 +93,10 @@ class CA3Cluster(nn.Module):
         self.state = self.activation(x)
         return self.target_syn(self.state)
 
+    def feedback(self, target: Tensor) -> None:
+        # Apply DRTP feedback to the target synapse using the provided target
+        self.target_syn(target)
+
 
 # -------------------------------------------------------------------------------------------
 class CA3(nn.Module):
@@ -126,6 +130,10 @@ class CA3(nn.Module):
         outputs_lec = [module(dg_pattern, recurrent_input) for module in self.clusters["lec"]]
         return cat(outputs_mec + outputs_lec, dim=-1)
 
+    def feedback(self, cluster_id: str, targets: List[Tensor]) -> None:
+        for i, cluster in enumerate(list(self.clusters[cluster_id])):
+            cluster.feedback(targets[i])
+
 
 # -----------------------------------------------------------------------------------
 class VectorHaSH(nn.Module):
@@ -154,26 +162,8 @@ class VectorHaSH(nn.Module):
         return y.detach()
 
     def feedback(self) -> None:
-        # Collect MEC feedback data
-        mec_activations, mec_deltas = [], []
-        for i, cluster in enumerate(list(self.ca3.clusters["mec"])):
-            target = self.mec_targets[i]
-            delta = torch.matmul(target.detach().float(), cluster.target_syn.fb_weight)
-            mec_activations.append(cluster.target_syn.last_input)
-            mec_deltas.append(delta)
-
-        # Collect LEC feedback data
-        lec_activations, lec_deltas = [], []
-        for i, cluster in enumerate(list(self.ca3.clusters["lec"])):
-            target = self.lec_targets[i]
-            delta = torch.matmul(target.detach().float(), cluster.target_syn.fb_weight)
-            lec_activations.append(cluster.target_syn.last_input)
-            lec_deltas.append(delta)
-
-        # Apply single backward pass
-        all_activations = mec_activations + lec_activations
-        all_deltas = mec_deltas + lec_deltas
-        torch.autograd.backward(all_activations, all_deltas)
+        self.ca3.feedback("mec", self.mec_targets)
+        self.ca3.feedback("lec", self.lec_targets)
 
 
 # -------------------------------------------------------------------------------------------
