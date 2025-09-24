@@ -42,36 +42,40 @@ class ModelParams(BaseModel):
 class Encoder(nn.Module):
     def __init__(self, n_inputs: int, n_h1: int, n_h2: int, n_latents: int):
         super().__init__()
-        self.layer1 = ann.Layer(drtp.Linear(n_inputs, n_h1, target_features=n_inputs), nn.GELU())
-        self.layer2 = ann.Layer(drtp.Linear(n_h1, n_h2, target_features=n_inputs), nn.GELU())
-        self.latent = ann.Layer(drtp.Linear(n_h2, n_latents, target_features=n_inputs), nn.GELU())
+        self.layer1 = ann.Layer(nn.Linear(n_inputs, n_h1), nn.GELU())
+        self.drtp_1 = drtp.Linear(n_h1, target_features=n_inputs)
+        self.layer2 = ann.Layer(nn.Linear(n_h1, n_h2), nn.GELU())
+        self.drtp_2 = drtp.Linear(n_h2, target_features=n_inputs)
+        self.latent = ann.Layer(nn.Linear(n_h2, n_latents), nn.ReLU())
 
     def forward(self, sensors: Tensor) -> Tensor:
-        x = self.layer1(sensors)
-        x = self.layer2(x)
+        x = self.drtp_1(self.layer1(sensors))
+        x = self.drtp_2(self.layer2(x))
         return self.latent(x)
 
     def feedback(self, target: Tensor) -> None:
-        self.layer2.synapses.feedback(target, context=self.layer2.neurons)
-        self.layer1.synapses.feedback(target, context=self.layer1.neurons)
+        self.drtp_1.feedback(target)
+        self.drtp_2.feedback(target)
 
 
 # -------------------------------------------------------------------------------------------
 class Decoder(nn.Module):
     def __init__(self, n_outputs: int, n_h1: int, n_h2: int, n_latents: int):
         super().__init__()
-        self.layer2 = ann.Layer(drtp.Linear(n_latents, n_h2, target_features=n_outputs), nn.GELU())
-        self.layer1 = ann.Layer(drtp.Linear(n_h2, n_h1, target_features=n_outputs), nn.GELU())
-        self.output = ann.Layer(nn.Linear(n_h1, n_outputs), nn.Sigmoid())
+        self.layer2 = ann.Layer(nn.Linear(n_latents, n_h2), nn.GELU())
+        self.drtp_2 = drtp.Linear(n_h2, target_features=n_outputs)
+        self.layer1 = ann.Layer(nn.Linear(n_h2, n_h1), nn.GELU())
+        self.drtp_1 = drtp.Linear(n_h1, target_features=n_outputs)
+        self.output = ann.Layer(nn.Linear(n_h1, n_outputs), nn.Sigmoid())  # Uses backprop
 
     def forward(self, latent: Tensor) -> Tensor:
-        x = self.layer2(latent)
-        x = self.layer1(x)
+        x = self.drtp_2(self.layer2(latent.detach()))
+        x = self.drtp_1(self.layer1(x))
         return self.output(x.detach())
 
     def feedback(self, target: Tensor) -> None:
-        self.layer2.synapses.feedback(target, context=self.layer2.neurons)
-        self.layer1.synapses.feedback(target, context=self.layer1.neurons)
+        self.drtp_2.feedback(target)
+        self.drtp_1.feedback(target)
 
 
 # -------------------------------------------------------------------------------------------
