@@ -19,11 +19,15 @@ class ModelParams(BaseModel):
 
     # Toroidal manifold shapes
     grid_sizes: List[int] = Field([2, 3, 6], description="List of grid scales.")
-    contexts_size: List[int] = Field([30] * 4, description="List of context vector sizes.")
+    context_sizes: List[int] = Field([30] * 4, description="List of context vector sizes.")
 
     @property
-    def ec_shapes(self) -> Tuple[List[int], List[int]]:
-        return [s**2 for s in self.grid_sizes], self.contexts_size
+    def mec_shape(self) -> List[int]:
+        return [s**2 for s in self.grid_sizes]
+
+    @property
+    def lec_shape(self) -> List[int]:
+        return self.context_sizes
 
 
 # -------------------------------------------------------------------------------------------
@@ -127,11 +131,11 @@ class CA3(nn.Module):
 class VectorHaSH(nn.Module):
     def __init__(self, params: Optional[ModelParams] = None):
         super().__init__()
-        self.params = params = params or ModelParams()
-        self.mec_layerII = MECLayerII(scales=params.grid_sizes)
-        self.lec_layerII = LECLayerII(contexts=params.contexts_size)
-        self.dg = DG(params.latent_size, *params.ec_shapes)
-        self.ca3 = CA3(params.latent_size, params.substate_size, *params.ec_shapes)
+        self.params = p = params or ModelParams()
+        self.ca3 = CA3(p.latent_size, p.substate_size, p.mec_shape, p.lec_shape)
+        self.dg = DG(p.latent_size, p.mec_shape, p.lec_shape)
+        self.mec_layerII = MECLayerII(scales=p.grid_sizes)
+        self.lec_layerII = LECLayerII(contexts=p.context_sizes)
 
     def forward(self, positions: Tensor, contexts: Tensor) -> Tensor:
         self.mec_targets = self.mec_layerII.encode(positions)
@@ -180,7 +184,7 @@ if __name__ == "__main__":
 
     torch.manual_seed(0)
 
-    params = ModelParams(grid_sizes=[2, 3, 6], contexts_size=[4, 5, 3])
+    params = ModelParams(grid_sizes=[2, 3, 6], context_sizes=[4, 5, 3])
     model = VectorHaSH(params)
 
     # Optimizer

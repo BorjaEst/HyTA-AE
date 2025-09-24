@@ -14,7 +14,7 @@ neural network architectures and domains.
 from typing import List, Union
 
 import torch
-from torch import Tensor
+from torch import Tensor, device
 from torch.nn.functional import one_hot
 
 # -------------------------------------------------------------------------------------------
@@ -64,17 +64,13 @@ def onehot_to_indices(encodings: List[Tensor]) -> Tensor:
 # -------------------------------------------------------------------------------------------
 
 
-def create_zero_tensor(batch_size: int, feature_size: int, device: torch.device) -> Tensor:
-    """Create a zero tensor with specified dimensions."""
-    return torch.zeros(batch_size, feature_size, device=device)
-
-
-def concat_states(states: List[Tensor], batch_size: int, feature_size: int, device: torch.device) -> Tensor:
+def concat_states(states: List[Tensor], batch_size: int, feature_size: int, device: device) -> Tensor:
     """Concatenate a list of state tensors, replacing None states with zeros."""
-    tensors = [
-        state.detach() if state is not None else create_zero_tensor(batch_size, feature_size, device)
-        for state in states
-    ]
+    tensors = []
+    for state in states:
+        if state is None:
+            state = torch.zeros(batch_size, feature_size, device=device)
+        tensors.append(state)
     return torch.cat(tensors, dim=-1)
 
 
