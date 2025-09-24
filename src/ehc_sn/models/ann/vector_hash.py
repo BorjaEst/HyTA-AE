@@ -90,16 +90,15 @@ class DG(nn.Module):
 
 # -------------------------------------------------------------------------------------------
 class CA3Cluster(nn.Module):
-    def __init__(self, latent_units: int, cluster_size: int, target_size: int, ca3_units: int):
+    def __init__(self, latent_units: int, cluster_size: int, target_size: int):
         super().__init__()
         self.input_syn = nn.Linear(latent_units, cluster_size)
-        self.recurrent_syn = nn.Linear(ca3_units, cluster_size)
         self.activation = nn.ReLU()
         self.target_syn = drtp.Linear(cluster_size, target_features=target_size)
         self.state: Optional[Tensor] = None
 
     def forward(self, dg_input: Tensor, recurrent_input: Tensor) -> Tensor:
-        x = self.input_syn(dg_input) + self.recurrent_syn(recurrent_input)
+        x = self.input_syn(dg_input) + recurrent_input
         self.state = self.activation(x)
         return self.target_syn(self.state)  # Detaches internally
 
@@ -114,8 +113,10 @@ class CA3(nn.Module):
         super().__init__()
         self.n_clusters = len(mec_shape) + len(lec_shape)
         self.cluster_size = cluster_size
-        mec_clusters = [CA3Cluster(latent_size, cluster_size, x, self.units) for x in mec_shape]
-        lec_clusters = [CA3Cluster(latent_size, cluster_size, x, self.units) for x in lec_shape]
+        # Shared recurrent transformation
+        self.recurrent_syn = nn.Linear(self.units, self.units)
+        mec_clusters = [CA3Cluster(latent_size, cluster_size, x) for x in mec_shape]
+        lec_clusters = [CA3Cluster(latent_size, cluster_size, x) for x in lec_shape]
         clusters_dict = {"mec": nn.ModuleList(mec_clusters), "lec": nn.ModuleList(lec_clusters)}
         self.clusters = nn.ModuleDict(clusters_dict)
 
@@ -135,9 +136,14 @@ class CA3(nn.Module):
             c.state = None
 
     def forward(self, dg_pattern: Tensor) -> Tensor:
-        recurrent_input = self.state.detach()  # Get the concatenated state for recurrent input
-        outputs_mec = [module(dg_pattern, recurrent_input) for module in self.clusters["mec"]]
-        outputs_lec = [module(dg_pattern, recurrent_input) for module in self.clusters["lec"]]
+        recurrent_input = self.recurrent_syn(self.state.detach())  # Shared recurrent transformation
+        # Split recurrent input for each cluster
+        cluster_inputs = torch.split(recurrent_input, self.cluster_size, dim=-1)
+        outputs_mec = [module(dg_pattern, cluster_inputs[i]) for i, module in enumerate(self.clusters["mec"])]
+        outputs_lec = [
+            module(dg_pattern, cluster_inputs[len(self.clusters["mec"]) + i])
+            for i, module in enumerate(self.clusters["lec"])
+        ]
         return cat(outputs_mec + outputs_lec, dim=-1)
 
     def feedback(self, cluster_id: str, targets: List[Tensor]) -> None:

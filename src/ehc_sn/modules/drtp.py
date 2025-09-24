@@ -28,7 +28,7 @@ def apply(activations: Tensor, fb_weight: Tensor, target: Tensor) -> None:
       decoupled across layers (use detach in forward).
     """
     delta = torch.matmul(target.detach(), fb_weight)  # (batch, units)
-    autograd.backward(activations, delta)
+    autograd.backward(activations, delta, retain_graph=True)
     return None
 
 
