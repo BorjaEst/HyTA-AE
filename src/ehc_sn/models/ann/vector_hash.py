@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 from torch import Tensor, cat, nn
 
 from ehc_sn.modules import drtp
+from ehc_sn.modules.loss import GramianOrthogonalityLoss as SparsityLoss
 from ehc_sn.utils import encoding_utils
 
 
@@ -68,14 +69,20 @@ class LECLayerII:
 class DG(nn.Module):
     def __init__(self, latent_size: int, mec_shape: List[int], lec_shape: List[int]):
         super().__init__()
+        self.sparsity_loss = SparsityLoss(center=True)  # Sparsity loss for DG activations
         syn_mec = nn.Linear(sum(mec_shape), latent_size)
         syn_lec = nn.Linear(sum(lec_shape), latent_size)
         self.synapses = nn.ModuleDict({"mec": syn_mec, "lec": syn_lec})
         self.activation = nn.ReLU()
+        self.state: Optional[Tensor] = None
 
     def forward(self, mec_inputs: Tensor, lec_inputs: Tensor) -> Tensor:
         x = self.synapses["mec"](mec_inputs) + self.synapses["lec"](lec_inputs)
-        return self.activation(x)
+        self.state = self.activation(x)
+        return self.state.detach()
+
+    def feedback(self) -> None:
+        self.sparsity_loss(self.state).backward()
 
 
 # -------------------------------------------------------------------------------------------
@@ -91,11 +98,11 @@ class CA3Cluster(nn.Module):
     def forward(self, dg_input: Tensor, recurrent_input: Tensor) -> Tensor:
         x = self.input_syn(dg_input) + self.recurrent_syn(recurrent_input)
         self.state = self.activation(x)
-        return self.target_syn(self.state)
+        return self.target_syn(self.state)  # Detaches internally
 
     def feedback(self, target: Tensor) -> None:
         # Apply DRTP feedback to the target synapse using the provided target
-        self.target_syn(target)
+        self.target_syn.feedback(target)
 
 
 # -------------------------------------------------------------------------------------------
@@ -115,17 +122,17 @@ class CA3(nn.Module):
 
     @property
     def state(self) -> Tensor:
-        states = [cluster.state for cluster in list(self.clusters["mec"]) + list(self.clusters["lec"])]
+        states = [c.state for c in list(self.clusters["mec"]) + list(self.clusters["lec"])]
         B = states[0].shape[0] if states[0] is not None else 1
         device = states[0].device if states[0] is not None else torch.device("cpu")
-        return encoding_utils.concat_states(states, B, self.cluster_size, device)
+        return encoding_utils.concat_states(states, B, self.cluster_size, device).detach()
 
     def reset_states(self) -> None:
         for c in list(self.clusters["mec"]) + list(self.clusters["lec"]):
             c.state = None
 
     def forward(self, dg_pattern: Tensor) -> Tensor:
-        recurrent_input = self.state  # Get the concatenated state for recurrent input
+        recurrent_input = self.state.detach()  # Get the concatenated state for recurrent input
         outputs_mec = [module(dg_pattern, recurrent_input) for module in self.clusters["mec"]]
         outputs_lec = [module(dg_pattern, recurrent_input) for module in self.clusters["lec"]]
         return cat(outputs_mec + outputs_lec, dim=-1)
@@ -150,8 +157,8 @@ class VectorHaSH(nn.Module):
         self.lec_targets = self.lec_layerII.encode(contexts)
 
         # Flatten and concatenate EC targets for DG input
-        mec_flat = torch.cat(self.mec_targets, dim=-1)
-        lec_flat = torch.cat(self.lec_targets, dim=-1)
+        mec_flat = torch.cat(self.mec_targets, dim=-1).detach()
+        lec_flat = torch.cat(self.lec_targets, dim=-1).detach()
 
         # DG and CA3 dynamics
         dg_pattern = self.dg(mec_flat, lec_flat)
