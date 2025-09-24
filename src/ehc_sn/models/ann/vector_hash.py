@@ -139,11 +139,8 @@ class CA3(nn.Module):
         recurrent_input = self.recurrent_syn(self.state.detach())  # Shared recurrent transformation
         # Split recurrent input for each cluster
         cluster_inputs = torch.split(recurrent_input, self.cluster_size, dim=-1)
-        outputs_mec = [module(dg_pattern, cluster_inputs[i]) for i, module in enumerate(self.clusters["mec"])]
-        outputs_lec = [
-            module(dg_pattern, cluster_inputs[len(self.clusters["mec"]) + i])
-            for i, module in enumerate(self.clusters["lec"])
-        ]
+        outputs_mec = [m(dg_pattern, cluster_inputs[i]) for i, m in enumerate(self.clusters["mec"])]
+        outputs_lec = [m(dg_pattern, cluster_inputs[i]) for i, m in enumerate(self.clusters["lec"], i)]
         return cat(outputs_mec + outputs_lec, dim=-1)
 
     def feedback(self, cluster_id: str, targets: List[Tensor]) -> None:
