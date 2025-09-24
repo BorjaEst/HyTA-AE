@@ -82,6 +82,7 @@ class DG(nn.Module):
         return self.state.detach()
 
     def feedback(self) -> None:
+        # Apply sparsity loss to the current state if available
         self.sparsity_loss(self.state).backward()
 
 
@@ -169,6 +170,7 @@ class VectorHaSH(nn.Module):
         return y.detach()
 
     def feedback(self) -> None:
+        self.dg.feedback()  # Apply sparsity loss feedback in DG
         self.ca3.feedback("mec", self.mec_targets)
         self.ca3.feedback("lec", self.lec_targets)
 
