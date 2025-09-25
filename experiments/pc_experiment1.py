@@ -14,6 +14,7 @@ from ehc_sn.models.ann.sparse_autoencoder import ModelParams as TeacherParams
 FEEDBACK_MODE: Literal["random", "identity"] = "random"
 COMBINATION_MODE: Literal["identity", "random"] = "identity"
 LEARNING_RATE = 1e-3
+ACTIVATION_FN: bool = True
 
 
 # -------------------------------------------------------------------------------------------
@@ -23,7 +24,7 @@ class EncoderLayer(nn.Linear):
     def __init__(self, in_features: int, out_features: int, *, bias: bool = False, **kwargs) -> None:
         super().__init__(in_features, out_features, bias=bias, **kwargs)
         self.register_buffer("F", torch.empty(out_features, in_features))  # feedback projection
-        self.activation = nn.GELU()
+        self.activation = nn.GELU() if ACTIVATION_FN else nn.Identity()
         self.register_buffer("currents", None)
         self.register_buffer("activations", None)
         self.init_feedback()  # default init
@@ -65,10 +66,16 @@ class DecoderLayer(nn.Linear):
     def __init__(self, in_features: int, out_features: int, **kwargs) -> None:
         super().__init__(in_features, out_features, **kwargs)
         self.register_buffer("B", torch.empty(out_features, out_features))  # combination / modulation
+        self.activation = nn.GELU() if ACTIVATION_FN else nn.Identity()
+        self.register_buffer("currents", None)
+        self.register_buffer("activations", None)
         self.init_combination()  # default init
 
     def forward(self, inputs: Tensor, feedback: Tensor) -> Tensor:
-        return super().forward(inputs.detach()) + (feedback @ self.B.T)
+        self.currents = super().forward(inputs.detach())
+        self.currents += feedback.detach() @ self.B.T
+        self.activations = self.activation(self.currents)
+        return self.activations
 
     def feedback(self, error: Tensor) -> Tensor:
         """Compute combination projection B h_e (no gradient)."""
