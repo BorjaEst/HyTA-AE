@@ -183,7 +183,7 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
-        return torch.optim.SGD(
+        return torch.optim.Adam(
             self.encoder_layer1.parameters(),
             lr=self.pc_params.learning_rate,
         )
