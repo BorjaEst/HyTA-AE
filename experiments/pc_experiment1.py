@@ -37,19 +37,33 @@ def gelu_derivative(x: Tensor) -> Tensor:
 
 # -------------------------------------------------------------------------------------------
 class EncoderLayer(nn.Linear):
-    """Linear layer mapping flattened reconstruction error to hidden corrective code.
+    """Error-to-hidden mapping with local feedback projection matrix F.
 
-    Holds last pre-activation (currents) for local gradient computation.
+    F projects input-layer reconstruction error (dimension D) into hidden corrective
+    units (H1) providing a local teaching signal (delta_tilde = F e0_prev).
     """
 
-    def __init__(self, *args, device=None, dtype=None, **kwargs) -> None:
-        super().__init__(*args, device=device, dtype=dtype, **kwargs)
+    def __init__(self, in_features: int, out_features: int, *, device=None, dtype=None, **kwargs) -> None:
+        super().__init__(in_features, out_features, device=device, dtype=dtype, **kwargs)
         self.activation = nn.GELU()
         self.register_buffer("currents", None)
         self.register_buffer("activations", None)
+        self.register_buffer("F", torch.empty(out_features, in_features))  # feedback projection
+
+    def init_feedback(self, mode: Literal["symmetric", "random", "identity"], teacher_output_layer: nn.Module) -> None:
+        """Initialize feedback matrix F based on selected mode."""
+        if mode == "symmetric":
+            W_out = teacher_output_layer
+            self.F.copy_(W_out.weight.T.detach())  # shape (H1,D)
+        elif mode == "identity":
+            # assume shapes compatible (may be rectangular -> eye crops/pads not handled here)
+            rows, cols = self.F.shape
+            eye = torch.eye(rows, cols, device=self.F.device, dtype=self.F.dtype)
+            self.F.copy_(eye)
+        else:  # random
+            torch.nn.init.kaiming_uniform_(self.F, a=math.sqrt(5))
 
     def forward(self, input: Tensor) -> Tensor:
-        # Local mapping ONLY; detach upstream to forbid global credit.
         input_local = input.detach()
         self.currents = super().forward(input_local)
         self.activations = self.activation(self.currents)
@@ -58,7 +72,17 @@ class EncoderLayer(nn.Linear):
 
 # -------------------------------------------------------------------------------------------
 class DecoderLayer(nn.Linear):
-    """Frozen first decoder layer W_{d1} mapping h2 -> h1 base."""
+    """Frozen first decoder layer W_{d1} mapping h2 -> h1 base with combination matrix B."""
+
+    def __init__(self, in_features: int, out_features: int, *, device=None, dtype=None, **kwargs) -> None:
+        super().__init__(in_features, out_features, device=device, dtype=dtype, **kwargs)
+        self.register_buffer("B", torch.empty(out_features, out_features))  # combination / modulation
+
+    def init_combination(self, mode: Literal["identity", "random"]) -> None:
+        if mode == "identity":
+            self.B.copy_(torch.eye(self.B.shape[0], device=self.B.device, dtype=self.B.dtype))
+        else:
+            torch.nn.init.kaiming_uniform_(self.B, a=math.sqrt(5))
 
     def forward(self, inputs: Tensor) -> Tensor:
         return super().forward(inputs.detach())
@@ -106,10 +130,9 @@ class Autoencoder(pl.LightningModule):
         # Reconstruction energy (no sparsity / weight decay in simplified version)
         self.reconstruction_loss = nn.MSELoss(reduction="mean")
 
-        # Feedback / combination matrices (buffers)
-        self.register_buffer("F", torch.empty(n_h1, n_sensors))  # feedback matrix
-        self.register_buffer("B", torch.empty(n_h1, n_h1))  # combination matrix
-        self._init_feedback_matrices()
+        # Initialize local feedback/combination matrices inside layers
+        self.encoder_layer1.init_feedback(self.pc_params.feedback_mode, self.teacher.decoder.output)
+        self.decoder_layer1.init_combination(self.pc_params.combination_mode)
 
         # Experiment state / caches
         self.cached_batch: Optional[Tuple[Tensor, Tensor]] = None
@@ -117,25 +140,8 @@ class Autoencoder(pl.LightningModule):
         self.prev_error_norm: Optional[Tensor] = None
 
     # -----------------------------------------------------------------------------------
-    def _init_feedback_matrices(self) -> None:
-        device = self.decoder_layer1.weight.device
-        n_h1, n_sensors = self.F.shape
-        mode = self.pc_params.feedback_mode
-        if mode == "symmetric":
-            W_out = self.teacher.decoder.output
-            self.F.copy_(W_out.weight.T.detach())
-        elif mode == "identity":
-            # Assume dimensions match if user requests identity
-            self.F.copy_(torch.eye(n_h1, n_sensors))
-        else:  # random
-            torch.nn.init.kaiming_uniform_(self.F, a=math.sqrt(5))
-
-        if self.pc_params.combination_mode == "identity":
-            self.B.copy_(torch.eye(n_h1))
-        else:
-            torch.nn.init.kaiming_uniform_(self.B, a=math.sqrt(5))
-        self.F = self.F.to(device)
-        self.B = self.B.to(device)
+    def _init_feedback_matrices(self) -> None:  # kept for backward compatibility (noop)
+        pass
 
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
@@ -170,7 +176,7 @@ class Autoencoder(pl.LightningModule):
 
         # Corrective code (builds local graph for W_e only)
         h_e = self.encoder_layer1(e0_prev)
-        h1_hat = h1_base + (h_e @ self.B.T)
+        h1_hat = h1_base + (h_e @ self.decoder_layer1.B.T)
         with torch.no_grad():
             x_hat = self.teacher.decoder.output(h1_hat)  # (B, D)
         e0 = flat_sensors - x_hat
@@ -206,7 +212,7 @@ class Autoencoder(pl.LightningModule):
         # Strictly local surrogate (Copilot-Processing Section 6.2):
         # delta_tilde = F' e0_prev ; grad_W = ((delta_tilde ⊙ f'(u)) e0_prev^T)/B
         with torch.no_grad():
-            delta_tilde = e0_prev @ self.F.T  # (B, H1)
+            delta_tilde = e0_prev @ self.encoder_layer1.F.T  # (B, H1)
 
         pre_act = self.encoder_layer1.currents  # u = W_e e0_prev
         gelu_prime = gelu_derivative(pre_act)
