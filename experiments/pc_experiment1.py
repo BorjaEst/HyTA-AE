@@ -144,9 +144,6 @@ class Autoencoder(pl.LightningModule):
         self.decoder_layer1 = DecoderLayer(n_h2, n_h1, bias=True)  # W_{d1}
         self.encoder_layer1 = EncoderLayer(n_sensors, n_h1, bias=True)  # W_e
 
-        # Reconstruction energy (no sparsity / weight decay in simplified version)
-        self.reconstruction_loss = nn.MSELoss(reduction="mean")
-
         # Initialize local feedback/combination matrices inside layers
         self.encoder_layer1.init_feedback(self.pc_params.feedback_mode, self.teacher.decoder.output)
         self.decoder_layer1.init_combination(self.pc_params.combination_mode)
@@ -183,6 +180,7 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def inference(self, batch: Tuple[Tensor, Tensor], h2: Tensor) -> Dict[str, Tensor]:
+        """Return only pre-correction error and final reconstruction."""
         sensors, targets = batch
         device = self.encoder_layer1.weight.device
         sensors = sensors.to(device)
@@ -191,26 +189,16 @@ class Autoencoder(pl.LightningModule):
         flat_sensors = flatten(sensors, start_dim=1)
 
         with torch.no_grad():
-            h1_base = self.decoder_layer1(h2)  # (B, H1)
-            x_base = self.teacher.decoder.output(h1_base)  # (B, D)
-        e0_prev = flat_sensors - x_base  # (B, D)
+            h1_base = self.decoder_layer1(h2)
+            x_base = self.teacher.decoder.output(h1_base)
+        e0_prev = flat_sensors - x_base
 
-        # Corrective code (builds local graph for W_e only)
         h_e = self.encoder_layer1(e0_prev)
         h1_hat = h1_base + (h_e @ self.decoder_layer1.B.T)
         with torch.no_grad():
-            x_hat = self.teacher.decoder.output(h1_hat)  # (B, D)
-        e0 = flat_sensors - x_hat
+            x_hat = self.teacher.decoder.output(h1_hat)
 
-        return {
-            "h1_base": h1_base,
-            "x_base": x_base,
-            "e0_prev": e0_prev,
-            "h_e": h_e,
-            "h1_hat": h1_hat,
-            "x_hat": x_hat,
-            "e0": e0,
-        }
+        return {"e0_prev": e0_prev, "x_hat": x_hat}
 
     # -----------------------------------------------------------------------------------
     def on_fit_start(self) -> None:
@@ -220,26 +208,21 @@ class Autoencoder(pl.LightningModule):
         self.cached_batch = batch  # type: ignore[assignment]
         self.stored_h2 = self.sample_h2(batch)  # type: ignore[arg-type]
 
-    # no stability tracking needed when only logging reconstruction
-
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tuple[Tensor, Tensor], batch_idx: int) -> Tensor:  # type: ignore[override]
         batch = self.cached_batch  # type: ignore[assignment]
         h2 = self.stored_h2
-
         out = self.inference(batch, h2)
         e0_prev = out["e0_prev"]
-        e0 = out["e0"]
-        # Local autograd-based surrogate update using optimizer
-        optimizer = self.optimizers()  # retrieve configured optimizer (SGD on encoder_layer1)
+        sensors = batch[0].to(self.device)
+        flat_sensors = flatten(sensors, start_dim=1)
+        e0 = flat_sensors - out["x_hat"].detach()
+        optimizer = self.optimizers()  # retrieve configured optimizer (Adam on encoder_layer1)
         optimizer.zero_grad()
-        _ = self.encoder_layer1.feedback(e0_prev)  # computes local backward and populates grads
+        _ = self.encoder_layer1.feedback(e0_prev)  # local backward populates grads
         optimizer.step()
-
-        # Metric (only reconstruction MSE)
         recon_mse = e0.pow(2).mean()
         self.log("train/recon_mse", recon_mse, prog_bar=True)
-
         return recon_mse
 
 
