@@ -4,7 +4,7 @@ from typing import Dict, Literal, Optional, Tuple
 import torch
 from lightning import pytorch as pl
 from pydantic import BaseModel, Field
-from torch import Tensor, flatten, nn
+from torch import Tensor, autograd, flatten, nn
 from torch.optim import Optimizer
 
 from ehc_sn.models.ann.sparse_autoencoder import Autoencoder as Teacher
@@ -69,6 +69,41 @@ class EncoderLayer(nn.Linear):
         self.activations = self.activation(self.currents)
         return self.activations
 
+    def feedback(self, error: Tensor) -> Tensor:
+        """Project reconstruction error locally and backprop through this layer only.
+
+        Parameters
+        ----------
+        error : Tensor
+            Reconstruction error at sensory layer (B, D) BEFORE correction (e0_prev).
+
+        Returns
+        -------
+        Tensor
+            Local projected signal delta_tilde = F e (B, H1) used as teaching signal.
+
+        Notes
+        -----
+        We build a purely local scalar objective L_local = sum_b,h a_{b,h} * delta_tilde_{b,h}
+        so that autograd yields: dL/dW = (delta_tilde ⊙ f'(u)) input^T, matching the
+        hand-crafted surrogate gradient. Inputs are detached so no upstream credit flows.
+        Batch-mean normalization keeps update scale comparable to earlier manual rule.
+        """
+        if self.activations is None or self.currents is None:
+            raise RuntimeError("Forward pass must be executed before feedback().")
+        # Local projection (no gradient path through error or F)
+        delta_tilde = error.detach() @ self.F.T  # (B, H1)
+        batch_size = error.shape[0]
+        # Local scalar objective whose gradient matches desired update direction
+        local_loss = (self.activations * delta_tilde).sum() / batch_size
+        # Zero existing grads (in-case of accumulation) then backward through this layer only
+        if self.weight.grad is not None:
+            self.weight.grad.zero_()
+        if self.bias is not None and self.bias.grad is not None:
+            self.bias.grad.zero_()
+        local_loss.backward()
+        return delta_tilde
+
 
 # -------------------------------------------------------------------------------------------
 class DecoderLayer(nn.Linear):
@@ -86,6 +121,10 @@ class DecoderLayer(nn.Linear):
 
     def forward(self, inputs: Tensor) -> Tensor:
         return super().forward(inputs.detach())
+
+    def feedback(self, error: Tensor) -> Tensor:
+        """Compute combination projection B h_e (no gradient)."""
+        raise RuntimeError("This experiment assumes fixed decoder parameters.")
 
 
 # -------------------------------------------------------------------------------------------
@@ -209,26 +248,19 @@ class Autoencoder(pl.LightningModule):
         e0_prev = out["e0_prev"]
         e0 = out["e0"]
         h_e = out["h_e"]
-        # Strictly local surrogate (Copilot-Processing Section 6.2):
-        # delta_tilde = F' e0_prev ; grad_W = ((delta_tilde ⊙ f'(u)) e0_prev^T)/B
-        with torch.no_grad():
-            delta_tilde = e0_prev @ self.encoder_layer1.F.T  # (B, H1)
+        # Local autograd-based surrogate update (still biologically plausible due to detached inputs)
+        delta_tilde = self.encoder_layer1.feedback(e0_prev)
 
-        pre_act = self.encoder_layer1.currents  # u = W_e e0_prev
-        gelu_prime = gelu_derivative(pre_act)
-        surrogate_term = delta_tilde * gelu_prime  # (B, H1)
-
-        batch_size = e0_prev.shape[0]
-        grad_W = surrogate_term.T @ e0_prev / batch_size
-        grad_b = surrogate_term.mean(dim=0)
-
-        # (No sparsity regularization or weight decay in simplified version)
-
+        # Apply manual SGD step using gradients produced locally
         lr = self.pc_params.learning_rate
         with torch.no_grad():
-            self.encoder_layer1.weight -= lr * grad_W
-            if self.encoder_layer1.bias is not None:
-                self.encoder_layer1.bias -= lr * grad_b
+            self.encoder_layer1.weight -= lr * self.encoder_layer1.weight.grad
+            if self.encoder_layer1.bias is not None and self.encoder_layer1.bias.grad is not None:
+                self.encoder_layer1.bias -= lr * self.encoder_layer1.bias.grad
+        # Clear grads to avoid accumulation next step
+        self.encoder_layer1.weight.grad = None
+        if self.encoder_layer1.bias is not None:
+            self.encoder_layer1.bias.grad = None
 
         # Metrics
         recon_mse = e0.pow(2).mean()
@@ -242,7 +274,15 @@ class Autoencoder(pl.LightningModule):
         self.log("train/recon_mse", recon_mse, prog_bar=True)
         self.log("train/correction_norm", correction_norm, prog_bar=False)
         self.log("train/error_stability", stability, prog_bar=False)
-        self.log("train/weight_grad_norm", grad_W.norm(p=2), prog_bar=False)
+        self.log(
+            "train/weight_grad_norm",
+            (
+                self.encoder_layer1.weight.grad.norm(p=2)
+                if self.encoder_layer1.weight.grad is not None
+                else torch.tensor(0.0, device=self.device)
+            ),
+            prog_bar=False,
+        )
 
         return recon_mse
 
