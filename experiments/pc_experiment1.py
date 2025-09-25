@@ -1,5 +1,5 @@
 import math
-from typing import Dict, Literal, Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 import torch
 from lightning import pytorch as pl
@@ -137,25 +137,22 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     @torch.no_grad()
     def forward(self, batch: Tuple[Tensor, Tensor], h2: Tensor) -> Tensor:  # type: ignore[override]
-        return self.inference(batch, h2)["x_hat"]
+        return self.inference(batch, h2)[1]
 
     # -----------------------------------------------------------------------------------
-    def inference(self, batch: Tuple[Tensor, Tensor], h2: Tensor) -> Dict[str, Tensor]:
-        """Return pre-correction error and final reconstruction (assumes proper device)."""
+    def inference(self, batch: Tuple[Tensor, Tensor], h2: Tensor) -> Tuple[Tensor, Tensor]:
+        """Return (pre-correction error, final reconstruction)."""
         sensors, targets = batch
         flat_sensors = flatten(sensors, start_dim=1)
-
         with torch.no_grad():
             h1_base = self.decoder_layer1(h2)
             x_base = self.teacher.decoder.output(h1_base)
         e0_prev = flat_sensors - x_base
-
         h_e = self.encoder_layer1(e0_prev)
         h1_hat = h1_base + (h_e @ self.decoder_layer1.B.T)
         with torch.no_grad():
             x_hat = self.teacher.decoder.output(h1_hat)
-
-        return {"e0_prev": e0_prev, "x_hat": x_hat}
+        return e0_prev, x_hat
 
     # -----------------------------------------------------------------------------------
     def on_fit_start(self) -> None:
@@ -164,14 +161,13 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tuple[Tensor, Tensor], batch_idx: int) -> Tensor:  # type: ignore[override]
         h2 = self.sample_h2(batch)
-        out = self.inference(batch, h2)
-        e0_prev = out["e0_prev"]
+        e0_prev, x_hat = self.inference(batch, h2)
         sensors = batch[0]
         flat_sensors = flatten(sensors, start_dim=1)
-        e0 = flat_sensors - out["x_hat"].detach()
-        optimizer = self.optimizers()  # retrieve configured optimizer (Adam on encoder_layer1)
+        e0 = flat_sensors - x_hat.detach()
+        optimizer = self.optimizers()
         optimizer.zero_grad()
-        self.encoder_layer1.feedback(e0_prev)  # local backward populates grads
+        self.encoder_layer1.feedback(e0_prev)
         optimizer.step()
         recon_mse = e0.pow(2).mean()
         self.log("train/recon_mse", recon_mse, prog_bar=True)
@@ -243,20 +239,13 @@ if __name__ == "__main__":
     # Pre-training inference (CPU by default; Lightning will handle device later)
     with torch.no_grad():
         h2_0 = model.sample_h2((sensors0, targets0))
-        out0 = model.inference((sensors0, targets0), h2_0)
-        xhat0 = out0["x_hat"].detach()
+    _e0_prev0, xhat0 = model.inference((sensors0, targets0), h2_0)
+    xhat0 = xhat0.detach()
 
     # Reshape reconstruction
     output_shape_tuple = tuple(model.config.output_shape)
     out_shape = (targets0.shape[0],) + output_shape_tuple
-    try:
-        recon0_img = xhat0.view(out_shape)
-    except RuntimeError:
-        # Attempt to treat as (N, H, W) if channel mismatch
-        if len(output_shape_tuple) == 2:
-            recon0_img = xhat0.view(targets0.shape[0], *output_shape_tuple)
-        else:
-            recon0_img = targets0.clone()
+    recon0_img = xhat0.view(out_shape)
 
     # Figure: pre-training reconstruction
     os.makedirs("figures", exist_ok=True)
@@ -271,15 +260,9 @@ if __name__ == "__main__":
 
     # Post-training reconstruction using same batch & latent
     with torch.no_grad():
-        out1 = model.inference((sensors0, targets0), h2_0)
-        xhat1 = out1["x_hat"].detach()
-    try:
-        recon1_img = xhat1.view(out_shape)
-    except RuntimeError:
-        if len(output_shape_tuple) == 2:
-            recon1_img = xhat1.view(targets0.shape[0], *output_shape_tuple)
-        else:
-            recon1_img = targets0.clone()
+        _e0_prev1, xhat1 = model.inference((sensors0, targets0), h2_0)
+        xhat1 = xhat1.detach()
+    recon1_img = xhat1.view(out_shape)
 
     fig_params_post = ReconstructionMapParams(n_samples=min(4, targets0.shape[0]), title="Post-Training Recon")
     fig_post = ReconstructionMapFigure(fig_params_post).plot(targets0.detach().cpu(), recon1_img.detach().cpu())
