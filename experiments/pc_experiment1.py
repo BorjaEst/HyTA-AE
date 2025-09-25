@@ -22,14 +22,12 @@ class PCExperimentParams(BaseModel):
 
 # -------------------------------------------------------------------------------------------
 class EncoderLayer(nn.Linear):
-    """Error-to-hidden mapping with local feedback projection matrix F.
+    """Error-to-hidden mapping with local feedback projection matrix F."""
 
-    F projects input-layer reconstruction error (dimension D) into hidden corrective
-    units (H1) providing a local teaching signal (delta_tilde = F e0_prev).
-    """
-
-    def __init__(self, in_features: int, out_features: int, *, device=None, dtype=None, **kwargs) -> None:
-        super().__init__(in_features, out_features, device=device, dtype=dtype, **kwargs)
+    def __init__(
+        self, in_features: int, out_features: int, *, device=None, dtype=None, bias: bool = False, **kwargs
+    ) -> None:  # disable bias for clean fixed point
+        super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype, **kwargs)
         self.activation = nn.GELU()
         self.register_buffer("currents", None)
         self.register_buffer("activations", None)
@@ -115,7 +113,7 @@ class Autoencoder(pl.LightningModule):
         n_sensors = math.prod(params.output_shape)
         self.teacher = teacher
         self.decoder_layer1 = DecoderLayer(n_h2, n_h1, bias=True)
-        self.encoder_layer1 = EncoderLayer(n_sensors, n_h1, bias=True)
+        self.encoder_layer1 = EncoderLayer(n_sensors, n_h1, bias=False)  # ensure no constant drive
         self.encoder_layer1.init_feedback(self.pc_params.feedback_mode, self.teacher.decoder.output)
         self.decoder_layer1.init_combination(self.pc_params.combination_mode)
 
