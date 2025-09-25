@@ -203,21 +203,17 @@ class Autoencoder(pl.LightningModule):
         e0_prev = out["e0_prev"]
         e0 = out["e0"]
         h_e = out["h_e"]
-
-        # Surrogate hidden error delta_h = F e0
+        # Strictly local surrogate (Copilot-Processing Section 6.2):
+        # delta_tilde = F' e0_prev ; grad_W = ((delta_tilde ⊙ f'(u)) e0_prev^T)/B
         with torch.no_grad():
-            delta_h = e0 @ self.F.T  # (B, H1)
+            delta_tilde = e0_prev @ self.F.T  # (B, H1)
 
-        # Local gradient components
-        pre_act = self.encoder_layer1.currents  # (B, H1)
+        pre_act = self.encoder_layer1.currents  # u = W_e e0_prev
         gelu_prime = gelu_derivative(pre_act)
-        # B^T delta_h (B, H1)
-        Bt_delta_h = delta_h @ self.B  # if B identity this is delta_h
-        surrogate_term = Bt_delta_h * gelu_prime  # (B, H1)
+        surrogate_term = delta_tilde * gelu_prime  # (B, H1)
 
-        # Weight gradient (H1, D)
-        grad_W = surrogate_term.T @ e0_prev / e0_prev.shape[0]
-        # Bias gradient (H1,)
+        batch_size = e0_prev.shape[0]
+        grad_W = surrogate_term.T @ e0_prev / batch_size
         grad_b = surrogate_term.mean(dim=0)
 
         # (No sparsity regularization or weight decay in simplified version)
