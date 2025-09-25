@@ -10,41 +10,35 @@ from torch.optim import Optimizer
 from ehc_sn.models.ann.sparse_autoencoder import Autoencoder as Teacher
 from ehc_sn.models.ann.sparse_autoencoder import ModelParams as TeacherParams
 
-
 # -------------------------------------------------------------------------------------------
-class PCExperimentParams(BaseModel):
-    """Minimal configuration for the predictive coding experiment (reconstruction only)."""
-
-    learning_rate: float = Field(1e-3, ge=0.0)
-    feedback_mode: Literal["symmetric", "random", "identity"] = "random"
-    combination_mode: Literal["identity", "random"] = "identity"
+FEEDBACK_MODE: Literal["random", "identity"] = "random"
+COMBINATION_MODE: Literal["identity", "random"] = "identity"
+LEARNING_RATE = 1e-3
 
 
 # -------------------------------------------------------------------------------------------
 class EncoderLayer(nn.Linear):
     """Error-to-hidden mapping with local feedback projection matrix F."""
 
-    def __init__(
-        self, in_features: int, out_features: int, *, device=None, dtype=None, bias: bool = False, **kwargs
-    ) -> None:  # disable bias for clean fixed point
-        super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype, **kwargs)
+    def __init__(self, in_features: int, out_features: int, *, bias: bool = False, **kwargs) -> None:
+        super().__init__(in_features, out_features, bias=bias, **kwargs)
         self.activation = nn.GELU()
         self.register_buffer("currents", None)
         self.register_buffer("activations", None)
         self.register_buffer("F", torch.empty(out_features, in_features))  # feedback projection
+        self.init_feedback()  # default init
 
-    def init_feedback(self, mode: Literal["symmetric", "random", "identity"], teacher_output_layer: nn.Module) -> None:
+    def init_feedback(self) -> None:
         """Initialize feedback matrix F based on selected mode."""
-        if mode == "symmetric":
-            W_out = teacher_output_layer
-            self.F.copy_(W_out.weight.T.detach())  # shape (H1,D)
-        elif mode == "identity":
+        if FEEDBACK_MODE == "identity":
             # assume shapes compatible (may be rectangular -> eye crops/pads not handled here)
             rows, cols = self.F.shape
             eye = torch.eye(rows, cols, device=self.F.device, dtype=self.F.dtype)
             self.F.copy_(eye)
-        else:  # random
+        elif FEEDBACK_MODE == "random":
             torch.nn.init.kaiming_uniform_(self.F, a=math.sqrt(5))
+        else:
+            raise ValueError(f"Unknown feedback mode: {FEEDBACK_MODE}")
 
     def forward(self, input: Tensor) -> Tensor:
         input_local = input.detach()
@@ -76,12 +70,15 @@ class DecoderLayer(nn.Linear):
     def __init__(self, in_features: int, out_features: int, *, device=None, dtype=None, **kwargs) -> None:
         super().__init__(in_features, out_features, device=device, dtype=dtype, **kwargs)
         self.register_buffer("B", torch.empty(out_features, out_features))  # combination / modulation
+        self.init_combination()  # default init
 
-    def init_combination(self, mode: Literal["identity", "random"]) -> None:
-        if mode == "identity":
+    def init_combination(self) -> None:
+        if COMBINATION_MODE == "identity":
             self.B.copy_(torch.eye(self.B.shape[0], device=self.B.device, dtype=self.B.dtype))
-        else:
+        elif COMBINATION_MODE == "random":
             torch.nn.init.kaiming_uniform_(self.B, a=math.sqrt(5))
+        else:
+            raise ValueError(f"Unknown combination mode: {COMBINATION_MODE}")
 
     def forward(self, inputs: Tensor) -> Tensor:
         return super().forward(inputs.detach())
@@ -100,28 +97,25 @@ class Autoencoder(pl.LightningModule):
     teacher remain frozen.
     """
 
-    def __init__(self, teacher: nn.Module, pc_params: Optional[PCExperimentParams] = None) -> None:
+    def __init__(self, teacher: nn.Module) -> None:
         super().__init__()
         self.save_hyperparameters(ignore=["teacher"])
         self.config = params = teacher.config
         teacher.eval()
         for p in teacher.parameters():
             p.requires_grad = False
-        self.pc_params = pc_params or PCExperimentParams()
         self.automatic_optimization = False
         n_h1, n_h2 = params.layer1_units, params.layer2_units
         n_sensors = math.prod(params.output_shape)
         self.teacher = teacher
         self.decoder_layer1 = DecoderLayer(n_h2, n_h1, bias=True)
         self.encoder_layer1 = EncoderLayer(n_sensors, n_h1, bias=False)  # ensure no constant drive
-        self.encoder_layer1.init_feedback(self.pc_params.feedback_mode, self.teacher.decoder.output)
-        self.decoder_layer1.init_combination(self.pc_params.combination_mode)
 
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
         return torch.optim.Adam(
             self.encoder_layer1.parameters(),
-            lr=self.pc_params.learning_rate,
+            lr=LEARNING_RATE,
         )
 
     # -----------------------------------------------------------------------------------
