@@ -20,9 +20,6 @@ class PCExperimentParams(BaseModel):
     combination_mode: Literal["identity", "random"] = "identity"
 
 
-"""Minimal predictive coding experiment (reconstruction-only)."""
-
-
 # -------------------------------------------------------------------------------------------
 class EncoderLayer(nn.Linear):
     """Error-to-hidden mapping with local feedback projection matrix F.
@@ -121,8 +118,6 @@ class Autoencoder(pl.LightningModule):
         self.encoder_layer1 = EncoderLayer(n_sensors, n_h1, bias=True)
         self.encoder_layer1.init_feedback(self.pc_params.feedback_mode, self.teacher.decoder.output)
         self.decoder_layer1.init_combination(self.pc_params.combination_mode)
-        self.cached_batch: Optional[Tuple[Tensor, Tensor]] = None
-        self.stored_h2: Optional[Tensor] = None
 
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
@@ -146,12 +141,8 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def inference(self, batch: Tuple[Tensor, Tensor], h2: Tensor) -> Dict[str, Tensor]:
-        """Return only pre-correction error and final reconstruction."""
+        """Return pre-correction error and final reconstruction (assumes proper device)."""
         sensors, targets = batch
-        device = self.encoder_layer1.weight.device
-        sensors = sensors.to(device)
-        targets = targets.to(device)
-        h2 = h2.to(device)
         flat_sensors = flatten(sensors, start_dim=1)
 
         with torch.no_grad():
@@ -168,19 +159,14 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def on_fit_start(self) -> None:
-        dl = self.trainer.datamodule.train_dataloader()
-        raw_batch = next(iter(dl))
-        batch = tuple(t.to(self.device) for t in raw_batch)
-        self.cached_batch = batch  # type: ignore[assignment]
-        self.stored_h2 = self.sample_h2(batch)  # type: ignore[arg-type]
+        pass  # no caching; rely on single-batch dataloader
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tuple[Tensor, Tensor], batch_idx: int) -> Tensor:  # type: ignore[override]
-        batch = self.cached_batch  # type: ignore[assignment]
-        h2 = self.stored_h2
+        h2 = self.sample_h2(batch)
         out = self.inference(batch, h2)
         e0_prev = out["e0_prev"]
-        sensors = batch[0].to(self.device)
+        sensors = batch[0]
         flat_sensors = flatten(sensors, start_dim=1)
         e0 = flat_sensors - out["x_hat"].detach()
         optimizer = self.optimizers()  # retrieve configured optimizer (Adam on encoder_layer1)
@@ -254,13 +240,9 @@ if __name__ == "__main__":
     first_batch = next(iter(datamodule.train_dataloader()))
     sensors0, targets0 = (t.clone() for t in first_batch)
 
-    # Move model & batch to device early
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    sensors0 = sensors0.to(device)
-    targets0 = targets0.to(device)
+    # Pre-training inference (CPU by default; Lightning will handle device later)
     with torch.no_grad():
-        h2_0 = model.sample_h2((sensors0, targets0)).to(device)
+        h2_0 = model.sample_h2((sensors0, targets0))
         out0 = model.inference((sensors0, targets0), h2_0)
         xhat0 = out0["x_hat"].detach()
 
@@ -289,7 +271,6 @@ if __name__ == "__main__":
 
     # Post-training reconstruction using same batch & latent
     with torch.no_grad():
-        h2_0 = h2_0.to(model.device)
         out1 = model.inference((sensors0, targets0), h2_0)
         xhat1 = out1["x_hat"].detach()
     try:
