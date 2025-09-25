@@ -20,7 +20,7 @@ class PCExperimentParams(BaseModel):
     combination_mode: Literal["identity", "random"] = "identity"
 
 
-"""Removed unused gelu_derivative helper (not needed for current experiment)."""
+"""Minimal predictive coding experiment (reconstruction-only)."""
 
 
 # -------------------------------------------------------------------------------------------
@@ -58,11 +58,7 @@ class EncoderLayer(nn.Linear):
         return self.activations
 
     def feedback(self, error: Tensor) -> None:
-        """In-place local surrogate gradient generation (no return value).
-
-        Builds a local scalar objective L_local = sum a * (F e) / B to populate grads
-        for this layer only. No tensor is returned; caller just invokes before optimizer.step().
-        """
+        """Populate local grads from sensory-layer error (in-place)."""
         if self.activations is None or self.currents is None:
             raise RuntimeError("Forward pass must be executed before feedback().")
         # Local projection (no gradient path through error or F)
@@ -112,34 +108,21 @@ class Autoencoder(pl.LightningModule):
     def __init__(self, teacher: nn.Module, pc_params: Optional[PCExperimentParams] = None) -> None:
         super().__init__()
         self.save_hyperparameters(ignore=["teacher"])
-        self.config = params = teacher.config  # teacher's (frozen) params
+        self.config = params = teacher.config
         teacher.eval()
         for p in teacher.parameters():
             p.requires_grad = False
-
         self.pc_params = pc_params or PCExperimentParams()
-        self.automatic_optimization = False  # manual local update
-
-        # Dimensions
-        self.n_hidden = n_h1, n_h2 = params.layer1_units, params.layer2_units
-        self.n_sensors = n_sensors = math.prod(params.output_shape)
-
-        # Modules
+        self.automatic_optimization = False
+        n_h1, n_h2 = params.layer1_units, params.layer2_units
+        n_sensors = math.prod(params.output_shape)
         self.teacher = teacher
-        self.decoder_layer1 = DecoderLayer(n_h2, n_h1, bias=True)  # W_{d1}
-        self.encoder_layer1 = EncoderLayer(n_sensors, n_h1, bias=True)  # W_e
-
-        # Initialize local feedback/combination matrices inside layers
+        self.decoder_layer1 = DecoderLayer(n_h2, n_h1, bias=True)
+        self.encoder_layer1 = EncoderLayer(n_sensors, n_h1, bias=True)
         self.encoder_layer1.init_feedback(self.pc_params.feedback_mode, self.teacher.decoder.output)
         self.decoder_layer1.init_combination(self.pc_params.combination_mode)
-
-        # Experiment state / caches
         self.cached_batch: Optional[Tuple[Tensor, Tensor]] = None
         self.stored_h2: Optional[Tensor] = None
-
-    # -----------------------------------------------------------------------------------
-    def _init_feedback_matrices(self) -> None:  # kept for backward compatibility (noop)
-        pass
 
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
@@ -159,9 +142,7 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     @torch.no_grad()
     def forward(self, batch: Tuple[Tensor, Tensor], h2: Tensor) -> Tensor:  # type: ignore[override]
-        """Lightning forward: returns final reconstruction only (for compatibility)."""
-        out = self.inference(batch, h2)
-        return out["x_hat"]
+        return self.inference(batch, h2)["x_hat"]
 
     # -----------------------------------------------------------------------------------
     def inference(self, batch: Tuple[Tensor, Tensor], h2: Tensor) -> Dict[str, Tensor]:
@@ -189,7 +170,7 @@ class Autoencoder(pl.LightningModule):
     def on_fit_start(self) -> None:
         dl = self.trainer.datamodule.train_dataloader()
         raw_batch = next(iter(dl))
-        batch = tuple(t.to(self.device) for t in raw_batch)  # assume tuple
+        batch = tuple(t.to(self.device) for t in raw_batch)
         self.cached_batch = batch  # type: ignore[assignment]
         self.stored_h2 = self.sample_h2(batch)  # type: ignore[arg-type]
 
@@ -213,8 +194,7 @@ class Autoencoder(pl.LightningModule):
 
 # -------------------------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Test predictive coding first model implementation
-    print("=== Testing Predictive Coding Autoencoder Model ===")
+    print("=== Predictive Coding Autoencoder (Minimal) ===")
 
     # Set seeds for fully deterministic behavior
     import os
@@ -228,7 +208,7 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    from ehc_sn.augmentation.incomplete_maps import Augmentation, ComposeParams
+    # Removed unused augmentation imports
     from ehc_sn.core.datamodule import BaseDataModule, DataModuleParams
     from ehc_sn.data.obstacle_maps import DataGenerator, DataParams
     from ehc_sn.figures.reconstruction_map import ReconstructionMapFigure, ReconstructionMapParams
@@ -271,9 +251,8 @@ if __name__ == "__main__":
 
     # Ensure datasets are prepared before directly accessing dataloader
     datamodule.setup("fit")
-    # Prepare a batch for before/after comparison (reuse first train batch)
     first_batch = next(iter(datamodule.train_dataloader()))
-    sensors0, targets0 = (t.clone() for t in first_batch)  # clone to avoid in-place side effects
+    sensors0, targets0 = (t.clone() for t in first_batch)
 
     # Move model & batch to device early
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -285,8 +264,7 @@ if __name__ == "__main__":
         out0 = model.inference((sensors0, targets0), h2_0)
         xhat0 = out0["x_hat"].detach()
 
-    # Reshape flattened reconstruction to spatial map
-    # output_shape stored as list -> convert to tuple for view; infer channel handling
+    # Reshape reconstruction
     output_shape_tuple = tuple(model.config.output_shape)
     out_shape = (targets0.shape[0],) + output_shape_tuple
     try:
@@ -303,7 +281,7 @@ if __name__ == "__main__":
     fig_params = ReconstructionMapParams(n_samples=min(4, targets0.shape[0]), title="Pre-Training Recon")
     fig_pre = ReconstructionMapFigure(fig_params).plot(targets0.detach().cpu(), recon0_img.detach().cpu())
     fig_pre.savefig("figures/reconstruction_pre.png", dpi=120, bbox_inches="tight")
-    print("Saved pre-training reconstruction figure to figures/reconstruction_pre.png")
+    print("Saved pre-training figure -> figures/reconstruction_pre.png")
 
     # Train
     trainer = pl.Trainer(max_epochs=40, enable_progress_bar=True)
@@ -325,6 +303,5 @@ if __name__ == "__main__":
     fig_params_post = ReconstructionMapParams(n_samples=min(4, targets0.shape[0]), title="Post-Training Recon")
     fig_post = ReconstructionMapFigure(fig_params_post).plot(targets0.detach().cpu(), recon1_img.detach().cpu())
     fig_post.savefig("figures/reconstruction_post.png", dpi=120, bbox_inches="tight")
-    print("Saved post-training reconstruction figure to figures/reconstruction_post.png")
-
-    print("=== Test Completed ===")
+    print("Saved post-training figure -> figures/reconstruction_post.png")
+    print("=== Done ===")
