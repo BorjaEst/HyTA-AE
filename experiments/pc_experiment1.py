@@ -151,19 +151,20 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tuple[Tensor, Tensor], batch_idx: int) -> None:
+        targets = flatten(batch[1], start_dim=1)
         h2 = self.sample_h2(batch)
-        e0_prev, x_hat = self(batch, h2)
-        sensors = batch[0]
-        flat_sensors = flatten(sensors, start_dim=1)
         optimizer = self.optimizers()
+
+        # Run the first forward pass to get error and prediction
+        error, prediction = self(batch, h2)
 
         # Update encoder layer with local feedback
         optimizer.zero_grad()
-        self.encoder_layer1.feedback(e0_prev)
+        self.encoder_layer1.feedback(error)
         optimizer.step()
 
         # Log reconstruction loss (not used for learning)
-        reconstruction_loss = nn.MSELoss(reduce="mean")(x_hat, flat_sensors)
+        reconstruction_loss = nn.MSELoss(reduce="mean")(prediction, targets)
         self.log("train/recon_mse", reconstruction_loss, prog_bar=True)
 
 
