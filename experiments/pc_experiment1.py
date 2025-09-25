@@ -13,7 +13,6 @@ from ehc_sn.models.ann.sparse_autoencoder import ModelParams as TeacherParams
 # -------------------------------------------------------------------------------------------
 FEEDBACK_MODE: Literal["random", "identity"] = "random"
 COMBINATION_MODE: Literal["identity", "random"] = "identity"
-LEARNING_RATE = 1e-3
 ACTIVATION_FN: bool = True
 
 
@@ -104,11 +103,7 @@ class Autoencoder(pl.LightningModule):
         self.save_hyperparameters(ignore=["teacher"])
         self.config = params = teacher.config
         self.automatic_optimization = False
-
-        # Freeze teacher parameters and set eval mode
         teacher.eval()
-        for p in teacher.parameters():
-            p.requires_grad = False
 
         # Dimensions
         n_h1, n_h2 = params.layer1_units, params.layer2_units
@@ -121,10 +116,9 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
-        return torch.optim.Adam(
-            self.encoder_layer1.parameters(),
-            lr=LEARNING_RATE,
-        )
+        l1_encoder = {"params": self.encoder_layer1.parameters(), "lr": 1e-3}
+        l0_decoder = {"params": self.teacher.decoder.output.parameters(), "lr": 0.0}
+        return torch.optim.Adam([l1_encoder, l0_decoder])
 
     # -----------------------------------------------------------------------------------
     @torch.no_grad()
@@ -145,8 +139,7 @@ class Autoencoder(pl.LightningModule):
         error = flat_sensors - x_base
         h1_err = self.encoder_layer1(error)
         h1_hat = self.decoder_layer1(h2, h1_err)
-        with torch.no_grad():
-            x_hat = self.teacher.decoder.output(h1_hat)
+        x_hat = self.teacher.decoder.output(h1_hat.detach())
         return error, x_hat
 
     # -----------------------------------------------------------------------------------
@@ -161,10 +154,11 @@ class Autoencoder(pl.LightningModule):
         # Update encoder layer with local feedback
         optimizer.zero_grad()
         self.encoder_layer1.feedback(error)
+        reconstruction_loss = nn.MSELoss(reduce="mean")(prediction, targets.detach())
+        self.manual_backward(reconstruction_loss)
         optimizer.step()
 
         # Log reconstruction loss (not used for learning)
-        reconstruction_loss = nn.MSELoss(reduce="mean")(prediction, targets)
         self.log("train/recon_mse", reconstruction_loss, prog_bar=True)
 
 
