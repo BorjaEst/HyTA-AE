@@ -57,25 +57,11 @@ class EncoderLayer(nn.Linear):
         self.activations = self.activation(self.currents)
         return self.activations
 
-    def feedback(self, error: Tensor) -> Tensor:
-        """Project reconstruction error locally and backprop through this layer only.
+    def feedback(self, error: Tensor) -> None:
+        """In-place local surrogate gradient generation (no return value).
 
-        Parameters
-        ----------
-        error : Tensor
-            Reconstruction error at sensory layer (B, D) BEFORE correction (e0_prev).
-
-        Returns
-        -------
-        Tensor
-            Local projected signal delta_tilde = F e (B, H1) used as teaching signal.
-
-        Notes
-        -----
-        We build a purely local scalar objective L_local = sum_b,h a_{b,h} * delta_tilde_{b,h}
-        so that autograd yields: dL/dW = (delta_tilde ⊙ f'(u)) input^T, matching the
-        hand-crafted surrogate gradient. Inputs are detached so no upstream credit flows.
-        Batch-mean normalization keeps update scale comparable to earlier manual rule.
+        Builds a local scalar objective L_local = sum a * (F e) / B to populate grads
+        for this layer only. No tensor is returned; caller just invokes before optimizer.step().
         """
         if self.activations is None or self.currents is None:
             raise RuntimeError("Forward pass must be executed before feedback().")
@@ -90,7 +76,6 @@ class EncoderLayer(nn.Linear):
         if self.bias is not None and self.bias.grad is not None:
             self.bias.grad.zero_()
         local_loss.backward()
-        return delta_tilde
 
 
 # -------------------------------------------------------------------------------------------
@@ -219,7 +204,7 @@ class Autoencoder(pl.LightningModule):
         e0 = flat_sensors - out["x_hat"].detach()
         optimizer = self.optimizers()  # retrieve configured optimizer (Adam on encoder_layer1)
         optimizer.zero_grad()
-        _ = self.encoder_layer1.feedback(e0_prev)  # local backward populates grads
+        self.encoder_layer1.feedback(e0_prev)  # local backward populates grads
         optimizer.step()
         recon_mse = e0.pow(2).mean()
         self.log("train/recon_mse", recon_mse, prog_bar=True)
