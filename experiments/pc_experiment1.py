@@ -183,9 +183,10 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
-        # Optimizer kept only for logging compatibility; manual update bypasses .step()
-        # (Return a dummy optimizer on encoder parameters.)
-        return torch.optim.SGD(self.encoder_layer1.parameters(), lr=self.pc_params.learning_rate)
+        return torch.optim.SGD(
+            self.encoder_layer1.parameters(),
+            lr=self.pc_params.learning_rate,
+        )
 
     # -----------------------------------------------------------------------------------
     @torch.no_grad()
@@ -251,19 +252,11 @@ class Autoencoder(pl.LightningModule):
         out = self.inference(batch, h2)
         e0_prev = out["e0_prev"]
         e0 = out["e0"]
-        # Local autograd-based surrogate update (still biologically plausible due to detached inputs)
-        delta_tilde = self.encoder_layer1.feedback(e0_prev)
-
-        # Apply manual SGD step using gradients produced locally
-        lr = self.pc_params.learning_rate
-        with torch.no_grad():
-            self.encoder_layer1.weight -= lr * self.encoder_layer1.weight.grad
-            if self.encoder_layer1.bias is not None and self.encoder_layer1.bias.grad is not None:
-                self.encoder_layer1.bias -= lr * self.encoder_layer1.bias.grad
-        # Clear grads to avoid accumulation next step
-        self.encoder_layer1.weight.grad = None
-        if self.encoder_layer1.bias is not None:
-            self.encoder_layer1.bias.grad = None
+        # Local autograd-based surrogate update using optimizer
+        optimizer = self.optimizers()  # retrieve configured optimizer (SGD on encoder_layer1)
+        optimizer.zero_grad()
+        _ = self.encoder_layer1.feedback(e0_prev)  # computes local backward and populates grads
+        optimizer.step()
 
         # Metric (only reconstruction MSE)
         recon_mse = e0.pow(2).mean()
