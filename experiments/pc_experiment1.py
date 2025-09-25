@@ -20,19 +20,7 @@ class PCExperimentParams(BaseModel):
     combination_mode: Literal["identity", "random"] = "identity"
 
 
-def gelu_derivative(x: Tensor) -> Tensor:
-    """Analytic derivative of GELU (approx standard formulation).
-
-    GELU(x) = 0.5 x [1 + erf(x / sqrt(2))]
-    d/dx GELU(x) = 0.5 * (1 + erf(x / sqrt(2))) + (x * exp(-x^2 /2)) / sqrt(2*pi)
-    """
-    import torch
-
-    sqrt_2 = math.sqrt(2.0)
-    sqrt_2pi = math.sqrt(2.0 * math.pi)
-    erf_term = torch.erf(x / sqrt_2)
-    exp_term = torch.exp(-0.5 * x * x)
-    return 0.5 * (1.0 + erf_term) + (x * exp_term) / sqrt_2pi
+"""Removed unused gelu_derivative helper (not needed for current experiment)."""
 
 
 # -------------------------------------------------------------------------------------------
@@ -128,15 +116,6 @@ class DecoderLayer(nn.Linear):
 
 
 # -------------------------------------------------------------------------------------------
-class ErrorLayer(nn.Module):
-    """Computes reconstruction error e0 = x - x_hat (flattened)."""
-
-    def forward(self, sensors: Tensor, predictions: Tensor) -> Tensor:
-        flat_sensors = flatten(sensors, start_dim=1)
-        return flat_sensors - predictions  # e0
-
-
-# -------------------------------------------------------------------------------------------
 class Autoencoder(pl.LightningModule):
     """Predictive-coding style experiment with explicit inference + local learning split.
 
@@ -164,7 +143,6 @@ class Autoencoder(pl.LightningModule):
         self.teacher = teacher
         self.decoder_layer1 = DecoderLayer(n_h2, n_h1, bias=True)  # W_{d1}
         self.encoder_layer1 = EncoderLayer(n_sensors, n_h1, bias=True)  # W_e
-        self.error_layer = ErrorLayer()
 
         # Reconstruction energy (no sparsity / weight decay in simplified version)
         self.reconstruction_loss = nn.MSELoss(reduction="mean")
@@ -360,7 +338,7 @@ if __name__ == "__main__":
     print("Saved pre-training reconstruction figure to figures/reconstruction_pre.png")
 
     # Train
-    trainer = pl.Trainer(max_epochs=200, enable_progress_bar=True)
+    trainer = pl.Trainer(max_epochs=40, enable_progress_bar=True)
     trainer.fit(model, datamodule)
 
     # Post-training reconstruction using same batch & latent
