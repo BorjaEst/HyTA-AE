@@ -22,32 +22,18 @@ class EncoderLayer(nn.Linear):
 
     def __init__(self, in_features: int, out_features: int, *, bias: bool = False, **kwargs) -> None:
         super().__init__(in_features, out_features, bias=bias, **kwargs)
+        self.register_buffer("F", torch.empty(out_features, in_features))  # feedback projection
         self.activation = nn.GELU()
         self.register_buffer("currents", None)
         self.register_buffer("activations", None)
-        self.register_buffer("F", torch.empty(out_features, in_features))  # feedback projection
         self.init_feedback()  # default init
 
-    def init_feedback(self) -> None:
-        """Initialize feedback matrix F based on selected mode."""
-        if FEEDBACK_MODE == "identity":
-            # assume shapes compatible (may be rectangular -> eye crops/pads not handled here)
-            rows, cols = self.F.shape
-            eye = torch.eye(rows, cols, device=self.F.device, dtype=self.F.dtype)
-            self.F.copy_(eye)
-        elif FEEDBACK_MODE == "random":
-            torch.nn.init.kaiming_uniform_(self.F, a=math.sqrt(5))
-        else:
-            raise ValueError(f"Unknown feedback mode: {FEEDBACK_MODE}")
-
     def forward(self, input: Tensor) -> Tensor:
-        input_local = input.detach()
-        self.currents = super().forward(input_local)
+        self.currents = super().forward(input.detach())
         self.activations = self.activation(self.currents)
         return self.activations
 
     def feedback(self, error: Tensor) -> None:
-        """Populate local grads from sensory-layer error (in-place)."""
         if self.activations is None or self.currents is None:
             raise RuntimeError("Forward pass must be executed before feedback().")
         # Local projection (no gradient path through error or F)
@@ -62,15 +48,31 @@ class EncoderLayer(nn.Linear):
             self.bias.grad.zero_()
         local_loss.backward()
 
+    def init_feedback(self) -> None:
+        """Initialize feedback matrix F based on selected mode."""
+        if FEEDBACK_MODE == "identity":
+            self.F.copy_(torch.eye(*self.F.shape, device=self.F.device, dtype=self.F.dtype))
+        elif FEEDBACK_MODE == "random":
+            torch.nn.init.kaiming_uniform_(self.F, a=math.sqrt(5))
+        else:
+            raise ValueError(f"Unknown feedback mode: {FEEDBACK_MODE}")
+
 
 # -------------------------------------------------------------------------------------------
 class DecoderLayer(nn.Linear):
     """Frozen first decoder layer W_{d1} mapping h2 -> h1 base with combination matrix B."""
 
-    def __init__(self, in_features: int, out_features: int, *, device=None, dtype=None, **kwargs) -> None:
-        super().__init__(in_features, out_features, device=device, dtype=dtype, **kwargs)
+    def __init__(self, in_features: int, out_features: int, **kwargs) -> None:
+        super().__init__(in_features, out_features, **kwargs)
         self.register_buffer("B", torch.empty(out_features, out_features))  # combination / modulation
         self.init_combination()  # default init
+
+    def forward(self, inputs: Tensor, feedback: Tensor) -> Tensor:
+        return super().forward(inputs.detach()) + (feedback @ self.B.T)
+
+    def feedback(self, error: Tensor) -> Tensor:
+        """Compute combination projection B h_e (no gradient)."""
+        raise RuntimeError("This experiment assumes fixed decoder parameters.")
 
     def init_combination(self) -> None:
         if COMBINATION_MODE == "identity":
@@ -79,13 +81,6 @@ class DecoderLayer(nn.Linear):
             torch.nn.init.kaiming_uniform_(self.B, a=math.sqrt(5))
         else:
             raise ValueError(f"Unknown combination mode: {COMBINATION_MODE}")
-
-    def forward(self, inputs: Tensor) -> Tensor:
-        return super().forward(inputs.detach())
-
-    def feedback(self, error: Tensor) -> Tensor:
-        """Compute combination projection B h_e (no gradient)."""
-        raise RuntimeError("This experiment assumes fixed decoder parameters.")
 
 
 # -------------------------------------------------------------------------------------------
@@ -101,12 +96,18 @@ class Autoencoder(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore=["teacher"])
         self.config = params = teacher.config
+        self.automatic_optimization = False
+
+        # Freeze teacher parameters and set eval mode
         teacher.eval()
         for p in teacher.parameters():
             p.requires_grad = False
-        self.automatic_optimization = False
+
+        # Dimensions
         n_h1, n_h2 = params.layer1_units, params.layer2_units
         n_sensors = math.prod(params.output_shape)
+
+        # Model components (only encoder_layer1 is trained)
         self.teacher = teacher
         self.decoder_layer1 = DecoderLayer(n_h2, n_h1, bias=True)
         self.encoder_layer1 = EncoderLayer(n_sensors, n_h1, bias=False)  # ensure no constant drive
@@ -130,15 +131,16 @@ class Autoencoder(pl.LightningModule):
     def forward(self, batch: Tuple[Tensor, Tensor], h2: Tensor) -> Tuple[Tensor, Tensor]:
         sensors, targets = batch
         flat_sensors = flatten(sensors, start_dim=1)
+        zeros = torch.zeros(h2.shape[0], self.encoder_layer1.out_features, device=h2.device)
         with torch.no_grad():
-            h1_base = self.decoder_layer1(h2)
+            h1_base = self.decoder_layer1(h2, zeros)  # (B, H1)
             x_base = self.teacher.decoder.output(h1_base)
-        e0_prev = flat_sensors - x_base
-        h_e = self.encoder_layer1(e0_prev)
-        h1_hat = h1_base + (h_e @ self.decoder_layer1.B.T)
+        error = flat_sensors - x_base
+        h1_err = self.encoder_layer1(error)
+        h1_hat = self.decoder_layer1(h2, h1_err)
         with torch.no_grad():
             x_hat = self.teacher.decoder.output(h1_hat)
-        return e0_prev, x_hat
+        return error, x_hat
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tuple[Tensor, Tensor], batch_idx: int) -> None:
