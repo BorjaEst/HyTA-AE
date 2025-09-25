@@ -133,13 +133,7 @@ class Autoencoder(pl.LightningModule):
         return self.teacher.decoder.layer2.neurons.detach()
 
     # -----------------------------------------------------------------------------------
-    @torch.no_grad()
-    def forward(self, batch: Tuple[Tensor, Tensor], h2: Tensor) -> Tensor:  # type: ignore[override]
-        return self.inference(batch, h2)[1]
-
-    # -----------------------------------------------------------------------------------
-    def inference(self, batch: Tuple[Tensor, Tensor], h2: Tensor) -> Tuple[Tensor, Tensor]:
-        """Return (pre-correction error, final reconstruction)."""
+    def forward(self, batch: Tuple[Tensor, Tensor], h2: Tensor) -> Tuple[Tensor, Tensor]:
         sensors, targets = batch
         flat_sensors = flatten(sensors, start_dim=1)
         with torch.no_grad():
@@ -153,23 +147,21 @@ class Autoencoder(pl.LightningModule):
         return e0_prev, x_hat
 
     # -----------------------------------------------------------------------------------
-    def on_fit_start(self) -> None:
-        pass  # no caching; rely on single-batch dataloader
-
-    # -----------------------------------------------------------------------------------
-    def training_step(self, batch: Tuple[Tensor, Tensor], batch_idx: int) -> Tensor:  # type: ignore[override]
+    def training_step(self, batch: Tuple[Tensor, Tensor], batch_idx: int) -> None:
         h2 = self.sample_h2(batch)
-        e0_prev, x_hat = self.inference(batch, h2)
+        e0_prev, x_hat = self(batch, h2)
         sensors = batch[0]
         flat_sensors = flatten(sensors, start_dim=1)
-        e0 = flat_sensors - x_hat.detach()
         optimizer = self.optimizers()
+
+        # Update encoder layer with local feedback
         optimizer.zero_grad()
         self.encoder_layer1.feedback(e0_prev)
         optimizer.step()
-        recon_mse = e0.pow(2).mean()
-        self.log("train/recon_mse", recon_mse, prog_bar=True)
-        return recon_mse
+
+        # Log reconstruction loss (not used for learning)
+        reconstruction_loss = nn.MSELoss(reduce="mean")(x_hat, flat_sensors)
+        self.log("train/recon_mse", reconstruction_loss, prog_bar=True)
 
 
 # -------------------------------------------------------------------------------------------
@@ -237,7 +229,7 @@ if __name__ == "__main__":
     # Pre-training inference (CPU by default; Lightning will handle device later)
     with torch.no_grad():
         h2_0 = model.sample_h2((sensors0, targets0))
-    _e0_prev0, xhat0 = model.inference((sensors0, targets0), h2_0)
+    _e0_prev0, xhat0 = model((sensors0, targets0), h2_0)
     xhat0 = xhat0.detach()
 
     # Reshape reconstruction
@@ -258,7 +250,7 @@ if __name__ == "__main__":
 
     # Post-training reconstruction using same batch & latent
     with torch.no_grad():
-        _e0_prev1, xhat1 = model.inference((sensors0, targets0), h2_0)
+        _e0_prev1, xhat1 = model((sensors0, targets0), h2_0)
         xhat1 = xhat1.detach()
     recon1_img = xhat1.view(out_shape)
 
