@@ -4,7 +4,7 @@ from typing import Dict, Literal, Optional, Tuple
 import torch
 from lightning import pytorch as pl
 from pydantic import BaseModel, Field
-from torch import Tensor, autograd, flatten, nn
+from torch import Tensor, flatten, nn
 from torch.optim import Optimizer
 
 from ehc_sn.models.ann.sparse_autoencoder import Autoencoder as Teacher
@@ -176,7 +176,6 @@ class Autoencoder(pl.LightningModule):
         # Experiment state / caches
         self.cached_batch: Optional[Tuple[Tensor, Tensor]] = None
         self.stored_h2: Optional[Tensor] = None
-        self.prev_error_norm: Optional[Tensor] = None
 
     # -----------------------------------------------------------------------------------
     def _init_feedback_matrices(self) -> None:  # kept for backward compatibility (noop)
@@ -206,6 +205,10 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     def inference(self, batch: Tuple[Tensor, Tensor], h2: Tensor) -> Dict[str, Tensor]:
         sensors, targets = batch
+        device = self.encoder_layer1.weight.device
+        sensors = sensors.to(device)
+        targets = targets.to(device)
+        h2 = h2.to(device)
         flat_sensors = flatten(sensors, start_dim=1)
 
         with torch.no_grad():
@@ -237,7 +240,8 @@ class Autoencoder(pl.LightningModule):
         batch = tuple(t.to(self.device) for t in raw_batch)  # assume tuple
         self.cached_batch = batch  # type: ignore[assignment]
         self.stored_h2 = self.sample_h2(batch)  # type: ignore[arg-type]
-        self.prev_error_norm = None
+
+    # no stability tracking needed when only logging reconstruction
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tuple[Tensor, Tensor], batch_idx: int) -> Tensor:  # type: ignore[override]
@@ -247,7 +251,6 @@ class Autoencoder(pl.LightningModule):
         out = self.inference(batch, h2)
         e0_prev = out["e0_prev"]
         e0 = out["e0"]
-        h_e = out["h_e"]
         # Local autograd-based surrogate update (still biologically plausible due to detached inputs)
         delta_tilde = self.encoder_layer1.feedback(e0_prev)
 
@@ -262,27 +265,9 @@ class Autoencoder(pl.LightningModule):
         if self.encoder_layer1.bias is not None:
             self.encoder_layer1.bias.grad = None
 
-        # Metrics
+        # Metric (only reconstruction MSE)
         recon_mse = e0.pow(2).mean()
-        correction_norm = h_e.norm(p=2, dim=1).mean()
-        if self.prev_error_norm is None:
-            stability = torch.tensor(0.0, device=self.device)
-        else:
-            stability = (recon_mse - self.prev_error_norm).abs()
-        self.prev_error_norm = recon_mse.detach()
-
         self.log("train/recon_mse", recon_mse, prog_bar=True)
-        self.log("train/correction_norm", correction_norm, prog_bar=False)
-        self.log("train/error_stability", stability, prog_bar=False)
-        self.log(
-            "train/weight_grad_norm",
-            (
-                self.encoder_layer1.weight.grad.norm(p=2)
-                if self.encoder_layer1.weight.grad is not None
-                else torch.tensor(0.0, device=self.device)
-            ),
-            prog_bar=False,
-        )
 
         return recon_mse
 
@@ -293,6 +278,7 @@ if __name__ == "__main__":
     print("=== Testing Predictive Coding Autoencoder Model ===")
 
     # Set seeds for fully deterministic behavior
+    import os
     import random
 
     import numpy as np
@@ -306,6 +292,7 @@ if __name__ == "__main__":
     from ehc_sn.augmentation.incomplete_maps import Augmentation, ComposeParams
     from ehc_sn.core.datamodule import BaseDataModule, DataModuleParams
     from ehc_sn.data.obstacle_maps import DataGenerator, DataParams
+    from ehc_sn.figures.reconstruction_map import ReconstructionMapFigure, ReconstructionMapParams
 
     # Prepare data generation
     data_param = DataParams(env_id="MiniGrid-MultiRoom-N6-v0")
@@ -340,7 +327,65 @@ if __name__ == "__main__":
     if unexpected:
         print("Unexpected keys (ignored):", unexpected)
 
-    # Instantiate and train themodel
+    # Instantiate model
     model = Autoencoder(teacher)
-    pl.Trainer(max_epochs=200, deterministic=True, enable_progress_bar=True).fit(model, datamodule)
+
+    # Ensure datasets are prepared before directly accessing dataloader
+    datamodule.setup("fit")
+    # Prepare a batch for before/after comparison (reuse first train batch)
+    first_batch = next(iter(datamodule.train_dataloader()))
+    sensors0, targets0 = (t.clone() for t in first_batch)  # clone to avoid in-place side effects
+
+    # Move model & batch to device early
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    sensors0 = sensors0.to(device)
+    targets0 = targets0.to(device)
+    with torch.no_grad():
+        h2_0 = model.sample_h2((sensors0, targets0)).to(device)
+        out0 = model.inference((sensors0, targets0), h2_0)
+        xhat0 = out0["x_hat"].detach()
+
+    # Reshape flattened reconstruction to spatial map
+    # output_shape stored as list -> convert to tuple for view; infer channel handling
+    output_shape_tuple = tuple(model.config.output_shape)
+    out_shape = (targets0.shape[0],) + output_shape_tuple
+    try:
+        recon0_img = xhat0.view(out_shape)
+    except RuntimeError:
+        # Attempt to treat as (N, H, W) if channel mismatch
+        if len(output_shape_tuple) == 2:
+            recon0_img = xhat0.view(targets0.shape[0], *output_shape_tuple)
+        else:
+            recon0_img = targets0.clone()
+
+    # Figure: pre-training reconstruction
+    os.makedirs("figures", exist_ok=True)
+    fig_params = ReconstructionMapParams(n_samples=min(4, targets0.shape[0]), title="Pre-Training Recon")
+    fig_pre = ReconstructionMapFigure(fig_params).plot(targets0.detach().cpu(), recon0_img.detach().cpu())
+    fig_pre.savefig("figures/reconstruction_pre.png", dpi=120, bbox_inches="tight")
+    print("Saved pre-training reconstruction figure to figures/reconstruction_pre.png")
+
+    # Train
+    trainer = pl.Trainer(max_epochs=200, enable_progress_bar=True)
+    trainer.fit(model, datamodule)
+
+    # Post-training reconstruction using same batch & latent
+    with torch.no_grad():
+        h2_0 = h2_0.to(model.device)
+        out1 = model.inference((sensors0, targets0), h2_0)
+        xhat1 = out1["x_hat"].detach()
+    try:
+        recon1_img = xhat1.view(out_shape)
+    except RuntimeError:
+        if len(output_shape_tuple) == 2:
+            recon1_img = xhat1.view(targets0.shape[0], *output_shape_tuple)
+        else:
+            recon1_img = targets0.clone()
+
+    fig_params_post = ReconstructionMapParams(n_samples=min(4, targets0.shape[0]), title="Post-Training Recon")
+    fig_post = ReconstructionMapFigure(fig_params_post).plot(targets0.detach().cpu(), recon1_img.detach().cpu())
+    fig_post.savefig("figures/reconstruction_post.png", dpi=120, bbox_inches="tight")
+    print("Saved post-training reconstruction figure to figures/reconstruction_post.png")
+
     print("=== Test Completed ===")
