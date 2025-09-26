@@ -14,6 +14,9 @@ from ehc_sn.models.ann.sparse_autoencoder import ModelParams as TeacherParams
 FEEDBACK_MODE: Literal["random", "identity"] = "random"
 COMBINATION_MODE: Literal["identity", "random"] = "random"
 ACTIVATION_FN: bool = True
+TRAIN_ENCODER_LAYER: bool = True  # whether to train the first encoder layer
+TRAIN_DECODER_LAYER: bool = True  # whether to train the first decoder layer
+TRAIN_OUTPUT_LAYER: bool = True  # whether to train the final output layer
 
 
 # -------------------------------------------------------------------------------------------
@@ -109,13 +112,12 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
-        return torch.optim.Adam(
-            [
-                {"params": self.encoder_layer1.parameters(), "lr": 1e-3},
-                {"params": self.decoder_layer1.parameters(), "lr": 1e-3},
-                {"params": self.decoder_output.parameters(), "lr": 4e-3},
-            ]
-        )
+        optimizer_parameters = [
+            {"params": self.encoder_layer1.parameters(), "lr": 1e-3 if TRAIN_ENCODER_LAYER else 0.0},
+            {"params": self.decoder_layer1.parameters(), "lr": 1e-3 if TRAIN_DECODER_LAYER else 0.0},
+            {"params": self.decoder_output.parameters(), "lr": 4e-3 if TRAIN_OUTPUT_LAYER else 0.0},
+        ]
+        return torch.optim.Adam(optimizer_parameters)
 
     # -----------------------------------------------------------------------------------
     @torch.no_grad()
