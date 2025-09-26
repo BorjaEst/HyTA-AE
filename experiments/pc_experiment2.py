@@ -113,7 +113,7 @@ class Autoencoder(pl.LightningModule):
             [
                 {"params": self.encoder_layer1.parameters(), "lr": 1e-3},
                 {"params": self.decoder_layer1.parameters(), "lr": 1e-3},
-                {"params": self.decoder_output.parameters(), "lr": 1e-3},
+                {"params": self.decoder_output.parameters(), "lr": 4e-3},
             ]
         )
 
@@ -190,7 +190,7 @@ if __name__ == "__main__":
     data_gen = DataGenerator(data_param)
 
     # Prepare data module
-    datamodule_param = DataModuleParams(num_samples=32, batch_size=32, drop_last=False)
+    datamodule_param = DataModuleParams(num_samples=16, batch_size=16, drop_last=False)
     datamodule = BaseDataModule(data_gen, datamodule_param)  # n_samples == batch_size to work
 
     # Prepare model and teacher
