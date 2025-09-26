@@ -12,7 +12,7 @@ from ehc_sn.models.ann.sparse_autoencoder import ModelParams as TeacherParams
 
 # -------------------------------------------------------------------------------------------
 FEEDBACK_MODE: Literal["random", "identity"] = "random"
-COMBINATION_MODE: Literal["identity", "random"] = "random"
+COMBINATION_MODE: Literal["random", "identity"] = "identity"
 ACTIVATION_FN: bool = True
 
 
@@ -102,15 +102,16 @@ class Autoencoder(pl.LightningModule):
 
         # Model components (only encoder_layer1 is trained)
         self.teacher = teacher
-        self.decoder_layer1 = DecoderLayer(n_h2, n_h1, bias=True)
         self.encoder_layer1 = EncoderLayer(n_sensors, n_h1, bias=False)  # ensure no constant drive
+        self.decoder_layer1 = DecoderLayer(n_h2, n_h1, bias=True)
+        self.decoder_output = teacher.decoder.output
 
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
         return torch.optim.Adam(
             [
                 {"params": self.encoder_layer1.parameters(), "lr": 1e-3},
-                # {"params": self.teacher.decoder.output.parameters(), "lr": 1e-3},
+                # {"params": self.decoder_output.parameters(), "lr": 1e-2},
             ]
         )
 
@@ -133,7 +134,7 @@ class Autoencoder(pl.LightningModule):
         error = flat_sensors - x_base
         h1_err = self.encoder_layer1(error)
         h1_hat = self.decoder_layer1(h2, h1_err)
-        x_hat = self.teacher.decoder.output(h1_hat.detach())
+        x_hat = self.decoder_output(h1_hat.detach())
         return error, x_hat
 
     # -----------------------------------------------------------------------------------
