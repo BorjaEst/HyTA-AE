@@ -21,7 +21,7 @@ class EncoderLayer(nn.Linear):
     """Error-to-hidden mapping with local feedback projection matrix F."""
 
     def __init__(self, in_features: int, out_features: int, *, bias: bool = False, **kwargs) -> None:
-        super().__init__(in_features, out_features, bias=bias, **kwargs)
+        super().__init__(in_features, out_features, bias=False, **kwargs)
         self.register_buffer("F", torch.empty(out_features, in_features))  # feedback projection
         self.activation = nn.GELU() if ACTIVATION_FN else nn.Identity()
         self.register_buffer("currents", None)
@@ -34,18 +34,8 @@ class EncoderLayer(nn.Linear):
         return self.activations
 
     def feedback(self, error: Tensor) -> None:
-        if self.activations is None or self.currents is None:
-            raise RuntimeError("Forward pass must be executed before feedback().")
-        # Local projection (no gradient path through error or F)
-        delta_tilde = error.detach() @ self.F.T  # (B, H1)
-        batch_size = error.shape[0]
-        # Local scalar objective whose gradient matches desired update direction
-        local_loss = (self.activations * delta_tilde).sum() / batch_size
-        # Zero existing grads (in-case of accumulation) then backward through this layer only
-        if self.weight.grad is not None:
-            self.weight.grad.zero_()
-        if self.bias is not None and self.bias.grad is not None:
-            self.bias.grad.zero_()
+        delta = error.detach() @ self.F.T  # (B, H1)
+        local_loss = (self.activations * delta).sum() / error.shape[0]
         local_loss.backward()
 
     def init_feedback(self) -> None:
@@ -56,6 +46,12 @@ class EncoderLayer(nn.Linear):
             torch.nn.init.kaiming_uniform_(self.F, a=math.sqrt(5))
         else:
             raise ValueError(f"Unknown feedback mode: {FEEDBACK_MODE}")
+
+    @property
+    def signal_mean(self) -> Optional[float]:
+        if self.activations is not None:
+            return self.activations.abs().mean().item()
+        return None
 
 
 # -------------------------------------------------------------------------------------------
@@ -158,8 +154,9 @@ class Autoencoder(pl.LightningModule):
         self.manual_backward(reconstruction_loss)
         optimizer.step()
 
-        # Log reconstruction loss (not used for learning)
+        # Log metrics to monitor progress
         self.log("train/recon_mse", reconstruction_loss, prog_bar=True)
+        self.log("train/Bf(h_e).mean", self.encoder_layer1.signal_mean, prog_bar=True)
 
 
 # -------------------------------------------------------------------------------------------
