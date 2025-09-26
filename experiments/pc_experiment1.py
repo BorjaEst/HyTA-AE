@@ -12,7 +12,7 @@ from ehc_sn.models.ann.sparse_autoencoder import ModelParams as TeacherParams
 
 # -------------------------------------------------------------------------------------------
 FEEDBACK_MODE: Literal["random", "identity"] = "random"
-COMBINATION_MODE: Literal["identity", "random"] = "identity"
+COMBINATION_MODE: Literal["identity", "random"] = "random"
 ACTIVATION_FN: bool = True
 
 
@@ -34,8 +34,9 @@ class EncoderLayer(nn.Linear):
         return self.activations
 
     def feedback(self, error: Tensor) -> None:
-        delta = error.detach() @ self.F.T  # (B, H1)
-        local_loss = (self.activations * delta).sum() / error.shape[0]
+        feedback_err = error.detach() @ self.F.T  # (B, H1)
+        local_loss = (self.activations * feedback_err).sum()  # Reduce error alignment
+        local_loss += 0.1 * self.activations.pow(2).sum()  # Prevent runaway
         local_loss.backward()
 
     def init_feedback(self) -> None:
@@ -46,12 +47,6 @@ class EncoderLayer(nn.Linear):
             torch.nn.init.kaiming_uniform_(self.F, a=math.sqrt(5))
         else:
             raise ValueError(f"Unknown feedback mode: {FEEDBACK_MODE}")
-
-    @property
-    def signal_mean(self) -> Optional[float]:
-        if self.activations is not None:
-            return self.activations.abs().mean().item()
-        return None
 
 
 # -------------------------------------------------------------------------------------------
@@ -78,7 +73,7 @@ class DecoderLayer(nn.Linear):
 
     def init_combination(self) -> None:
         if COMBINATION_MODE == "identity":
-            self.B.copy_(torch.eye(self.B.shape[0], device=self.B.device, dtype=self.B.dtype))
+            self.B.copy_(torch.eye(*self.B.shape, device=self.B.device, dtype=self.B.dtype))
         elif COMBINATION_MODE == "random":
             torch.nn.init.kaiming_uniform_(self.B, a=math.sqrt(5))
         else:
@@ -112,9 +107,12 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
-        l1_encoder = {"params": self.encoder_layer1.parameters(), "lr": 1e-3}
-        l0_decoder = {"params": self.teacher.decoder.output.parameters(), "lr": 0.0}
-        return torch.optim.Adam([l1_encoder, l0_decoder])
+        return torch.optim.Adam(
+            [
+                {"params": self.encoder_layer1.parameters(), "lr": 1e-3},
+                # {"params": self.teacher.decoder.output.parameters(), "lr": 1e-3},
+            ]
+        )
 
     # -----------------------------------------------------------------------------------
     @torch.no_grad()
@@ -156,7 +154,8 @@ class Autoencoder(pl.LightningModule):
 
         # Log metrics to monitor progress
         self.log("train/recon_mse", reconstruction_loss, prog_bar=True)
-        self.log("train/Bf(h_e).mean", self.encoder_layer1.signal_mean, prog_bar=True)
+        self.log("train/Bf(h1_e).mean", self.encoder_layer1.activations.abs().mean(), prog_bar=True)
+        self.log("train/Wd1.mean", self.decoder_layer1.weight.abs().mean(), prog_bar=True)
 
 
 # -------------------------------------------------------------------------------------------
@@ -240,7 +239,7 @@ if __name__ == "__main__":
     print("Saved pre-training figure -> figures/reconstruction_pre.png")
 
     # Train
-    trainer = pl.Trainer(max_epochs=40, enable_progress_bar=True)
+    trainer = pl.Trainer(max_epochs=100, enable_progress_bar=True, log_every_n_steps=1)
     trainer.fit(model, datamodule)
 
     # Post-training reconstruction using same batch & latent
