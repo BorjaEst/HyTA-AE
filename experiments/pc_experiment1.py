@@ -17,7 +17,7 @@ PERFECT_DECODER_INIT: bool = True  # whether to init decoder with teacher weight
 TRAIN_ENCODER_LAYER: bool = True  # whether to train the first encoder layer
 TRAIN_DECODER_LAYER: bool = True  # whether to train the first decoder layer
 TRAIN_OUTPUT_LAYER: bool = False  # whether to train the final output layer
-INFERENCE_STEPS: int = 20  # number of inference steps
+INFERENCE_STEPS: int = 5  # number of inference steps
 
 
 # -------------------------------------------------------------------------------------------
@@ -28,23 +28,19 @@ class EncoderLayer(nn.Linear):
         super().__init__(in_features, out_features, bias=False, **kwargs)
         self.register_buffer("F", torch.empty(out_features, in_features))  # feedback projection
         self.activation = nn.GELU() if ACTIVATION_FN else nn.Identity()
-        self.register_buffer("activations", None)
-        self.register_buffer("currents", None)  # pre-activations u = W_e e0
+        self.register_buffer("activations", None)  # h_e = B f
         self.init_feedback()  # default init
-        self.loss_fn = nn.MSELoss(reduction="mean")
 
-    def forward(self, input: Tensor) -> Tensor:
-        self.currents = super().forward(input.detach())
-        self.activations = self.activation(self.currents)
+    def feedback(self, error: Tensor) -> None:
+        pass  # TODO
+
+    def forward(self, error: Tensor) -> Tensor:
+        currents = super().forward(error.detach())
+        self.activations = self.activation(currents)
         return self.activations
 
-    def feedback(self, error: Tensor) -> Tensor:
-        # Local surrogate: push f(u) toward f(u)* + F e0, detaching f(u) in the target
-        target = self.activations.detach() + error.detach() @ self.F.T  # (B, H1)
-        local_loss = self.loss_fn(self.activations, target)
-        local_loss += 0.01 * self.activations.pow(2).sum()  # Prevent runaway
-        local_loss.backward()
-        return local_loss.detach()
+    def update(self) -> None:
+        pass  # TODO
 
     def init_feedback(self) -> None:
         """Initialize feedback matrix F based on selected mode."""
@@ -65,21 +61,26 @@ class DecoderLayer(nn.Linear):
         self.register_buffer("B", torch.empty(out_features, out_features))  # combination / modulation
         self.activation = nn.GELU() if ACTIVATION_FN else nn.Identity()
         self.register_buffer("corrections", None)  # (B, H1) = B h_e
-        self.register_buffer("currents", None)  # (B, H1) = Wd1 h2 + B h_e
+        self.register_buffer("currents", None)  # pre-activations u = W_d h2
         self.init_combination()  # default init
         self.loss_fn = nn.MSELoss(reduction="mean")
 
-    def forward(self, inputs: Tensor, errors: Tensor) -> Tensor:
-        self.corrections = errors.detach() @ self.B.T
-        self.currents = super().forward(inputs.detach()) + self.corrections
+    def feedback(self, corrections: Tensor) -> None:
+        # Prepare the correction to be applied at next topdown pass
+        self.corrections = corrections.detach() @ self.B.T
+
+    def forward(self, input: Tensor) -> Tensor:
+        # Standard forward pass with possible corrections
+        self.currents = super().forward(input.detach())
+        if self.corrections is not None:
+            self.currents += self.corrections
         return self.activation(self.currents)
 
-    def feedback(self) -> Tensor:
-        # Pre-activation target matching: Wd1 h2 -> t1 = (Wd1 h2 + B h_e)*
-        target = self.currents - self.corrections
-        local_loss = self.loss_fn(self.currents.detach(), target)
+    def update(self) -> None:
+        # Update weights W_d1 to push u toward u* = u - B h_e
+        local_loss = self.loss_fn(self.currents.detach(), self.currents - self.corrections)
         local_loss.backward()
-        return local_loss.detach()
+        self.corrections = None  # reset after use
 
     def init_combination(self) -> None:
         if COMBINATION_MODE == "identity":
@@ -119,9 +120,9 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
         optimizer_parameters = [
-            {"params": self.encoder_layer1.parameters(), "lr": 1e-3 if TRAIN_ENCODER_LAYER else 0.0},
-            {"params": self.decoder_layer1.parameters(), "lr": 1e-3 if TRAIN_DECODER_LAYER else 0.0},
-            {"params": self.decoder_output.parameters(), "lr": 4e-3 if TRAIN_OUTPUT_LAYER else 0.0},
+            {"params": self.encoder_layer1.parameters(), "lr": 1e-4 if TRAIN_ENCODER_LAYER else 0.0},
+            {"params": self.decoder_layer1.parameters(), "lr": 1e-4 if TRAIN_DECODER_LAYER else 0.0},
+            {"params": self.decoder_output.parameters(), "lr": 1e-3 if TRAIN_OUTPUT_LAYER else 0.0},
         ]
         return torch.optim.Adam(optimizer_parameters)
 
@@ -134,49 +135,54 @@ class Autoencoder(pl.LightningModule):
         return self.teacher.decoder.layer2.neurons.detach()
 
     # -----------------------------------------------------------------------------------
-    def forward(self, h2: Tensor, encoder_feedback: List[Tensor]) -> Tensor:
-        # Top down from h2 to reconstruction x_hat
-        h1_hat = self.decoder_layer1(h2, encoder_feedback[0])
-        return self.decoder_output(h1_hat.detach())
-
-    # -----------------------------------------------------------------------------------
-    def feedback(self, error: Tensor) -> List[Tensor]:
-        # Bottom up using the error
-        return [self.encoder_layer1(error.detach())]
-
-    # -----------------------------------------------------------------------------------
-    def predict(self, batch: Tuple[Tensor, Tensor], batch_idx: int) -> Tensor:
+    def learn(self, batch: Tuple[Tensor, Tensor]) -> Tensor:
+        optimizer = self.optimizers()  # get decoder optimizers
         _sensors, targets = batch
         flattened_targets = flatten(targets, start_dim=1)
         h2 = self.sample_h2(batch)
         error = torch.zeros_like(flattened_targets)
 
-        for _step in range(INFERENCE_STEPS):
-            encoder_feedback = self.feedback(error)  # Bottom-up error to h1_e
-            x_hat = self.forward(h2, encoder_feedback)  # Top-down prediction
+        for _step in range(INFERENCE_STEPS):  # Inference loop with local learning
+            optimizer.zero_grad(set_to_none=True)
+            x_hat = self.inference_step(error, h2)  # Top-down prediction
+            self.decoder_layer1.update()  # Update Wd1 locally
+            nn.MSELoss(reduction="mean")(x_hat, flattened_targets.detach()).backward()  # for output layer
             error = flattened_targets - x_hat  # (B, D)
+            optimizer.step()
 
-        return x_hat, error
+        return x_hat
+
+    # -----------------------------------------------------------------------------------
+    def inference_step(self, error: Tensor, h2: Tensor) -> None:
+        correction = self.encoder_layer1(error.detach())
+        self.decoder_layer1.feedback(correction)  # Prepares the correction at the decoder
+        return self.forward(h2)  # Top-down prediction
+
+    # -----------------------------------------------------------------------------------
+    def forward(self, h2: Tensor) -> Tensor:
+        # Top down from h2 to reconstruction x_hat and update Wd1
+        h1_hat = self.decoder_layer1(h2)  # Trigger local learning in decoder layer
+        return self.decoder_output(h1_hat.detach())
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tuple[Tensor, Tensor], batch_idx: int) -> None:
         targets = flatten(batch[1], start_dim=1)
-        optimizer = self.optimizers()
-        optimizer.zero_grad(set_to_none=True)
 
         # Perform prediction, feedback, and learning
-        x_hat, error = self.predict(batch, batch_idx)
-        self.encoder_layer1.feedback(error)  # update encoder with final error
-        self.decoder_layer1.feedback()  # update decoder with final correction
-        reconstruction_loss = nn.MSELoss(reduction="mean")(x_hat, targets.detach())
-        self.manual_backward(reconstruction_loss)
-        optimizer.step()
+        x_hat = self.learn(batch)
+        reconstruction_loss = nn.MSELoss(reduction="mean")(x_hat, targets)
 
+        # Logging and metrics
         self.log("train/recon_mse", reconstruction_loss, prog_bar=True)
         self.log("train/Wd1.rms", self.decoder_layer1.weight.pow(2).mean().sqrt(), prog_bar=True)
-        self.log("train/Wd1.L2Frobenius", self.decoder_layer1.weight.norm(p="fro"), prog_bar=True)
         self.log("train/Wd1.max", self.decoder_layer1.weight.abs().max(), prog_bar=True)
-        self.log("train/Bf(h1_e).mean", self.encoder_layer1.activations.abs().mean(), prog_bar=True)
+        # self.log("train/Bf(h1_e).mean", self.encoder_layer1.activations.abs().mean(), prog_bar=True)
+
+    # -----------------------------------------------------------------------------------
+    @torch.no_grad()
+    def predict(self, batch: Tuple[Tensor, Tensor]) -> Tensor:
+        h2 = self.sample_h2(batch)
+        return self.forward(h2)
 
 
 # -------------------------------------------------------------------------------------------
@@ -243,7 +249,7 @@ if __name__ == "__main__":
 
     # Pre-training inference (CPU by default; Lightning will handle device later)
     with torch.no_grad():
-        xhat0, _err0 = model.predict((sensors0, targets0), batch_idx=0)
+        xhat0 = model.predict((sensors0, targets0))
         xhat0 = xhat0.detach()
 
     # Reshape reconstruction
@@ -264,7 +270,7 @@ if __name__ == "__main__":
 
     # Post-training reconstruction using same batch
     with torch.no_grad():
-        xhat1, _err1 = model.predict((sensors0, targets0), batch_idx=0)
+        xhat1 = model.predict((sensors0, targets0))
         xhat1 = xhat1.detach()
     recon1_img = xhat1.view(out_shape)
 
