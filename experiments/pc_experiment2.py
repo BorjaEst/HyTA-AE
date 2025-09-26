@@ -113,7 +113,7 @@ class Autoencoder(pl.LightningModule):
             [
                 {"params": self.encoder_layer1.parameters(), "lr": 1e-3},
                 {"params": self.decoder_layer1.parameters(), "lr": 1e-3},
-                # {"params": self.teacher.decoder.output.parameters(), "lr": 1e-3},
+                {"params": self.decoder_output.parameters(), "lr": 1e-3},
             ]
         )
 
