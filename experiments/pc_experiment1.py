@@ -1,9 +1,8 @@
 import math
-from typing import Literal, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 import torch
 from lightning import pytorch as pl
-from pydantic import BaseModel, Field
 from torch import Tensor, flatten, nn
 from torch.optim import Optimizer
 
@@ -13,10 +12,11 @@ from ehc_sn.models.ann.sparse_autoencoder import ModelParams as TeacherParams
 # -------------------------------------------------------------------------------------------
 FEEDBACK_MODE: Literal["random", "identity"] = "random"
 COMBINATION_MODE: Literal["identity", "random"] = "random"
-ACTIVATION_FN: bool = True
-TRAIN_ENCODER_LAYER: bool = True  # whether to train the first encoder layer
+ACTIVATION_FN: bool = True  # whether to use non-linear activations
 TRAIN_DECODER_LAYER: bool = True  # whether to train the first decoder layer
-TRAIN_OUTPUT_LAYER: bool = True  # whether to train the final output layer
+TRAIN_ENCODER_LAYER: bool = True  # whether to train the first encoder layer
+TRAIN_OUTPUT_LAYER: bool = False  # whether to train the final output layer
+INFERENCE_STEPS: int = 6  # number of inference steps
 
 
 # -------------------------------------------------------------------------------------------
@@ -41,7 +41,7 @@ class EncoderLayer(nn.Linear):
         # Local surrogate: push f(u) toward f(u)* + F e0, detaching f(u) in the target
         target = self.activations.detach() + error.detach() @ self.F.T  # (B, H1)
         local_loss = self.loss_fn(self.activations, target)
-        local_loss += 0.1 * self.activations.pow(2).sum()  # Prevent runaway
+        local_loss += 0.01 * self.activations.pow(2).sum()  # Prevent runaway
         local_loss.backward()
         return local_loss.detach()
 
@@ -128,42 +128,49 @@ class Autoencoder(pl.LightningModule):
         return self.teacher.decoder.layer2.neurons.detach()
 
     # -----------------------------------------------------------------------------------
-    def forward(self, batch: Tuple[Tensor, Tensor], h2: Tensor) -> Tuple[Tensor, Tensor]:
-        sensors, targets = batch
-        flat_sensors = flatten(sensors, start_dim=1)
-        zeros = torch.zeros(h2.shape[0], self.encoder_layer1.out_features, device=h2.device)
-        with torch.no_grad():
-            h1_base = self.decoder_layer1(h2, zeros)  # (B, H1)
-            x_base = self.teacher.decoder.output(h1_base)
-        error = flat_sensors - x_base
-        h1_err = self.encoder_layer1(error)
-        h1_hat = self.decoder_layer1(h2, h1_err)
-        x_hat = self.decoder_output(h1_hat.detach())
-        return error, x_hat
+    def forward(self, h2: Tensor, encoder_feedback: List[Tensor]) -> Tensor:
+        # Top down from h2 to reconstruction x_hat
+        h1_hat = self.decoder_layer1(h2, encoder_feedback[0])
+        return self.decoder_output(h1_hat.detach())
+
+    # -----------------------------------------------------------------------------------
+    def feedback(self, error: Tensor) -> List[Tensor]:
+        # Bottom up using the error
+        return [self.encoder_layer1(error.detach())]
+
+    # -----------------------------------------------------------------------------------
+    def predict(self, batch: Tuple[Tensor, Tensor], batch_idx: int) -> Tensor:
+        _sensors, targets = batch
+        flattened_targets = flatten(targets, start_dim=1)
+        h2 = self.sample_h2(batch)
+        error = torch.zeros_like(flattened_targets)
+
+        for _step in range(INFERENCE_STEPS):
+            encoder_feedback = self.feedback(error)
+            x_hat = self.forward(h2, encoder_feedback)  # Top-down prediction
+            error = flattened_targets - x_hat  # (B, D)
+
+        return x_hat, error
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tuple[Tensor, Tensor], batch_idx: int) -> None:
         targets = flatten(batch[1], start_dim=1)
-        h2 = self.sample_h2(batch)
         optimizer = self.optimizers()
+        optimizer.zero_grad(set_to_none=True)
 
-        # Run the first forward pass to get error and prediction
-        error, prediction = self(batch, h2)
-
-        # Update encoder layer with local feedback
-        optimizer.zero_grad()
-        encoder_loss = self.encoder_layer1.feedback(error)  # Updates encoder layer
-        decoder_loss = self.decoder_layer1.feedback()  # Updates decoder layer
-        reconstruction_loss = nn.MSELoss(reduce="mean")(prediction, targets.detach())
-        self.manual_backward(reconstruction_loss)  # Updates output layer
+        # Perform prediction, feedback, and learning
+        x_hat, error = self.predict(batch, batch_idx)
+        self.encoder_layer1.feedback(error)  # update encoder with final error
+        self.decoder_layer1.feedback()  # update decoder with final correction
+        reconstruction_loss = nn.MSELoss(reduction="mean")(x_hat, targets.detach())
+        self.manual_backward(reconstruction_loss)
         optimizer.step()
 
-        # Log metrics to monitor progress
         self.log("train/recon_mse", reconstruction_loss, prog_bar=True)
+        self.log("train/Wd1.rms", self.decoder_layer1.weight.pow(2).mean().sqrt(), prog_bar=True)
+        self.log("train/Wd1.L2Frobenius", self.decoder_layer1.weight.norm(p="fro"), prog_bar=True)
+        self.log("train/Wd1.max", self.decoder_layer1.weight.abs().max(), prog_bar=True)
         self.log("train/Bf(h1_e).mean", self.encoder_layer1.activations.abs().mean(), prog_bar=True)
-        self.log("train/Wd1.mean", self.decoder_layer1.weight.abs().mean(), prog_bar=True)
-        self.log("train/We_local", encoder_loss, prog_bar=False)
-        self.log("train/Wd1_local", decoder_loss, prog_bar=False)
 
 
 # -------------------------------------------------------------------------------------------
@@ -192,7 +199,7 @@ if __name__ == "__main__":
     data_gen = DataGenerator(data_param)
 
     # Prepare data module
-    datamodule_param = DataModuleParams(num_samples=16, batch_size=16, drop_last=False)
+    datamodule_param = DataModuleParams(num_samples=320, batch_size=16, drop_last=True)
     datamodule = BaseDataModule(data_gen, datamodule_param)  # n_samples == batch_size to work
 
     # Prepare model and teacher
@@ -230,9 +237,8 @@ if __name__ == "__main__":
 
     # Pre-training inference (CPU by default; Lightning will handle device later)
     with torch.no_grad():
-        h2_0 = model.sample_h2((sensors0, targets0))
-    _e0_prev0, xhat0 = model((sensors0, targets0), h2_0)
-    xhat0 = xhat0.detach()
+        xhat0, _err0 = model.predict((sensors0, targets0), batch_idx=0)
+        xhat0 = xhat0.detach()
 
     # Reshape reconstruction
     output_shape_tuple = tuple(model.config.output_shape)
@@ -247,12 +253,12 @@ if __name__ == "__main__":
     print("Saved pre-training figure -> figures/reconstruction_pre.png")
 
     # Train
-    trainer = pl.Trainer(max_epochs=100, enable_progress_bar=True, log_every_n_steps=1)
+    trainer = pl.Trainer(max_epochs=40, enable_progress_bar=True, log_every_n_steps=1)
     trainer.fit(model, datamodule)
 
-    # Post-training reconstruction using same batch & latent
+    # Post-training reconstruction using same batch
     with torch.no_grad():
-        _e0_prev1, xhat1 = model((sensors0, targets0), h2_0)
+        xhat1, _err1 = model.predict((sensors0, targets0), batch_idx=0)
         xhat1 = xhat1.detach()
     recon1_img = xhat1.view(out_shape)
 
