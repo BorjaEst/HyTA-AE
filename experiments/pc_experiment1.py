@@ -12,8 +12,11 @@ from ehc_sn.models.ann.sparse_autoencoder import ModelParams as TeacherParams
 
 # -------------------------------------------------------------------------------------------
 FEEDBACK_MODE: Literal["random", "identity"] = "random"
-COMBINATION_MODE: Literal["random", "identity"] = "identity"
+COMBINATION_MODE: Literal["identity", "random"] = "random"
 ACTIVATION_FN: bool = True
+TRAIN_ENCODER_LAYER: bool = True  # whether to train the first encoder layer
+TRAIN_DECODER_LAYER: bool = True  # whether to train the first decoder layer
+TRAIN_OUTPUT_LAYER: bool = True  # whether to train the final output layer
 
 
 # -------------------------------------------------------------------------------------------
@@ -24,20 +27,23 @@ class EncoderLayer(nn.Linear):
         super().__init__(in_features, out_features, bias=False, **kwargs)
         self.register_buffer("F", torch.empty(out_features, in_features))  # feedback projection
         self.activation = nn.GELU() if ACTIVATION_FN else nn.Identity()
-        self.register_buffer("currents", None)
         self.register_buffer("activations", None)
+        self.register_buffer("currents", None)  # pre-activations u = W_e e0
         self.init_feedback()  # default init
+        self.loss_fn = nn.MSELoss(reduction="mean")
 
     def forward(self, input: Tensor) -> Tensor:
         self.currents = super().forward(input.detach())
         self.activations = self.activation(self.currents)
         return self.activations
 
-    def feedback(self, error: Tensor) -> None:
-        feedback_err = error.detach() @ self.F.T  # (B, H1)
-        local_loss = (self.activations * feedback_err).sum()  # Reduce error alignment
+    def feedback(self, error: Tensor) -> Tensor:
+        # Local surrogate: push f(u) toward f(u)* + F e0, detaching f(u) in the target
+        target = self.activations.detach() + error.detach() @ self.F.T  # (B, H1)
+        local_loss = self.loss_fn(self.activations, target)
         local_loss += 0.1 * self.activations.pow(2).sum()  # Prevent runaway
         local_loss.backward()
+        return local_loss.detach()
 
     def init_feedback(self) -> None:
         """Initialize feedback matrix F based on selected mode."""
@@ -57,19 +63,22 @@ class DecoderLayer(nn.Linear):
         super().__init__(in_features, out_features, **kwargs)
         self.register_buffer("B", torch.empty(out_features, out_features))  # combination / modulation
         self.activation = nn.GELU() if ACTIVATION_FN else nn.Identity()
-        self.register_buffer("currents", None)
-        self.register_buffer("activations", None)
+        self.register_buffer("corrections", None)  # (B, H1) = B h_e
+        self.register_buffer("currents", None)  # (B, H1) = Wd1 h2 + B h_e
         self.init_combination()  # default init
+        self.loss_fn = nn.MSELoss(reduction="mean")
 
-    def forward(self, inputs: Tensor, feedback: Tensor) -> Tensor:
-        self.currents = super().forward(inputs.detach())
-        self.currents += feedback.detach() @ self.B.T
-        self.activations = self.activation(self.currents)
-        return self.activations
+    def forward(self, inputs: Tensor, errors: Tensor) -> Tensor:
+        self.corrections = errors.detach() @ self.B.T
+        self.currents = super().forward(inputs.detach()) + self.corrections
+        return self.activation(self.currents)
 
-    def feedback(self, error: Tensor) -> Tensor:
-        """Compute combination projection B h_e (no gradient)."""
-        raise RuntimeError("This experiment assumes fixed decoder parameters.")
+    def feedback(self) -> Tensor:
+        # Pre-activation target matching: Wd1 h2 -> t1 = (Wd1 h2 + B h_e)*
+        target = self.currents - self.corrections
+        local_loss = self.loss_fn(self.currents.detach(), target)
+        local_loss.backward()
+        return local_loss.detach()
 
     def init_combination(self) -> None:
         if COMBINATION_MODE == "identity":
@@ -82,12 +91,7 @@ class DecoderLayer(nn.Linear):
 
 # -------------------------------------------------------------------------------------------
 class Autoencoder(pl.LightningModule):
-    """Predictive-coding style experiment with explicit inference + local learning split.
-
-    Only the error-to-hidden weights (encoder_layer1) are updated via a surrogate
-    local gradient using a feedback / alignment matrix F. Decoder layers and
-    teacher remain frozen.
-    """
+    """Predictive-coding style experiment with explicit inference + local learning split."""
 
     def __init__(self, teacher: nn.Module) -> None:
         super().__init__()
@@ -108,12 +112,12 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
-        return torch.optim.Adam(
-            [
-                {"params": self.encoder_layer1.parameters(), "lr": 1e-3},
-                # {"params": self.decoder_output.parameters(), "lr": 1e-2},
-            ]
-        )
+        optimizer_parameters = [
+            {"params": self.encoder_layer1.parameters(), "lr": 1e-3 if TRAIN_ENCODER_LAYER else 0.0},
+            {"params": self.decoder_layer1.parameters(), "lr": 1e-3 if TRAIN_DECODER_LAYER else 0.0},
+            {"params": self.decoder_output.parameters(), "lr": 4e-3 if TRAIN_OUTPUT_LAYER else 0.0},
+        ]
+        return torch.optim.Adam(optimizer_parameters)
 
     # -----------------------------------------------------------------------------------
     @torch.no_grad()
@@ -148,15 +152,18 @@ class Autoencoder(pl.LightningModule):
 
         # Update encoder layer with local feedback
         optimizer.zero_grad()
-        self.encoder_layer1.feedback(error)
+        encoder_loss = self.encoder_layer1.feedback(error)  # Updates encoder layer
+        decoder_loss = self.decoder_layer1.feedback()  # Updates decoder layer
         reconstruction_loss = nn.MSELoss(reduce="mean")(prediction, targets.detach())
-        self.manual_backward(reconstruction_loss)
+        self.manual_backward(reconstruction_loss)  # Updates output layer
         optimizer.step()
 
         # Log metrics to monitor progress
         self.log("train/recon_mse", reconstruction_loss, prog_bar=True)
         self.log("train/Bf(h1_e).mean", self.encoder_layer1.activations.abs().mean(), prog_bar=True)
         self.log("train/Wd1.mean", self.decoder_layer1.weight.abs().mean(), prog_bar=True)
+        self.log("train/We_local", encoder_loss, prog_bar=False)
+        self.log("train/Wd1_local", decoder_loss, prog_bar=False)
 
 
 # -------------------------------------------------------------------------------------------
@@ -185,7 +192,7 @@ if __name__ == "__main__":
     data_gen = DataGenerator(data_param)
 
     # Prepare data module
-    datamodule_param = DataModuleParams(num_samples=32, batch_size=32, drop_last=False)
+    datamodule_param = DataModuleParams(num_samples=16, batch_size=16, drop_last=False)
     datamodule = BaseDataModule(data_gen, datamodule_param)  # n_samples == batch_size to work
 
     # Prepare model and teacher
