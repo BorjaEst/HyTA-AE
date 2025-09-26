@@ -11,12 +11,13 @@ from ehc_sn.models.ann.sparse_autoencoder import ModelParams as TeacherParams
 
 # -------------------------------------------------------------------------------------------
 FEEDBACK_MODE: Literal["random", "identity"] = "random"
-COMBINATION_MODE: Literal["identity", "random"] = "random"
+COMBINATION_MODE: Literal["identity", "random"] = "identity"
 ACTIVATION_FN: bool = True  # whether to use non-linear activations
-TRAIN_DECODER_LAYER: bool = True  # whether to train the first decoder layer
+PERFECT_DECODER_INIT: bool = True  # whether to init decoder with teacher weights
 TRAIN_ENCODER_LAYER: bool = True  # whether to train the first encoder layer
+TRAIN_DECODER_LAYER: bool = True  # whether to train the first decoder layer
 TRAIN_OUTPUT_LAYER: bool = False  # whether to train the final output layer
-INFERENCE_STEPS: int = 6  # number of inference steps
+INFERENCE_STEPS: int = 20  # number of inference steps
 
 
 # -------------------------------------------------------------------------------------------
@@ -110,6 +111,11 @@ class Autoencoder(pl.LightningModule):
         self.decoder_layer1 = DecoderLayer(n_h2, n_h1, bias=True)
         self.decoder_output = teacher.decoder.output
 
+        # Initialize weights
+        if PERFECT_DECODER_INIT:  # copy weights from teacher
+            self.decoder_layer1.weight.data.copy_(teacher.decoder.layer1.synapses.weight.data)
+            self.decoder_layer1.bias.data.copy_(teacher.decoder.layer1.synapses.bias.data)
+
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
         optimizer_parameters = [
@@ -146,7 +152,7 @@ class Autoencoder(pl.LightningModule):
         error = torch.zeros_like(flattened_targets)
 
         for _step in range(INFERENCE_STEPS):
-            encoder_feedback = self.feedback(error)
+            encoder_feedback = self.feedback(error)  # Bottom-up error to h1_e
             x_hat = self.forward(h2, encoder_feedback)  # Top-down prediction
             error = flattened_targets - x_hat  # (B, D)
 
