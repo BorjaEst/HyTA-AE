@@ -98,8 +98,8 @@ class HTLLayer(nn.Linear):
         return self.out_features
 
     def feedback(self, target: Tensor) -> None:
-        F.mse_loss(self.currents, target.detach(), reduction="mean").backward()
-        # F.mse_loss(self.activations, target.detach(), reduction="mean").backward()
+        # F.mse_loss(self.currents, target.detach(), reduction="mean").backward()
+        F.mse_loss(self.activations, target.detach(), reduction="mean").backward()
 
     def reset_feedback(self) -> None:
         if self.fb_weight.shape[0] != self.out_features:
