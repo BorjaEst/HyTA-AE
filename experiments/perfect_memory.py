@@ -147,7 +147,8 @@ class Autoencoder(pl.LightningModule):
         _sensors, targets = batch
         h2_teacher = self.sample_h2(flatten(targets, start_dim=1))
         h1 = self.decoder_layer1(h2_teacher.detach())  # detach to isolate decoder path
-        reconstruction = self.output_layer(h1.detach())  # detach to isolate output path
+        logits = self.output_layer(h1.detach())  # detach to isolate output path
+        reconstruction = torch.sigmoid(logits)
         return unflatten(reconstruction, 1, targets.shape[1:]), h2_teacher
 
     @torch.inference_mode()
@@ -175,7 +176,7 @@ class Autoencoder(pl.LightningModule):
         self.decoder_layer1.feedback(h1_target.detach())
 
         # Loss propagation for output layer
-        F.mse_loss(reconstruction, completion, reduction="mean").backward()
+        F.binary_cross_entropy(reconstruction, completion, reduction="mean").backward()
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
