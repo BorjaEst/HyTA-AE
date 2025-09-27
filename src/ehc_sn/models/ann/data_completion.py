@@ -18,7 +18,7 @@ class ModelParams(BaseModel):
     model_config = {"extra": "forbid", "arbitrary_types_allowed": True}
 
     # Encoder and decoder components
-    latent_units: int = Field(default=32, gt=0, description="Dimensionality of the latent code.")
+    latent_units: int = Field(default=2048, gt=0, description="Dimensionality of the latent code.")
     layer2_units: int = Field(default=512, gt=0, description="Number of hidden units per layer.")
     layer1_units: int = Field(default=1024, gt=0, description="Number of hidden units per layer.")
     output_shape: List[int] = Field([25, 25], description="Dimensionality of the input and output.")
