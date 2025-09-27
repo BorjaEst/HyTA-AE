@@ -41,16 +41,15 @@ class ModelParams(BaseModel):
 
 # -------------------------------------------------------------------------------------------
 class Encoder(nn.Module):
-    def __init__(self, n_inputs: int, n_h1: int, n_h2: int, n_latents: int):
+    def __init__(self, n_inputs: int, n_h1: int, n_h2: int):
         super().__init__()
         self.layer1 = ann.Layer(dfa.Linear(n_inputs, n_h1, error_features=n_inputs), nn.GELU())
         self.layer2 = ann.Layer(dfa.Linear(n_h1, n_h2, error_features=n_inputs), nn.GELU())
-        self.latent = ann.Layer(nn.Linear(n_h2, n_latents), nn.GELU())
 
-    def forward(self, sensors: Tensor) -> Tensor:
-        x = self.layer1(sensors)
-        x = self.layer2(x)
-        return self.latent(x.detach())
+    def forward(self, sensors: Tensor) -> List[Tensor]:
+        h1 = self.layer1(sensors)
+        h2 = self.layer2(h1)
+        return [h1, h2]
 
     def feedback(self, reconstruction_err: Tensor) -> None:
         self.layer2.synapses.feedback(reconstruction_err, context=self.layer2.neurons)
@@ -70,8 +69,8 @@ class Decoder(nn.Module):
         x = self.layer1(x)
         return self.output(x.detach())
 
-    def feedback(self, encoder: Encoder) -> None:
-        self.layer2.synapses.feedback(encoder.layer2.neurons, context=encoder.latent.neurons)
+    def feedback(self, encoder: Encoder, latent: Tensor) -> None:
+        self.layer2.synapses.feedback(encoder.layer2.neurons, context=latent)
         self.layer1.synapses.feedback(encoder.layer1.neurons, context=encoder.layer2.neurons)
 
 
@@ -84,7 +83,9 @@ class Autoencoder(pl.LightningModule):
         self.automatic_optimization = False
 
         # Initialize encoder and decoder with DFA layers
-        self.encoder = Encoder(*params.units())
+        n_outputs = math.prod(params.output_shape)
+        self.encoder = Encoder(n_outputs, params.layer1_units, params.layer2_units)
+        self.latent = ann.Layer(nn.Linear(params.layer2_units, params.latent_units), nn.GELU())
         self.decoder = Decoder(*params.units())
 
         # Loss functions
@@ -100,13 +101,15 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
         sensors, targets = batch
-        latent = self.encoder(flatten(sensors, start_dim=1))
+        encoder_signals = self.encoder(flatten(sensors, start_dim=1))
+        latent = self.latent(encoder_signals[-1].detach())
         reconstruction = unflatten(self.decoder(latent), 1, sensors.shape[1:])
         return reconstruction, latent
 
     @torch.inference_mode()
     def encode(self, sensors: Tensor) -> Tensor:
-        return self.encoder(flatten(sensors, start_dim=1))
+        encoder_signals = self.encoder(flatten(sensors, start_dim=1))
+        return self.latent(encoder_signals[-1].detach())
 
     @torch.inference_mode()
     def decode(self, latent: Tensor) -> Tensor:
@@ -124,7 +127,7 @@ class Autoencoder(pl.LightningModule):
         reconstruction_err = flatten(reconstruction - sensors, start_dim=1)
         self.encoder.feedback(reconstruction_err)
         self.sparsity_loss(latent).backward()
-        self.decoder.feedback(self.encoder)
+        self.decoder.feedback(self.encoder, latent.detach())
         self.reconstruction_loss(reconstruction, sensors).backward()
 
     # -----------------------------------------------------------------------------------
