@@ -117,10 +117,10 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
         optimizer_parameters = [
-            {"params": self.encoder.parameters(), "lr": 1e-4},
-            {"params": self.latent.parameters(), "lr": 1e-4},
-            {"params": self.decoder.parameters(), "lr": 1e-3},
-            {"params": self.output.parameters(), "lr": 1e-2},
+            {"params": self.encoder.parameters(), "lr": 2e-6},
+            {"params": self.latent.parameters(), "lr": 2e-6},
+            {"params": self.decoder.parameters(), "lr": 1e-4},
+            {"params": self.output.parameters(), "lr": 1e-4},
         ]
         return Adam(optimizer_parameters)
 
@@ -214,7 +214,7 @@ if __name__ == "__main__":
     print(f"\n--- Running Data Completion with Feedback Experiment ---")
 
     # Initialize experiment configuration
-    experiment = Experiment(experiment_name="datcom_feedback")
+    experiment = Experiment(experiment_name="data_completion")
     augmentation = Augmentation(experiment.augmentation)
     data_gen = DataGenerator(experiment.data, augmentation)
     datamodule = BaseDataModule(data_gen, experiment.datamodule)
