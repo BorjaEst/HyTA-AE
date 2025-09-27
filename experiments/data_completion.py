@@ -121,7 +121,7 @@ class Encoder(nn.Module):
         self.layer1 = ann.Layer(dfa.Linear(n_inputs, n_h1, error_features=n_inputs), nn.GELU())
         self.layer2 = ann.Layer(dfa.Linear(n_h1, n_h2, error_features=n_inputs), nn.GELU())
 
-    def forward(self, sensors: Tensor) -> List[Tensor]:
+    def forward(self, x_incomplete: Tensor) -> List[Tensor]:
         """Forward pass returning intermediate activations.
 
         Parameters
@@ -134,7 +134,7 @@ class Encoder(nn.Module):
         List[Tensor]
             [h1, h2] activations for downstream use and local objectives.
         """
-        h1 = self.layer1(sensors)
+        h1 = self.layer1(x_incomplete)  # Use only channel 0 (obstacles)
         h2 = self.layer2(h1)
         return [h1, h2]
 
@@ -147,7 +147,7 @@ class Encoder(nn.Module):
         Parameters
         ----------
         reconstruction_err: Tensor
-            Flattened difference (reconstruction − sensors) with shape (B, N).
+            Flattened difference (reconstruction - sensors) with shape (B, N).
         """
         self.layer2.synapses.feedback(reconstruction_err, context=self.layer2.neurons)
         self.layer1.synapses.feedback(reconstruction_err, context=self.layer1.neurons)
@@ -267,18 +267,18 @@ class Autoencoder(pl.LightningModule):
             and latent is the compressed code.
         """
         sensors, targets = batch
-        encoder_signals = self.encoder(flatten(sensors, start_dim=1))
+        encoder_signals = self.encoder(flatten(sensors[:, 0], start_dim=1))
         # Detach to prevent gradient transport through encoder (DFA regime)
         latent = self.latent(encoder_signals[-1].detach())
         decoder_signals = self.decoder(latent)
         # Detach to keep decoder local objectives (HTL) and avoid BP coupling
         reconstruction = self.output(decoder_signals[0].detach())
-        return unflatten(reconstruction, 1, sensors.shape[1:]), latent
+        return unflatten(reconstruction, 1, targets.shape[1:]), latent
 
     @torch.inference_mode()
     def encode(self, sensors: Tensor) -> Tensor:
         """Encode sensors into latent space using the DFA-based encoder."""
-        encoder_signals = self.encoder(flatten(sensors, start_dim=1))
+        encoder_signals = self.encoder(flatten(sensors[:, 0], start_dim=1))
         return self.latent(encoder_signals[-1].detach())
 
     @torch.inference_mode()
@@ -310,11 +310,11 @@ class Autoencoder(pl.LightningModule):
         4) Reconstruction: optimize output Bernoulli likelihood (BCE).
         """
         (sensors, reconstruction, latent) = feedback
-        reconstruction_err = flatten(reconstruction - sensors, start_dim=1)
+        reconstruction_err = flatten(reconstruction - sensors[:, 0], start_dim=1)
         self.encoder.feedback(reconstruction_err)
         self.sparsity_loss(latent).backward()
         self.decoder.feedback(self.encoder, latent.detach())
-        self.reconstruction_loss(reconstruction, sensors).backward()
+        self.reconstruction_loss(reconstruction, sensors[:, 0]).backward()
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
@@ -329,7 +329,7 @@ class Autoencoder(pl.LightningModule):
     def validation_step(self, batch: Tensor, batch_idx: int) -> List[Tensor]:
         """Validation metrics: reconstruction error and latent sparsity rate."""
         outputs = self(batch)
-        reconstruction_loss = nn.MSELoss(reduction="mean")(outputs[0], batch[0])
+        reconstruction_loss = nn.MSELoss(reduction="mean")(outputs[0], batch[1])
         sparsity_rate = (outputs[1] > 0.01).float().mean()
         self.log("val/sparsity_rate", sparsity_rate, prog_bar=True)
         self.log("val/reconstruction_loss", reconstruction_loss, prog_bar=True)
