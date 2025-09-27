@@ -1,3 +1,42 @@
+"""Predictive-coding experiment with strictly local learning placeholders.
+
+This module implements a minimal, analysis-friendly predictive-coding setup for an
+autoencoder-style decoder with explicit separation between inference and local learning.
+The code is intentionally simple and leaves some local learning rules as TODOs to enable
+focused experiments and documentation.
+
+Mathematical correspondence (see article/predictive-coding/README.md):
+
+- Variables and shapes (batch dimension implicit):
+  - x in R^D: ground-truth target ("sensors" are ignored for this study)
+  - h2 in R^{H2}: cached hidden state from a frozen teacher encoder (top-down drive)
+  - h1_hat in R^{H1}: corrected hidden state at the first decoder layer
+  - W_d1: first decoder layer mapping h2 -> h1_base
+  - W_out: output layer mapping h1_hat -> x_hat (borrowed from the teacher)
+  - W_e: error->hidden mapping; implemented here as EncoderLayer (nn.Linear)
+  - B: correction mixing (combination) matrix applied at decoder h1 (identity by default)
+  - F: feedback projection buffer for W_e (initialized as identity or random)
+
+Core one-step relations implemented by forward paths:
+
+  h1_base = W_d1 h2
+  h_e     = f(W_e e_0)
+  h1_hat  = h1_base + B h_e
+  x_hat   = W_out h1_hat
+  e_0     = x - x_hat
+
+Local stability (analysis-only; not enforced by code):
+  J = I - W_out B D W_e, with D = diag(f'(0)). A sufficient local contraction
+  condition around the perfect fixed point e_0=0 is rho(J) < 1. This file does not
+  alter learning based on J; it just exposes the operators in a way that enables
+  external stability probes and reporting.
+
+Important: This script avoids transposes of forward weights for the corrective path.
+All updates to W_e (EncoderLayer) are left as TODOs to preserve strict locality
+exploration. The DecoderLayer contains a local target-matching loss to "absorb"
+the correction into W_d1, as described in the article.
+"""
+
 import math
 from typing import List, Literal, Optional, Tuple
 
@@ -22,7 +61,25 @@ INFERENCE_STEPS: int = 5  # number of inference steps
 
 # -------------------------------------------------------------------------------------------
 class EncoderLayer(nn.Linear):
-    """Error-to-hidden mapping with local feedback projection matrix F."""
+    """Error→hidden map W_e with a local feedback projection F.
+
+    This layer represents the strictly local corrective pathway from output error e_0
+    to the hidden correction h_e used at the first decoder layer. It holds a buffer
+    ``F`` that can serve as an independent (random/identity) feedback projection and
+    caches the post-activation ``activations`` to support local rules.
+
+    Notation alignment with the docs:
+    - W_e: this module's trainable weights (nn.Linear)
+    - f(·): GELU or Identity (controlled by ACTIVATION_FN)
+    - h_e = f(W_e e_0)
+    - F: optional fixed feedback projection (not used in forward, reserved for local updates)
+
+    Notes on locality and stability:
+    - Local surrogate updates for W_e (see article) use only e_0, unit-local slopes,
+      an external teaching signal F' e_0, and optional penalties; we keep the method
+      placeholders here to enable controlled experiments without changing behavior.
+    - Stability near e_0≈0 is governed by the composite J = I - W_out B D W_e (analysis-only).
+    """
 
     def __init__(self, in_features: int, out_features: int, *, bias: bool = False, **kwargs) -> None:
         super().__init__(in_features, out_features, bias=False, **kwargs)
@@ -32,18 +89,47 @@ class EncoderLayer(nn.Linear):
         self.init_feedback()  # default init
 
     def feedback(self, error: Tensor) -> None:
-        pass  # TODO
+        """Placeholder to receive a local teaching signal for W_e updates.
+
+        In the strict-locality recipe, one would form a surrogate hidden error
+        ``tilde_delta_h = F' e_0`` and combine it with the unitwise slope to
+        produce a local update on W_e. This experiment keeps learning for W_e
+        as a TODO to avoid changing behavior while documenting the logic.
+        """
+        pass  # TODO (strictly local W_e update lives here if/when enabled)
 
     def forward(self, error: Tensor) -> Tensor:
+        """Map output error to hidden correction: u=W_e e_0, h_e=f(u).
+
+        Parameters
+        ----------
+        error: Tensor
+            Current reconstruction error e_0 in R^D (flattened per sample).
+
+        Returns
+        -------
+        Tensor
+            Hidden correction activations h_e in R^{H1} to be mixed at decoder h1.
+        """
         currents = super().forward(error.detach())
         self.activations = self.activation(currents)
         return self.activations
 
     def update(self) -> None:
-        pass  # TODO
+        """Placeholder for a strictly local W_e learning rule.
+
+        See article/predictive-coding/README.md for the recommended local update
+        that uses only local signals and a fixed projection; intentionally not
+        implemented to keep the experiment's behavior unchanged.
+        """
+        pass  # TODO (local W_e rule)
 
     def init_feedback(self) -> None:
-        """Initialize feedback matrix F based on selected mode."""
+        """Initialize the feedback projection F (identity or random).
+
+        This F is distinct from forward weights and is intended as a fixed,
+        independently drawn projection used by local learning surrogates (if enabled).
+        """
         if FEEDBACK_MODE == "identity":
             self.F.copy_(torch.eye(*self.F.shape, device=self.F.device, dtype=self.F.dtype))
         elif FEEDBACK_MODE == "random":
@@ -54,7 +140,19 @@ class EncoderLayer(nn.Linear):
 
 # -------------------------------------------------------------------------------------------
 class DecoderLayer(nn.Linear):
-    """Frozen first decoder layer W_{d1} mapping h2 -> h1 base with combination matrix B."""
+    """First decoder layer W_d1 with local absorption of hidden corrections.
+
+    This layer implements the base hidden drive h1_base = W_d1 h2 and adds a prepared
+    correction at the pre-activation level using a mixing matrix B:
+
+      currents = W_d1 h2 + (B h_e)  [when corrections are provided]
+      h1_hat  = f(currents)
+
+    The ``update`` method performs a strictly local target-matching step to absorb
+    the current correction into W_d1, using the quadratic loss
+    1/2 || W_d1 h2 - (W_d1 h2 - B h_e) ||^2 at the pre-activation level. This matches
+    the "absorption" rule described in the docs and uses only local pre/post signals.
+    """
 
     def __init__(self, in_features: int, out_features: int, **kwargs) -> None:
         super().__init__(in_features, out_features, **kwargs)
@@ -66,10 +164,26 @@ class DecoderLayer(nn.Linear):
         self.loss_fn = nn.MSELoss(reduction="mean")
 
     def feedback(self, corrections: Tensor) -> None:
+        """Prepare top-down pre-activation corrections as B h_e.
+
+        Parameters
+        ----------
+        corrections: Tensor
+            Hidden correction h_e in R^{H1} (batch x H1). Will be mixed by B and
+            added to currents on the next forward call.
+        """
         # Prepare the correction to be applied at next topdown pass
         self.corrections = corrections.detach() @ self.B.T
 
     def forward(self, input: Tensor) -> Tensor:
+        """Compute h1_hat = f(W_d1 h2 + B h_e) with cached pre-activations.
+
+        Notes
+        -----
+        - The corrections are additive at the pre-activation level (currents), matching
+          the mathematical sketch. If no correction is queued, the base path is used.
+        - We cache currents for the local absorption loss in ``update``.
+        """
         # Standard forward pass with possible corrections
         self.currents = super().forward(input.detach())
         if self.corrections is not None:
@@ -77,12 +191,20 @@ class DecoderLayer(nn.Linear):
         return self.activation(self.currents)
 
     def update(self) -> None:
+        """Locally absorb the last correction into W_d1 via pre-activation matching.
+
+        Implements the quadratic loss L = 1/2 || u - (u - B h_e) ||^2 at the level of
+        pre-activations u, whose gradient step pushes W_d1 so that future predictions
+        rely less on the explicit correction. This operation is strictly local: it uses
+        cached ``currents`` (post-synaptic) and the prepared correction (also cached).
+        """
         # Update weights W_d1 to push u toward u* = u - B h_e
         local_loss = self.loss_fn(self.currents.detach(), self.currents - self.corrections)
         local_loss.backward()
         self.corrections = None  # reset after use
 
     def init_combination(self) -> None:
+        """Initialize the mixing matrix B (identity or random)."""
         if COMBINATION_MODE == "identity":
             self.B.copy_(torch.eye(*self.B.shape, device=self.B.device, dtype=self.B.dtype))
         elif COMBINATION_MODE == "random":
@@ -93,7 +215,20 @@ class DecoderLayer(nn.Linear):
 
 # -------------------------------------------------------------------------------------------
 class Autoencoder(pl.LightningModule):
-    """Predictive-coding style experiment with explicit inference + local learning split."""
+    """Predictive-coding experiment with explicit inference and local learning split.
+
+    High-level flow per training step (outer loop):
+    - Cache h2 from a frozen teacher encoder for the given target x.
+    - Iterate a small number of inference steps:
+        1) Compute a hidden correction h_e = f(W_e e_0) via ``EncoderLayer``.
+        2) Queue the pre-activation correction B h_e into ``DecoderLayer``.
+        3) Top-down pass to obtain x_hat and compute e_0 = x - x_hat.
+        4) Apply local absorption update on W_d1 (``DecoderLayer.update``).
+        5) Optionally train the output layer using the reconstruction loss.
+
+    Learning for W_e is intentionally left as a TODO to keep the experiment invariant
+    while we document math, signals, and stability considerations.
+    """
 
     def __init__(self, teacher: nn.Module) -> None:
         super().__init__()
@@ -119,6 +254,14 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
+        """Configure a single Adam optimizer with per-group learning rates.
+
+        Notes
+        -----
+        - TRAIN_* flags control which parameter groups are effectively trained.
+        - We rely on Lightning's manual optimization to orchestrate the step timing
+          across the local absorption and the output layer loss.
+        """
         optimizer_parameters = [
             {"params": self.encoder_layer1.parameters(), "lr": 1e-4 if TRAIN_ENCODER_LAYER else 0.0},
             {"params": self.decoder_layer1.parameters(), "lr": 1e-4 if TRAIN_DECODER_LAYER else 0.0},
@@ -129,6 +272,11 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     @torch.no_grad()
     def sample_h2(self, batch: Tuple[Tensor, Tensor]) -> Tensor:
+        """Extract h2 from the frozen teacher given targets x.
+
+        This caches the top-down drive used by the student decoder. The teacher's
+        decoder is evaluated to ensure internal buffers (if any) reflect h2.
+        """
         _sensors, targets = batch
         latent = self.teacher.encode(targets)
         _ = self.teacher.decoder(latent)
@@ -136,6 +284,20 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def learn(self, batch: Tuple[Tensor, Tensor]) -> Tensor:
+        """Run the outer inference loop with local absorption and output-layer updates.
+
+        Steps
+        -----
+        - Zero optimizer grads, run one inference step (prepare B h_e and predict x_hat).
+        - Apply local absorption update on W_d1 (no weight transposes used for correction).
+        - Backprop only through the output layer on the reconstruction loss (optional).
+        - Update the reconstruction error e_0 and repeat for INFERENCE_STEPS.
+
+        Returns
+        -------
+        Tensor
+            The final reconstruction x_hat from the last inference step.
+        """
         optimizer = self.optimizers()  # get decoder optimizers
         _sensors, targets = batch
         flattened_targets = flatten(targets, start_dim=1)
@@ -154,18 +316,34 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def inference_step(self, error: Tensor, h2: Tensor) -> None:
+        """One inference step: compute h_e from e_0 and produce a top-down prediction.
+
+        Parameters
+        ----------
+        error: Tensor
+            Current reconstruction error e_0.
+        h2: Tensor
+            Frozen top-down drive from teacher.
+
+        Returns
+        -------
+        Tensor
+            The reconstruction x_hat obtained after mixing the prepared correction.
+        """
         correction = self.encoder_layer1(error.detach())
         self.decoder_layer1.feedback(correction)  # Prepares the correction at the decoder
         return self.forward(h2)  # Top-down prediction
 
     # -----------------------------------------------------------------------------------
     def forward(self, h2: Tensor) -> Tensor:
+        """Top-down prediction x_hat = W_out f(W_d1 h2 + B h_e)."""
         # Top down from h2 to reconstruction x_hat and update Wd1
         h1_hat = self.decoder_layer1(h2)  # Trigger local learning in decoder layer
         return self.decoder_output(h1_hat.detach())
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tuple[Tensor, Tensor], batch_idx: int) -> None:
+        """Lightning training step: run learning loop and log reconstruction metrics."""
         targets = flatten(batch[1], start_dim=1)
 
         # Perform prediction, feedback, and learning
@@ -181,6 +359,7 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     @torch.no_grad()
     def predict(self, batch: Tuple[Tensor, Tensor]) -> Tensor:
+        """Produce a reconstruction using the current top-down path and any queued correction."""
         h2 = self.sample_h2(batch)
         return self.forward(h2)
 
