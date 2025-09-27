@@ -10,8 +10,7 @@ from ehc_sn.core.trainer import BaseTrainer
 class FeedbackTainer(BaseTrainer):
 
     # -----------------------------------------------------------------------------------
-    def training_step(self, model: pl.LightningModule, batch: Tensor, batch_idx: int) -> None:
-        sensors, *_ = batch
+    def training_step(self, model: pl.LightningModule, batch: Tensor, batch_idx: int) -> Any:
 
         # Clear any previous gradients from model parameters
         optimizers = model.optimizers()
@@ -22,7 +21,7 @@ class FeedbackTainer(BaseTrainer):
             optm.zero_grad()
 
         # Forward pass and compute feedback signals
-        outputs = model(sensors)
+        outputs = model(batch)
         feedback = model.compute_feedback(outputs, batch)
 
         # Calculate gradients using feedback signals
@@ -31,3 +30,6 @@ class FeedbackTainer(BaseTrainer):
         # Optimizer step
         for optm in optimizers:
             optm.step()
+
+        # Returns the outputs for potential logging or further processing
+        return outputs
