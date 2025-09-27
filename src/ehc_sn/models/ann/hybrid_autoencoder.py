@@ -99,7 +99,8 @@ class Autoencoder(pl.LightningModule):
         return Adam([optm_pe, optm_pd])
 
     # -----------------------------------------------------------------------------------
-    def forward(self, sensors: Tensor) -> Tuple[Tensor, Tensor]:
+    def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
+        sensors, *_ = batch
         latent = self.encoder(flatten(sensors, start_dim=1))
         reconstruction = unflatten(self.decoder(latent), 1, sensors.shape[1:])
         return reconstruction, latent
@@ -133,7 +134,7 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def validation_step(self, batch: Tensor, batch_idx: int) -> List[Tensor]:
-        outputs = self(batch[0])
+        outputs = self(batch)
         reconstruction_loss = nn.MSELoss(reduction="mean")(outputs[0], batch[0])
         sparsity_rate = (outputs[1] > 0.01).float().mean()
         self.log("val/sparsity_rate", sparsity_rate, prog_bar=True)

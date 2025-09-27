@@ -64,13 +64,13 @@ def gen_figures(model: Autoencoder, datamodule: BaseDataModule, experiment: Expe
     test_dataloader = datamodule.test_dataloader()
 
     try:
-        inputs, _ = next(iter(test_dataloader))
+        inputs, _ = batch = next(iter(test_dataloader))
     except StopIteration:
         print("No test data available for plotting.")
         return
 
     with torch.inference_mode():
-        outputs, activations = model(inputs)
+        outputs, activations = model(batch)
 
     fig_reconstruction = ReconstructionMapFigure(experiment.figure_1)
     _ = fig_reconstruction.plot(inputs, outputs)
