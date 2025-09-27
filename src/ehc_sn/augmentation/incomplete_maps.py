@@ -32,15 +32,18 @@ class ComposeParams(BaseModel):
 class RandomMask:
     """Randomly keep a single visible rectangle and mask the rest.
 
-    Assumes input is a float tensor of shape (C, H, W) with binary channels
-    (channel 0 == walls). Applies the same rectangular mask across channels.
+    Mask channel semantics:
+      - 1.0 on visible (unmasked) positions
+      - mask_value on masked positions
 
-    The rectangle area is approximately (1 - ratio) of the map area.
+    The masked input is computed as x * mask (i.e., values are faded, not replaced).
     """
 
     def __init__(self, ratio: float = 0.3, value: float = 0.0):
         self.ratio = float(ratio)
         self.value = float(value)
+        # Stores last mask (1,H,W): 1.0 where visible, mask_value where masked
+        self.last_mask: Optional[Tensor] = None
 
     def __call__(self, x: Tensor) -> Tensor:
         if not isinstance(x, torch.Tensor):
@@ -50,14 +53,14 @@ class RandomMask:
 
         c, h, w = x.shape
         if self.ratio <= 0.0:
-            # No masking requested
+            # No masking: mask is all ones, input unchanged
+            self.last_mask = torch.ones((1, h, w), device=x.device, dtype=x.dtype)
             return x
 
         # Compute visible area ratio; keep a single rectangle with this area
         visible_ratio = max(0.0, min(1.0, 1.0 - self.ratio))
 
         if visible_ratio <= 0.0:
-            # Fully masked
             keep = torch.zeros((h, w), device=x.device, dtype=x.dtype)
         else:
             # Keep rectangle with approximately visible_ratio area.
@@ -74,8 +77,16 @@ class RandomMask:
             keep = torch.zeros((h, w), device=x.device, dtype=x.dtype)
             keep[i : i + vh, j : j + vw] = 1.0
 
-        keep_ch = keep.unsqueeze(0).expand(c, -1, -1)
-        return x * keep_ch + (1.0 - keep_ch) * self.value
+        keep1 = keep.unsqueeze(0)  # (1,H,W)
+
+        # Build mask channel: 1.0 where visible, mask_value where masked
+        mask1 = keep1 * 1.0 + (1.0 - keep1) * self.value  # (1,H,W)
+        self.last_mask = mask1
+
+        # Apply faded masking to input: x_incomplete = x * mask
+        x_incomplete = x * mask1.expand(c, -1, -1)
+
+        return x_incomplete
 
 
 # -------------------------------------------------------------------------------------------
@@ -109,17 +120,19 @@ class Augmentation:
     # -----------------------------------------------------------------------------------
     def __call__(self, x: Tensor) -> Tuple[Tensor, Tensor]:
         """
-        Args:
-            x: Input map tensor (C,H,W), binary channels with channel 0 as walls.
-
-        Returns:
-            (incomplete_input, clean_target)
+        Returns sensors with shape (C+1,H,W):
+          - first C channels: masked input
+          - last channel: mask (1.0 visible, mask_value masked)
         """
-        # Geometry (random) once
         y = self._geom(x)  # clean target after geometry
-        # Corruption only for the input
         x_incomplete = self._mask(y)
-        return x_incomplete, y
+        mask = self._mask.last_mask
+        if mask is None:
+            # Fallback: all visible
+            mask = torch.ones_like(y[:1])
+
+        sensors = torch.cat([x_incomplete, mask.to(torch.float32)], dim=0)
+        return sensors, y
 
 
 if __name__ == "__main__":
@@ -131,8 +144,10 @@ if __name__ == "__main__":
     from ehc_sn.figures.reconstruction_map import ReconstructionMapFigure
 
     # Create data generator with augmentation
-    params = DataParams(env_id="MiniGrid-MultiRoom-N6-v0", seed=42, invert_walls=False)
-    generator = DataGenerator(params, transform=Augmentation())
+    compose_params = ComposeParams(hflip_p=0.0, vflip_p=0.0, mask_ratio=0.6, mask_value=0.5)
+    augmentation = Augmentation(compose_params)
+    data_params = DataParams(env_id="MiniGrid-MultiRoom-N6-v0", seed=42, invert_walls=False)
+    generator = DataGenerator(data_params, transform=augmentation)
 
     # Generate a batch of samples
     dataset = generator(4)
