@@ -39,7 +39,7 @@ from lightning import pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
 from matplotlib import pyplot as plt
-from pydantic import BaseModel, Field, field_validator
+from pydantic import Field, PositiveInt
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from torch import Tensor, flatten, nn, unflatten
 from torch.optim import Adam, Optimizer
@@ -77,29 +77,23 @@ class Experiment(BaseSettings):
     model_config = SettingsConfigDict(extra="forbid", cli_parse_args=True)
 
     # Encoder and decoder components
-    latent_units: int = Field(default=2048, gt=0, description="Dimensionality of the latent code.")
-    layer2_units: int = Field(default=512, gt=0, description="Number of hidden units per layer.")
-    layer1_units: int = Field(default=1024, gt=0, description="Number of hidden units per layer.")
-    output_shape: List[int] = Field([25, 25], description="Dimensionality of the input and output.")
+    latent_units: PositiveInt = Field(default=2048, gt=0, description="Dimensionality of the latent code.")
+    layer2_units: PositiveInt = Field(default=512, gt=0, description="Number of hidden units per layer.")
+    layer1_units: PositiveInt = Field(default=1024, gt=0, description="Number of hidden units per layer.")
+    output_shape: List[PositiveInt] = Field([25, 25], description="Dimensionality of the input and output.")
 
     # Data and augmentation parameters
-    augmentation: ComposeParams = Field(default_factory=ComposeParams, description="Data augmentation parameters")
     data: DataParams = Field(default_factory=DataParams, description="Data generation parameters")
     datamodule: DataModuleParams = Field(default_factory=DataModuleParams, description="Data module parameters")
+    mask_ratio: float = Field(default=0.0, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
 
     # Training Settings
-    max_epochs: int = Field(default=200, ge=1, le=1000, description="Maximum training epochs")
+    max_epochs: PositiveInt = Field(default=200, ge=1, le=1000, description="Maximum training epochs")
 
     # Logging and Output Settings
     log_dir: str = Field(default="logs", description="Directory for experiment logs")
-    experiment_name: str = Field(..., description="Experiment name")
-    checkpoint_freq: int = Field(default=5, ge=1, le=50, description="Checkpoint frequency")
-
-    @field_validator("output_shape")
-    def check_output_shape(cls, v: List[int]) -> List[int]:
-        if any(dim <= 0 for dim in v):
-            raise ValueError("output_shape must be a list of positive integers; e.g. [H, W, C]")
-        return v
+    experiment_name: str = Field("data_completion", description="Experiment name")
+    checkpoint_freq: PositiveInt = Field(default=5, ge=1, le=50, description="Checkpoint frequency")
 
 
 # -------------------------------------------------------------------------------------------
@@ -340,8 +334,7 @@ def gen_figures(model: Autoencoder, datamodule: BaseDataModule) -> None:
     """Generate reconstruction, sparsity, and decoder montage figures.
 
     - Figure 1: Reconstruction map comparing inputs and outputs.
-    - Figure 2: Latent sparsity overview.
-    - Figure 3: Decoder montage for one-hot latent probes.
+    - Figure 2: Decoder montage for one-hot latent probes.
 
     Assumes the datamodule provides a test set compatible with the trained
     model and that the figure classes handle their own tensor formatting.
@@ -382,10 +375,9 @@ if __name__ == "__main__":
     print(f"\n--- Running Data Completion with Feedback Experiment ---")
 
     # Initialize experiment configuration
-    experiment = Experiment(experiment_name="data_completion")
-    # Augmentation composes transforms that hide parts of the obstacle map so
-    # inputs contain partial information; targets remain full maps.
-    augmentation = Augmentation(experiment.augmentation)
+    experiment = Experiment()
+    composition_params = ComposeParams(mask_ratio=experiment.mask_ratio)
+    augmentation = Augmentation(composition_params)
     data_gen = DataGenerator(experiment.data, augmentation)
     datamodule = BaseDataModule(data_gen, experiment.datamodule)
 
