@@ -12,7 +12,7 @@ from torch import Tensor, flatten, nn, unflatten
 from torch.nn import functional as F
 from torch.optim import Adam, Optimizer
 
-from ehc_sn.augmentation.incomplete_maps import Augmentation
+from ehc_sn.augmentation.incomplete_maps import Augmentation, ComposeParams
 from ehc_sn.core import ann
 from ehc_sn.core.datamodule import BaseDataModule, DataModuleParams
 from ehc_sn.data.obstacle_maps import DataGenerator, DataParams
@@ -37,6 +37,7 @@ class Experiment(BaseSettings):
     # Data and augmentation parameters
     data: DataParams = Field(default_factory=DataParams, description="Data generation parameters")
     datamodule: DataModuleParams = Field(default_factory=DataModuleParams, description="Data module parameters")
+    mask_ratio: float = Field(default=0.0, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
 
     # Training Settings
     max_epochs: PositiveInt = Field(default=200, ge=1, le=1000, description="Maximum training epochs")
@@ -60,7 +61,7 @@ class DFALayer(nn.Linear):
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
         self.currents = super().forward(*args, **kwargs)
         self.activations = self.activation_fn(self.currents)
-        return self.activations
+        return self.activations.detach()  # enforce locality
 
     @property
     def features(self) -> int:
@@ -90,16 +91,17 @@ class HTLLayer(nn.Linear):
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
         self.currents = super().forward(*args, **kwargs)
         self.activations = self.activation_fn(self.currents)
-        return self.activations
+        return self.activations.detach()  # enforce locality
 
     @property
     def features(self) -> int:
         """Number of output features of the layer."""
         return self.out_features
 
-    def feedback(self, target: Tensor) -> None:
+    def feedback(self, targets: Tensor) -> None:
         # F.mse_loss(self.currents, target.detach(), reduction="mean").backward()
-        F.mse_loss(self.activations, target.detach(), reduction="mean").backward()
+        targets = targets @ self.fb_weight  # (batch_size, out_features)
+        F.mse_loss(self.activations, targets.detach(), reduction="mean").backward()
 
     def reset_feedback(self) -> None:
         if self.fb_weight.shape[0] != self.out_features:
@@ -130,9 +132,9 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
         optimizer_parameters = [
-            {"params": self.encoder_layer1.parameters(), "lr": 1e-5},
-            {"params": self.decoder_layer1.parameters(), "lr": 1e-5},
-            {"params": self.output_layer.parameters(), "lr": 1e-4},
+            # {"params": self.encoder_layer1.parameters(), "lr": 2e-6},
+            # {"params": self.decoder_layer1.parameters(), "lr": 1e-4},
+            {"params": self.output_layer.parameters(), "lr": 1e-3},
         ]
         return Adam(optimizer_parameters)
 
@@ -145,9 +147,9 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
         _sensors, targets = batch
-        h2_teacher = self.sample_h2(flatten(targets, start_dim=1))
-        h1 = self.decoder_layer1(h2_teacher.detach())  # detach to isolate decoder path
-        logits = self.output_layer(h1.detach())  # detach to isolate output path
+        h2_teacher = self.sample_h2(flatten(targets, start_dim=1)).detach()
+        h1 = self.decoder_layer1(h2_teacher)  # Detached by HTLLayer
+        logits = self.output_layer(h1)
         reconstruction = torch.sigmoid(logits)
         return unflatten(reconstruction, 1, targets.shape[1:]), h2_teacher
 
@@ -166,31 +168,25 @@ class Autoencoder(pl.LightningModule):
         sensors, targets = batch
         x_incomplete, mask = sensors[:, 0], sensors[:, 1]
 
-        # Create completion target for encoder/decoder feedback paths (no grad through target)
-        completion = x_incomplete * mask + reconstruction.detach() * (1 - mask)
+        # Create completion target for encoder/decoder feedback paths
+        completion = x_incomplete * mask + reconstruction * (1 - mask)
 
-        # Encoder DFA feedback uses error only on visible pixels (normalize per sample)
-        error = (reconstruction - x_incomplete) * mask
-        denom = mask.flatten(start_dim=1).sum(dim=1, keepdim=True).clamp_min(1.0)
-        error = error.flatten(start_dim=1) / denom
-
+        # Encoder DFA feedback uses error only on visible pixels
+        error = reconstruction * mask - x_incomplete
         h1_target = self.encoder_layer1(flatten(completion, start_dim=1).detach())
-        self.encoder_layer1.feedback(error)
+        self.encoder_layer1.feedback(error.flatten(start_dim=1))
         self.decoder_layer1.feedback(h1_target.detach())
 
-        # Loss for output layer (detach target)
-        loss_output = nn.BCELoss(reduction="mean")(reconstruction, completion.detach())
+        # Loss propagation for output layer
+        loss_output = nn.BCELoss(reduction="mean")(reconstruction, completion)
         loss_output.backward()
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
-        opt = self.optimizers()
-        opt.zero_grad(set_to_none=True)
+        self.optimizers().zero_grad()
         reconstruction, _h2_teacher = self(batch)
         self.feedback(reconstruction, batch)
-        # Prevent exploding gradients
-        self.clip_gradients(opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
-        opt.step()
+        self.optimizers().step()
 
     # -----------------------------------------------------------------------------------
     def validation_step(self, batch: Tensor, batch_idx: int) -> List[Tensor]:
@@ -234,7 +230,9 @@ if __name__ == "__main__":
 
     # Initialize experiment configuration
     experiment = Experiment()
-    data_gen = DataGenerator(experiment.data, Augmentation())
+    composition_params = ComposeParams(mask_ratio=experiment.mask_ratio)
+    augmentation = Augmentation(composition_params)
+    data_gen = DataGenerator(experiment.data, augmentation)
     datamodule = BaseDataModule(data_gen, experiment.datamodule)
 
     # Load teacher model and its parameters
