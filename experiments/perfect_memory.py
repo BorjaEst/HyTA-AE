@@ -37,7 +37,7 @@ class Experiment(BaseSettings):
     # Data and augmentation parameters
     data: DataParams = Field(default_factory=DataParams, description="Data generation parameters")
     datamodule: DataModuleParams = Field(default_factory=DataModuleParams, description="Data module parameters")
-    mask_ratio: float = Field(default=0.0, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
+    mask_ratio: float = Field(default=0.4, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
 
     # Training Settings
     max_epochs: PositiveInt = Field(default=200, ge=1, le=1000, description="Maximum training epochs")
@@ -128,12 +128,13 @@ class Autoencoder(pl.LightningModule):
         # Loss functions
         self.reconstruction_loss = nn.BCELoss(reduction="mean")
         self.sparsity_loss = SparsityLoss(center=True)
+        self.teacher.eval()
 
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
         optimizer_parameters = [
-            # {"params": self.encoder_layer1.parameters(), "lr": 2e-6},
-            # {"params": self.decoder_layer1.parameters(), "lr": 1e-4},
+            {"params": self.encoder_layer1.parameters(), "lr": 1e-4},
+            {"params": self.decoder_layer1.parameters(), "lr": 1e-3},
             {"params": self.output_layer.parameters(), "lr": 1e-3},
         ]
         return Adam(optimizer_parameters)
@@ -147,7 +148,7 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
         _sensors, targets = batch
-        h2_teacher = self.sample_h2(flatten(targets, start_dim=1)).detach()
+        h2_teacher = self.sample_h2(flatten(targets, start_dim=1))  # Detach by @torch.no_grad
         h1 = self.decoder_layer1(h2_teacher)  # Detached by HTLLayer
         logits = self.output_layer(h1)
         reconstruction = torch.sigmoid(logits)
@@ -167,6 +168,8 @@ class Autoencoder(pl.LightningModule):
     def feedback(self, reconstruction: Tensor, batch: Tensor) -> None:
         sensors, targets = batch
         x_incomplete, mask = sensors[:, 0], sensors[:, 1]
+        reconstruction = torch.nan_to_num(reconstruction, nan=0.5, posinf=1.0, neginf=0.0)
+        reconstruction = reconstruction.clamp_(0.0, 1.0)
 
         # Create completion target for encoder/decoder feedback paths
         completion = x_incomplete * mask + reconstruction * (1 - mask)
@@ -178,7 +181,7 @@ class Autoencoder(pl.LightningModule):
         self.decoder_layer1.feedback(h1_target.detach())
 
         # Loss propagation for output layer
-        loss_output = nn.BCELoss(reduction="mean")(reconstruction, completion)
+        loss_output = nn.BCELoss(reduction="mean")(reconstruction, completion.detach())
         loss_output.backward()
 
     # -----------------------------------------------------------------------------------
@@ -186,6 +189,7 @@ class Autoencoder(pl.LightningModule):
         self.optimizers().zero_grad()
         reconstruction, _h2_teacher = self(batch)
         self.feedback(reconstruction, batch)
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
         self.optimizers().step()
 
     # -----------------------------------------------------------------------------------
