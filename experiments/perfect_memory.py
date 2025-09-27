@@ -130,8 +130,8 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
         optimizer_parameters = [
-            {"params": self.encoder_layer1.parameters(), "lr": 2e-6},
-            {"params": self.decoder_layer1.parameters(), "lr": 1e-4},
+            {"params": self.encoder_layer1.parameters(), "lr": 1e-5},
+            {"params": self.decoder_layer1.parameters(), "lr": 1e-5},
             {"params": self.output_layer.parameters(), "lr": 1e-4},
         ]
         return Adam(optimizer_parameters)
@@ -159,32 +159,38 @@ class Autoencoder(pl.LightningModule):
     @torch.inference_mode()
     def decode(self, h1: Tensor) -> Tensor:
         reconstruction = unflatten(self.output_layer(h1), 1, self.output_shape)
-        return reconstruction
+        return torch.sigmoid(reconstruction)
 
     # -----------------------------------------------------------------------------------
     def feedback(self, reconstruction: Tensor, batch: Tensor) -> None:
         sensors, targets = batch
         x_incomplete, mask = sensors[:, 0], sensors[:, 1]
-        # mask has 1s where input is present and 0s where input is missing
 
-        # Create completion target and error signal
-        completion = x_incomplete + reconstruction * (1 - mask)
+        # Create completion target for encoder/decoder feedback paths (no grad through target)
+        completion = x_incomplete * mask + reconstruction.detach() * (1 - mask)
+
+        # Encoder DFA feedback uses error only on visible pixels (normalize per sample)
         error = (reconstruction - x_incomplete) * mask
-        # Encoder training using DFA and decoder targets
+        denom = mask.flatten(start_dim=1).sum(dim=1, keepdim=True).clamp_min(1.0)
+        error = error.flatten(start_dim=1) / denom
+
         h1_target = self.encoder_layer1(flatten(completion, start_dim=1).detach())
-        self.encoder_layer1.feedback(error.flatten(start_dim=1))
-        # Decoder training using HTL
+        self.encoder_layer1.feedback(error)
         self.decoder_layer1.feedback(h1_target.detach())
 
-        # Loss propagation for output layer
-        F.binary_cross_entropy(reconstruction, completion, reduction="mean").backward()
+        # Loss for output layer (detach target)
+        loss_output = nn.BCELoss(reduction="mean")(reconstruction, completion.detach())
+        loss_output.backward()
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
-        self.optimizers().zero_grad()
+        opt = self.optimizers()
+        opt.zero_grad(set_to_none=True)
         reconstruction, _h2_teacher = self(batch)
         self.feedback(reconstruction, batch)
-        self.optimizers().step()
+        # Prevent exploding gradients
+        self.clip_gradients(opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
+        opt.step()
 
     # -----------------------------------------------------------------------------------
     def validation_step(self, batch: Tensor, batch_idx: int) -> List[Tensor]:
@@ -239,7 +245,7 @@ if __name__ == "__main__":
     # Filter only weight/bias keys to ignore obsolete buffers
     state_dict = teacher_ckpt["state_dict"]
     filtered = {k: v for k, v in state_dict.items() if k.endswith(".weight") or k.endswith(".bias")}
-    teacher.load_state_dict(filtered, strict=False)
+    teacher.load_state_dict(filtered, strict=True)
 
     # Initialize model with specified architecture
     model = Autoencoder(experiment.output_shape, experiment.layer1_units, teacher)
