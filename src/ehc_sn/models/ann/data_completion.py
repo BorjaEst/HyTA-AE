@@ -58,16 +58,15 @@ class Encoder(nn.Module):
 
 # -------------------------------------------------------------------------------------------
 class Decoder(nn.Module):
-    def __init__(self, n_outputs: int, n_h1: int, n_h2: int, n_latents: int):
+    def __init__(self, n_h1: int, n_h2: int, n_latents: int):
         super().__init__()
         self.layer2 = ann.Layer(htl.Linear(n_latents, n_h2), nn.GELU())
         self.layer1 = ann.Layer(htl.Linear(n_h2, n_h1), nn.GELU())
-        self.output = ann.Layer(nn.Linear(n_h1, n_outputs), nn.Sigmoid())
 
-    def forward(self, latent: Tensor) -> Tensor:
-        x = self.layer2(latent)
-        x = self.layer1(x)
-        return self.output(x.detach())
+    def forward(self, latent: Tensor) -> List[Tensor]:
+        h2 = self.layer2(latent)
+        h1 = self.layer1(h2)
+        return [h1, h2]
 
     def feedback(self, encoder: Encoder, latent: Tensor) -> None:
         self.layer2.synapses.feedback(encoder.layer2.neurons, context=latent)
@@ -86,7 +85,8 @@ class Autoencoder(pl.LightningModule):
         n_outputs = math.prod(params.output_shape)
         self.encoder = Encoder(n_outputs, params.layer1_units, params.layer2_units)
         self.latent = ann.Layer(nn.Linear(params.layer2_units, params.latent_units), nn.GELU())
-        self.decoder = Decoder(*params.units())
+        self.decoder = Decoder(params.layer1_units, params.layer2_units, params.latent_units)
+        self.output = ann.Layer(nn.Linear(params.layer1_units, n_outputs), nn.Sigmoid())
 
         # Loss functions
         self.reconstruction_loss = nn.BCELoss(reduction="mean")
@@ -95,16 +95,19 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
         optm_pe = {"params": self.encoder.parameters(), "lr": self.config.encoder_lr}
+        optm_pl = {"params": self.latent.parameters(), "lr": self.config.decoder_lr}
         optm_pd = {"params": self.decoder.parameters(), "lr": self.config.decoder_lr}
-        return Adam([optm_pe, optm_pd])
+        optm_po = {"params": self.output.parameters(), "lr": self.config.decoder_lr}
+        return Adam([optm_pe, optm_pl, optm_pd, optm_po])
 
     # -----------------------------------------------------------------------------------
     def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
         sensors, targets = batch
         encoder_signals = self.encoder(flatten(sensors, start_dim=1))
         latent = self.latent(encoder_signals[-1].detach())
-        reconstruction = unflatten(self.decoder(latent), 1, sensors.shape[1:])
-        return reconstruction, latent
+        decoder_signals = self.decoder(latent)
+        reconstruction = self.output(decoder_signals[0].detach())
+        return unflatten(reconstruction, 1, sensors.shape[1:]), latent
 
     @torch.inference_mode()
     def encode(self, sensors: Tensor) -> Tensor:
@@ -113,7 +116,9 @@ class Autoencoder(pl.LightningModule):
 
     @torch.inference_mode()
     def decode(self, latent: Tensor) -> Tensor:
-        return unflatten(self.decoder(latent), 1, self.config.output_shape)
+        decoder_signals = self.decoder(latent)
+        reconstruction = self.output(decoder_signals[0].detach())
+        return unflatten(reconstruction, 1, self.config.output_shape)
 
     # -----------------------------------------------------------------------------------
     def compute_feedback(self, outputs: Tensor, batch: Tensor) -> List[Tensor]:
