@@ -165,9 +165,10 @@ class Autoencoder(pl.LightningModule):
     def feedback(self, reconstruction: Tensor, batch: Tensor) -> None:
         sensors, targets = batch
         x_incomplete, mask = sensors[:, 0], sensors[:, 1]
+        # mask has 1s where input is present and 0s where input is missing
 
         # Create completion target and error signal
-        completion = x_incomplete * mask + reconstruction * (1 - mask)
+        completion = x_incomplete + reconstruction * (1 - mask)
         error = (reconstruction - x_incomplete) * mask
         # Encoder training using DFA and decoder targets
         h1_target = self.encoder_layer1(flatten(completion, start_dim=1).detach())
@@ -229,11 +230,16 @@ if __name__ == "__main__":
     experiment = Experiment()
     data_gen = DataGenerator(experiment.data, Augmentation())
     datamodule = BaseDataModule(data_gen, experiment.datamodule)
-    teacher_ckpt = torch.load(experiment.teacher_path)
 
     # Load teacher model and its parameters
+    teacher_ckpt = torch.load(experiment.teacher_path)
     teacher_params = TeacherParams(latent_units=2048)
     teacher = Teacher(teacher_params, trainer=None)
+
+    # Filter only weight/bias keys to ignore obsolete buffers
+    state_dict = teacher_ckpt["state_dict"]
+    filtered = {k: v for k, v in state_dict.items() if k.endswith(".weight") or k.endswith(".bias")}
+    teacher.load_state_dict(filtered, strict=False)
 
     # Initialize model with specified architecture
     model = Autoencoder(experiment.output_shape, experiment.layer1_units, teacher)
