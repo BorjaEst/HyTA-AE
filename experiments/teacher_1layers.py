@@ -194,10 +194,24 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def validation_step(self, batch: Tensor, batch_idx: int) -> List[Tensor]:
-        sensors, targets = batch
-        reconstruction, _h2_teacher = self(batch)
-        reconstruction_loss = nn.MSELoss(reduction="mean")(reconstruction, targets)
-        self.log("val/reconstruction_loss", reconstruction_loss, prog_bar=True)
+        _sensors, targets = batch
+        reconstruction, h2_teacher = self(batch)  # Detach by @torch.inference_mode
+        h1_decoder = self.decoder_layer1(h2_teacher)  # Detached by HTLLayer
+        self.log_metrics_x(reconstruction, targets)
+        self.log_metrics_h1(reconstruction, h1_decoder)
+
+    def log_metrics_x(self, reconstruction: Tensor, targets: Tensor) -> None:
+        x_mseloss = F.mse_loss(reconstruction, targets, reduction="mean")
+        self.log("val/reconstruction_loss", x_mseloss, prog_bar=True, on_step=False, on_epoch=True)
+
+    def log_metrics_h1(self, completion: Tensor, h1_decoder: Tensor) -> None:
+        h1_target = self.encoder_layer1(flatten(completion, start_dim=1).detach())
+        self.log("val/h1_mean", h1_target.mean(), prog_bar=False, on_step=False, on_epoch=True)
+        self.log("val/h1_std", h1_target.std(unbiased=False), prog_bar=False, on_step=False, on_epoch=True)
+        h1_sparsity = (h1_target.abs() < 1e-3).float().mean()
+        self.log("val/h1_sparsity", h1_sparsity, prog_bar=False, on_step=False, on_epoch=True)
+        h1_mseloss = F.mse_loss(h1_decoder, h1_target.detach(), reduction="mean")
+        self.log("val/h1_mseloss", h1_mseloss, prog_bar=True, on_step=False, on_epoch=True)
 
 
 # -------------------------------------------------------------------------------------------
