@@ -82,26 +82,25 @@ class DFALayer(nn.Linear):
 class HTLLayer(nn.Linear):
     def __init__(self, n_in: int, n_out: int, n_target: int, activation_fn: Optional[nn.Module] = None):
         super().__init__(in_features=n_in, out_features=n_out, bias=True)
-        self.register_buffer("currents", None)  # Starts without current values
-        self.register_buffer("activations", None)  # Starts without activation values
         self.activation_fn = activation_fn or nn.Identity()
         self.register_buffer("fb_weight", torch.zeros(n_target, self.out_features))
         self.reset_feedback()  # Initialize weights properly
 
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
-        self.currents = super().forward(*args, **kwargs)
-        self.activations = self.activation_fn(self.currents)
-        return self.activations.detach()  # enforce locality
+        currents = super().forward(*args, **kwargs)
+        activations = self.activation_fn(currents)
+        return activations.detach()  # enforce locality
 
     @property
     def features(self) -> int:
         """Number of output features of the layer."""
         return self.out_features
 
-    def feedback(self, targets: Tensor) -> None:
-        # F.mse_loss(self.currents, target.detach(), reduction="mean").backward()
-        targets = targets @ self.fb_weight  # (batch_size, out_features)
-        F.mse_loss(self.activations, targets.detach(), reduction="mean").backward()
+    def feedback(self, targets: Tensor, context: Tensor) -> None:
+        currents = super().forward(context.detach())  # Detach pre-synaptic
+        output = self.activation_fn(currents)
+        targets = F.sigmoid(targets.detach() @ self.fb_weight)  # (batch_size, out_features)
+        F.binary_cross_entropy(output, targets, reduction="mean").backward()
 
     def reset_feedback(self) -> None:
         if self.fb_weight.shape[0] != self.out_features:
@@ -121,8 +120,8 @@ class Autoencoder(pl.LightningModule):
 
         # Initialize encoder and decoder with DFA and HTL layers
         self.teacher = teacher
-        self.encoder_layer1 = DFALayer(n_output, n_layer1, n_output, nn.GELU())
-        self.decoder_layer1 = HTLLayer(n_layer2, n_layer1, n_layer1, nn.GELU())
+        self.encoder_layer1 = DFALayer(n_output, n_layer1, n_output, nn.Sigmoid())
+        self.decoder_layer1 = HTLLayer(n_layer2, n_layer1, n_layer1, nn.Sigmoid())
         self.output_layer = nn.Linear(n_layer1, n_output)  # Output layer (no HTL)
 
         # Loss functions
@@ -178,7 +177,8 @@ class Autoencoder(pl.LightningModule):
         error = reconstruction * mask - x_incomplete
         h1_target = self.encoder_layer1(flatten(completion, start_dim=1).detach())
         self.encoder_layer1.feedback(error.flatten(start_dim=1))
-        self.decoder_layer1.feedback(h1_target.detach())
+        h1_context = self.teacher.encoder.layer2(h1_target)
+        self.decoder_layer1.feedback(h1_target, h1_context)
 
         # Loss propagation for output layer
         loss_output = nn.BCELoss(reduction="mean")(reconstruction, completion.detach())
