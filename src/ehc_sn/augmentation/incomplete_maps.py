@@ -144,7 +144,7 @@ if __name__ == "__main__":
     from ehc_sn.figures.reconstruction_map import ReconstructionMapFigure
 
     # Create data generator with augmentation
-    compose_params = ComposeParams(hflip_p=0.0, vflip_p=0.0, mask_ratio=0.6, mask_value=0.5)
+    compose_params = ComposeParams(hflip_p=0.0, vflip_p=0.0, mask_ratio=0.6, mask_value=0.2)
     augmentation = Augmentation(compose_params)
     data_params = DataParams(env_id="MiniGrid-MultiRoom-N6-v0", seed=42, invert_walls=False)
     generator = DataGenerator(data_params, transform=augmentation)
