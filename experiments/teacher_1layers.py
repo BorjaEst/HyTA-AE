@@ -44,7 +44,7 @@ class Experiment(BaseSettings):
 
     # Logging and Output Settings
     log_dir: str = Field(default="logs", description="Directory for experiment logs")
-    experiment_name: str = Field("perfect_memory", description="Experiment name")
+    experiment_name: str = Field("teacher_1layers", description="Experiment name")
     checkpoint_freq: PositiveInt = Field(default=5, ge=1, le=50, description="Checkpoint frequency")
 
 
