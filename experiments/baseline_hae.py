@@ -46,7 +46,6 @@ from torch.nn import functional as F
 from torch.optim import Adam, Optimizer
 
 from ehc_sn.augmentation.incomplete_maps import Augmentation, ComposeParams
-from ehc_sn.core import ann
 from ehc_sn.core.datamodule import BaseDataModule, DataModuleParams
 from ehc_sn.data.obstacle_maps import DataGenerator, DataParams
 from ehc_sn.figures.decoder_montage import DecoderMontageFigure
@@ -278,9 +277,9 @@ class Autoencoder(pl.LightningModule):
 
         # Initialize encoder and decoder with DFA layers
         self.encoder = Encoder(n_output, n_layer1, n_layer2)
-        self.latent = ann.Layer(nn.Linear(n_layer2, n_latent), nn.GELU())
+        self.latent = nn.Linear(n_layer2, n_latent)
         self.decoder = Decoder(n_layer1, n_layer2, n_latent)
-        self.output = ann.Layer(nn.Linear(n_layer1, n_output), nn.Sigmoid())
+        self.output = nn.Linear(n_layer1, n_output)
 
         # Loss functions
         self.reconstruction_loss = nn.BCELoss(reduction="mean")
@@ -322,22 +321,26 @@ class Autoencoder(pl.LightningModule):
         encoder_signals = self.encoder(flatten(sensors[:, 0], start_dim=1))
         # Detach to prevent gradient transport through encoder (DFA regime)
         latent = self.latent(encoder_signals[-1].detach())
+        latent = F.gelu(latent)  # Nonlinearity on latent code
         decoder_signals = self.decoder(latent.detach())
         # Detach to keep decoder local objectives (HTL) and avoid BP coupling
-        reconstruction = self.output(decoder_signals[0].detach())
+        logits = self.output(decoder_signals[0].detach())
+        reconstruction = F.sigmoid(logits)
         return unflatten(reconstruction, 1, targets.shape[1:]), latent
 
     @torch.inference_mode()
     def encode(self, sensors: Tensor) -> Tensor:
         """Encode sensors into latent space using the DFA-based encoder."""
         encoder_signals = self.encoder(flatten(sensors[:, 0], start_dim=1))
-        return self.latent(encoder_signals[-1])
+        latent = self.latent(encoder_signals[-1])
+        return F.gelu(latent)
 
     @torch.inference_mode()
     def decode(self, latent: Tensor) -> Tensor:
         """Decode latent codes into map space using the HTL-based decoder."""
         decoder_signals = self.decoder(latent)
-        reconstruction = self.output(decoder_signals[0])
+        logits = self.output(decoder_signals[0])
+        reconstruction = F.sigmoid(logits)
         return unflatten(reconstruction, 1, self.output_shape)
 
     # -----------------------------------------------------------------------------------
