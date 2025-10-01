@@ -263,8 +263,6 @@ class Autoencoder(pl.LightningModule):
         self.log("val/sparsity_rate", sparsity_rate, prog_bar=True, on_step=False, on_epoch=True)
 
     def log_metrics_hi(self, i: int, h1_decoder: Tensor, h1_encoder: Tensor) -> None:
-        self.log(f"val/h{i}_mean", h1_encoder.mean(), prog_bar=False, on_step=False, on_epoch=True)
-        self.log(f"val/h{i}_std", h1_encoder.std(unbiased=False), prog_bar=False, on_step=False, on_epoch=True)
         h1_mseloss = F.mse_loss(h1_decoder, h1_encoder.detach(), reduction="mean")
         self.log(f"val/h{i}_mseloss", h1_mseloss, prog_bar=True, on_step=False, on_epoch=True)
 
