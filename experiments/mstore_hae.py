@@ -68,6 +68,7 @@ class DFALayer(nn.Linear):
     def feedback(self, error: Tensor) -> None:
         delta = error.detach() @ self.fb_weight  # (batch_size, out_features)
         torch.autograd.backward(self.activations, delta)
+        # nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
 
     def reset_feedback(self) -> None:
         limit = 1.0 / math.sqrt(self.error_features)
@@ -115,6 +116,7 @@ class HTLLayer(nn.Linear):
         output = self.activation_fn(output)
         targets = targets @ self.fb_weight  # (batch_size, out_features)
         F.mse_loss(output, targets.detach(), reduction="mean").backward()
+        # nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
 
     def reset_feedback(self) -> None:
         if self.fb_weight.shape[0] != self.out_features:
@@ -140,6 +142,32 @@ class Decoder(nn.Module):
 
 
 # -------------------------------------------------------------------------------------------
+class DGLayer(nn.Linear):
+    def __init__(self, n_in: int, n_init: int, n_max: int, activation_fn: Optional[nn.Module] = None):
+        super().__init__(in_features=n_in, out_features=n_max, bias=True)
+        self.activation_fn = activation_fn or nn.ReLU()
+        self.register_buffer("output_mask", torch.zeros(n_max, dtype=torch.float32))
+        self.grow(n_init)  # Initialize with n_init active units
+
+    def forward(self, *args: Any, **kwargs: Any) -> Tensor:
+        out = super().forward(*args, **kwargs)
+        out = out * self.output_mask  # Masked units are zeroed; grads do not flow to their rows
+        return self.activation_fn(out)
+
+    @property
+    def out_active(self) -> int:
+        return sum(self.output_mask).int().item()
+
+    @property
+    def capacity(self) -> int:
+        return self.weight.shape[0]
+
+    @torch.no_grad()
+    def grow(self, n: int) -> None:
+        self.output_mask[: self.out_active + n] = 1.0
+
+
+# -------------------------------------------------------------------------------------------
 class Autoencoder(pl.LightningModule):
     def __init__(self, output_shape: List[int], n_layer1: int, n_layer2: int, n_latent: int):
         super().__init__()
@@ -150,7 +178,7 @@ class Autoencoder(pl.LightningModule):
 
         # Initialize encoder and decoder with DFA layers
         self.encoder = Encoder(n_output, n_layer1, n_layer2)
-        self.latent = nn.Linear(n_layer2, n_latent)
+        self.latent = DGLayer(n_layer2, n_latent // 10, n_latent)
         self.decoder = Decoder(n_layer1, n_layer2, n_latent)
         self.output = nn.Linear(n_layer1, n_output)
 
@@ -161,8 +189,8 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
         optimizer_parameters = [
-            {"params": self.encoder.parameters(), "lr": 2e-6},
-            {"params": self.latent.parameters(), "lr": 2e-6},
+            {"params": self.encoder.parameters(), "lr": 1e-5},
+            {"params": self.latent.parameters(), "lr": 1e-8},
             {"params": self.decoder.parameters(), "lr": 1e-4},
             {"params": self.output.parameters(), "lr": 1e-4},
         ]
@@ -171,8 +199,7 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     def _encode(self, inputs: Tensor) -> Tensor:
         encoder_signals = self.encoder(flatten(inputs, start_dim=1))
-        latent = self.latent(encoder_signals[-1])
-        return F.gelu(latent)  # Nonlinearity on latent code
+        return self.latent(encoder_signals[-1])
 
     @torch.inference_mode()
     def encode(self, sensors: Tensor) -> Tensor:
@@ -199,8 +226,6 @@ class Autoencoder(pl.LightningModule):
     def feedback(self, first_prediction: Tensor, batch: Tensor) -> None:
         sensors, targets = batch
         x_incomplete, mask = sensors[:, 0], sensors[:, 1]
-        # reconstruction = torch.nan_to_num(reconstruction, nan=0.5, posinf=1.0, neginf=0.0)
-        # reconstruction = reconstruction.clamp_(0.0, 1.0)
 
         # Create completion target for encoder/decoder feedback paths
         completion = x_incomplete * mask + first_prediction * (1 - mask)
@@ -209,7 +234,6 @@ class Autoencoder(pl.LightningModule):
         # Create targets and contexts for feedback paths
         targets = self.encoder(flatten(completion, start_dim=1))
         latent = self.latent(targets[-1])  # detached by DFALayer
-        latent = F.gelu(latent)  # Nonlinearity on latent code
 
         # Second pass to update activations and reconstruction
         reconstruction = self._decode(latent.detach())
@@ -221,6 +245,9 @@ class Autoencoder(pl.LightningModule):
         self.reconstruction_loss(reconstruction, completion.detach()).backward()
 
     # -----------------------------------------------------------------------------------
+    def on_train_epoch_start(self) -> None:
+        self.latent.grow(10)  # Grow latent units per epoch till maximum capacity
+
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
         # First we produce the reconstruction, we ignore the latent obtained from targets
         with torch.no_grad():
