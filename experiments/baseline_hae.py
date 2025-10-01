@@ -67,14 +67,14 @@ class Experiment(BaseSettings):
     # Data and augmentation parameters
     data: DataParams = Field(default_factory=DataParams, description="Data generation parameters")
     datamodule: DataModuleParams = Field(default_factory=DataModuleParams, description="Data module parameters")
-    mask_ratio: float = Field(default=0.0, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
+    mask_ratio: float = Field(default=0.4, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
 
     # Training Settings
     max_epochs: PositiveInt = Field(default=200, ge=1, le=1000, description="Maximum training epochs")
 
     # Logging and Output Settings
     log_dir: str = Field(default="logs", description="Directory for experiment logs")
-    experiment_name: str = Field("data_completion", description="Experiment name")
+    experiment_name: str = Field("baseline_hae", description="Experiment name")
     checkpoint_freq: PositiveInt = Field(default=5, ge=1, le=50, description="Checkpoint frequency")
 
 
