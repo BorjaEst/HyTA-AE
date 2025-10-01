@@ -202,54 +202,46 @@ class Autoencoder(pl.LightningModule):
         return Adam(optimizer_parameters)
 
     # -----------------------------------------------------------------------------------
-    def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
-        sensors, targets = batch
-        encoder_signals = self.encoder(flatten(sensors[:, 0], start_dim=1))
-        # Detach to prevent gradient transport through encoder (DFA regime)
-        latent = self.latent(encoder_signals[-1].detach())
-        latent = F.gelu(latent)  # Nonlinearity on latent code
-        decoder_signals = self.decoder(latent.detach())
-        # Detach to keep decoder local objectives (HTL) and avoid BP coupling
-        logits = self.output(decoder_signals[0].detach())
-        reconstruction = F.sigmoid(logits)
-        return unflatten(reconstruction, 1, targets.shape[1:]), latent
+    def _encode(self, inputs: Tensor) -> Tensor:
+        encoder_signals = self.encoder(flatten(inputs, start_dim=1))
+        latent = self.latent(encoder_signals[-1])
+        return F.gelu(latent)  # Nonlinearity on latent code
 
     @torch.inference_mode()
     def encode(self, sensors: Tensor) -> Tensor:
         """Encode sensors into latent space using the DFA-based encoder."""
-        encoder_signals = self.encoder(flatten(sensors[:, 0], start_dim=1))
-        latent = self.latent(encoder_signals[-1])
-        return F.gelu(latent)
+        return self._encode(sensors)
+
+    def _decode(self, latent: Tensor) -> Tensor:
+        decoder_signals = self.decoder(latent)
+        logits = unflatten(self.output(decoder_signals[0]), 1, self.output_shape)
+        return F.sigmoid(logits)
 
     @torch.inference_mode()
     def decode(self, latent: Tensor) -> Tensor:
         """Decode latent codes into map space using the HTL-based decoder."""
-        decoder_signals = self.decoder(latent)
-        logits = self.output(decoder_signals[0])
-        reconstruction = F.sigmoid(logits)
-        return unflatten(reconstruction, 1, self.output_shape)
+        return self._decode(latent)
+
+    def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
+        sensors, _targets = batch
+        latent = self._encode(sensors[:, 0])  # Use channel 0 with masked targets
+        reconstruction = self._decode(latent.detach())
+        return reconstruction, latent
 
     # -----------------------------------------------------------------------------------
-    def compute_feedback(self, outputs: Tensor, batch: Tensor) -> List[Tensor]:
-        reconstruction, latent = outputs
-        sensors, *_ = batch
-        return [sensors, reconstruction, latent]
-
-    # -----------------------------------------------------------------------------------
-    def apply_feedback(self, feedback: List[Tensor]) -> None:
-        (sensors, reconstruction, latent) = feedback
+    def feedback(self, reconstruction: Tensor, latent: Tensor, batch: Tensor) -> List[Tensor]:
+        sensors, _targets = batch
         reconstruction_err = flatten(reconstruction - sensors[:, 0], start_dim=1)
         self.encoder.feedback(reconstruction_err)
         self.sparsity_loss(latent).backward()
         self.decoder.feedback(self.encoder, latent.detach())
-        self.reconstruction_loss(reconstruction, sensors[:, 0]).backward()
+        self.reconstruction_loss(reconstruction, sensors[:, 0].detach()).backward()
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
         self.optimizers().zero_grad()
-        outputs = self(batch)
-        feedback = self.compute_feedback(outputs, batch)
-        self.apply_feedback(feedback)
+        reconstruction, latent = self(batch)
+        self.feedback(reconstruction, latent, batch)
         self.optimizers().step()
 
     # -----------------------------------------------------------------------------------
@@ -257,9 +249,10 @@ class Autoencoder(pl.LightningModule):
         reconstruction, latent = self(batch)
         self.log_metrics_x(reconstruction, batch[1])
         self.log_metrics_z(latent)
-        h1_encoder = self.encoder.layer1(flatten(batch[0][:, 0], start_dim=1))
-        h1_decoder = self.decoder.layer1(self.decoder.layer2(latent))
-        self.log_metrics_h1(h1_decoder, h1_encoder)
+        encoder_signals = self.encoder(flatten(batch[0][:, 0], start_dim=1))
+        decoder_signals = self.decoder(latent)
+        self.log_metrics_hi("1", decoder_signals[0], encoder_signals[0])
+        self.log_metrics_hi("2", decoder_signals[1], encoder_signals[1])
 
     def log_metrics_x(self, reconstruction: Tensor, targets: Tensor) -> None:
         x_mseloss = F.mse_loss(reconstruction, targets, reduction="mean")
@@ -269,15 +262,16 @@ class Autoencoder(pl.LightningModule):
         sparsity_rate = (latent.abs() < 0.01).float().mean()
         self.log("val/latent_sparsity", sparsity_rate, prog_bar=True, on_step=False, on_epoch=True)
 
-    def log_metrics_h1(self, h1_decoder: Tensor, h1_encoder: Tensor) -> None:
-        self.log("val/h1_mean", h1_encoder.mean(), prog_bar=False, on_step=False, on_epoch=True)
-        self.log("val/h1_std", h1_encoder.std(unbiased=False), prog_bar=False, on_step=False, on_epoch=True)
+    def log_metrics_hi(self, i: int, h1_decoder: Tensor, h1_encoder: Tensor) -> None:
+        self.log(f"val/h{i}_mean", h1_encoder.mean(), prog_bar=False, on_step=False, on_epoch=True)
+        self.log(f"val/h{i}_std", h1_encoder.std(unbiased=False), prog_bar=False, on_step=False, on_epoch=True)
         h1_mseloss = F.mse_loss(h1_decoder, h1_encoder.detach(), reduction="mean")
-        self.log("val/h1_mseloss", h1_mseloss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log(f"val/h{i}_mseloss", h1_mseloss, prog_bar=True, on_step=False, on_epoch=True)
 
 
 # -------------------------------------------------------------------------------------------
 def gen_figures(model: Autoencoder, datamodule: BaseDataModule) -> None:
+    """Generate reconstruction and sparsity figures from model outputs."""
     model.eval()
     datamodule.setup("test")
     test_dataloader = datamodule.test_dataloader()
