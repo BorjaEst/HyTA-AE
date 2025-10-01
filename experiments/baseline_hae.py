@@ -56,19 +56,6 @@ from ehc_sn.modules.loss import GramianOrthogonalityLoss as SparsityLoss
 
 # -----------------------------------------------------------------------------------
 class Experiment(BaseSettings):
-    """Configuration settings for the data completion experiment.
-
-    This configuration controls model width/depth, data/augmentation settings,
-    Lightning data module parameters, figure options, logging, and checkpoints.
-
-    Key ideas:
-    - Inputs are obstacle maps that are augmented to contain only partial
-      obstacles (masking/occlusion). The model must complete the missing
-      structure from memory.
-    - The encoder uses DFA-based layers; the decoder uses HTL-based layers.
-    - Training is manual to keep feedback signals explicit and local.
-    """
-
     model_config = SettingsConfigDict(extra="forbid", cli_parse_args=True)
 
     # Encoder and decoder components
@@ -122,51 +109,17 @@ class DFALayer(nn.Linear):
 
 # -------------------------------------------------------------------------------------------
 class Encoder(nn.Module):
-    """DFA-based encoder that maps input maps to higher-level features.
-
-    Architecture:
-    - layer1: Linear + GELU
-    - layer2: Linear + GELU
-
-    Learning principle:
-    - Each Linear is wrapped with a DFA synapse object. During feedback,
-      a global reconstruction error is broadcast and each layer computes a
-      local update using fixed/random feedback projections (no W^T).
-    """
-
     def __init__(self, n_inputs: int, n_h1: int, n_h2: int):
         super().__init__()
         self.layer1 = DFALayer(n_inputs, n_h1, n_inputs, nn.GELU())
         self.layer2 = DFALayer(n_h1, n_h2, n_inputs, nn.GELU())
 
     def forward(self, x_incomplete: Tensor) -> List[Tensor]:
-        """Forward pass returning intermediate activations.
-
-        Parameters
-        ----------
-        sensors: Tensor
-            Flattened input maps (B, N).
-
-        Returns
-        -------
-        List[Tensor]
-            [h1, h2] activations for downstream use and local objectives.
-        """
         h1 = self.layer1(x_incomplete)  # Use only channel 0 (obstacles)
         h2 = self.layer2(h1)
         return [h1, h2]
 
     def feedback(self, reconstruction_err: Tensor) -> None:
-        """Apply DFA feedback using the global reconstruction error.
-
-        The same broadcast error is used at both layers, consistent with DFA,
-        but each layer uses its own fixed/random feedback mapping.
-
-        Parameters
-        ----------
-        reconstruction_err: Tensor
-            Flattened difference (reconstruction - sensors) with shape (B, N).
-        """
         self.layer2.feedback(reconstruction_err)
         self.layer1.feedback(reconstruction_err)
 
@@ -204,70 +157,23 @@ class HTLLayer(nn.Linear):
 
 # -------------------------------------------------------------------------------------------
 class Decoder(nn.Module):
-    """HTL-based decoder that reconstructs maps from latent codes.
-
-    Architecture:
-    - layer2: Linear + GELU
-    - layer1: Linear + GELU
-
-    Learning principle:
-    - Hierarchical Target Learning (HTL): local layer-wise targets are derived
-      from encoder activities and/or higher-level context. Each layer minimizes
-      a local objective w.r.t. its target without requiring backprop transport
-      through upstream modules.
-    """
-
     def __init__(self, n_h1: int, n_h2: int, n_latents: int):
         super().__init__()
         self.layer2 = HTLLayer(n_latents, n_h2, n_h2, nn.GELU())
         self.layer1 = HTLLayer(n_h2, n_h1, n_h1, nn.GELU())
 
     def forward(self, latent: Tensor) -> List[Tensor]:
-        """Forward pass returning intermediate decoder activations.
-
-        Parameters
-        ----------
-        latent: Tensor
-            Latent code tensor of shape (B, D_latent).
-
-        Returns
-        -------
-        List[Tensor]
-            [h1, h2] where h2 is deeper (closer to latent) and h1 drives output.
-        """
         h2 = self.layer2(latent)
         h1 = self.layer1(h2)
         return [h1, h2]
 
     def feedback(self, encoder: Encoder, latent: Tensor) -> None:
-        """Apply HTL-style feedback using encoder activities as targets/context.
-
-        Parameters
-        ----------
-        encoder: Encoder
-            The paired encoder, providing activities that act as apical-like
-            targets for decoder layers.
-        latent: Tensor
-            Current latent code; used as contextual signal for deeper layer.
-        """
         self.layer2.feedback(encoder.layer2.activations, context=latent)
         self.layer1.feedback(encoder.layer1.activations, context=encoder.layer2.activations)
 
 
 # -------------------------------------------------------------------------------------------
 class Autoencoder(pl.LightningModule):
-    """Hybrid DFA (encoder) + HTL (decoder) autoencoder for map completion.
-
-    - Encoder receives DFA feedback broadcast from the output reconstruction
-      error (global signal) and updates locally.
-    - Latent layer provides a compact code with GELU nonlinearity.
-    - Decoder uses HTL feedback to align layer activities to targets derived
-      from encoder states, avoiding backprop-through-encoder.
-    - Output is a Bernoulli map (Sigmoid) trained with BCE.
-
-    Manual optimization is used to sequence local losses/backward passes.
-    """
-
     def __init__(self, output_shape: List[int], n_layer1: int, n_layer2: int, n_latent: int):
         super().__init__()
         self.save_hyperparameters(ignore=["trainer"])
@@ -287,12 +193,6 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
-        """Configure parameter groups and learning rates.
-
-        Encoder/latent receive smaller learning rates to stabilize DFA-driven
-        updates on representation layers, while decoder/output can learn faster
-        given their local HTL + reconstruction objectives.
-        """
         optimizer_parameters = [
             {"params": self.encoder.parameters(), "lr": 2e-6},
             {"params": self.latent.parameters(), "lr": 2e-6},
@@ -303,20 +203,6 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
-        """Forward pass returning reconstruction and latent code.
-
-        Parameters
-        ----------
-        batch: Tuple[Tensor, Tensor]
-            (sensors, targets) where sensors are possibly partial maps due to
-            augmentation, and targets are full maps.
-
-        Returns
-        -------
-        Tuple[Tensor, Tensor]
-            (reconstruction, latent) where reconstruction matches sensors shape
-            and latent is the compressed code.
-        """
         sensors, targets = batch
         encoder_signals = self.encoder(flatten(sensors[:, 0], start_dim=1))
         # Detach to prevent gradient transport through encoder (DFA regime)
@@ -345,25 +231,12 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def compute_feedback(self, outputs: Tensor, batch: Tensor) -> List[Tensor]:
-        """Collect tensors required for local learning rules.
-
-        Returns a tuple-like list to decouple how we compute and how we apply
-        feedback. Keeping this explicit aids manual optimization sequencing.
-        """
         reconstruction, latent = outputs
         sensors, *_ = batch
         return [sensors, reconstruction, latent]
 
     # -----------------------------------------------------------------------------------
     def apply_feedback(self, feedback: List[Tensor]) -> None:
-        """Apply local objectives in biologically motivated order.
-
-        Order of updates (conceptual):
-        1) DFA: broadcast reconstruction error to encoder layers.
-        2) Sparsity: encourage decorrelated, sparse latent codes.
-        3) HTL: decoder layers match targets from encoder context.
-        4) Reconstruction: optimize output Bernoulli likelihood (BCE).
-        """
         (sensors, reconstruction, latent) = feedback
         reconstruction_err = flatten(reconstruction - sensors[:, 0], start_dim=1)
         self.encoder.feedback(reconstruction_err)
@@ -373,7 +246,6 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
-        """Manual training step to preserve local learning semantics."""
         self.optimizers().zero_grad()
         outputs = self(batch)
         feedback = self.compute_feedback(outputs, batch)
@@ -382,7 +254,6 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def validation_step(self, batch: Tensor, batch_idx: int) -> List[Tensor]:
-        """Validation metrics: reconstruction error and latent sparsity rate."""
         reconstruction, latent = self(batch)
         self.log_metrics_x(reconstruction, batch[1])
         self.log_metrics_z(latent)
@@ -407,14 +278,6 @@ class Autoencoder(pl.LightningModule):
 
 # -------------------------------------------------------------------------------------------
 def gen_figures(model: Autoencoder, datamodule: BaseDataModule) -> None:
-    """Generate reconstruction, sparsity, and decoder montage figures.
-
-    - Figure 1: Reconstruction map comparing inputs and outputs.
-    - Figure 2: Decoder montage for one-hot latent probes.
-
-    Assumes the datamodule provides a test set compatible with the trained
-    model and that the figure classes handle their own tensor formatting.
-    """
     model.eval()
     datamodule.setup("test")
     test_dataloader = datamodule.test_dataloader()
@@ -474,10 +337,7 @@ if __name__ == "__main__":
         profiler="simple",
     )
 
-    # Train till end of training or keyboard interup
-    try:
-        # Manual optimization inside the LightningModule preserves the local
-        # feedback semantics (DFA/HTL) and avoids standard BP weight transport.
+    try:  # Train till end of training or keyboard interup
         trainer.fit(model, datamodule=datamodule)
     except KeyboardInterrupt:
         print("Training interrupted by user. Generating figures...")
