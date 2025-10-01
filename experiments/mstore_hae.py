@@ -65,10 +65,10 @@ class DFALayer(nn.Linear):
         """Number of output features of the layer."""
         return self.out_features
 
-    def feedback(self, error: Tensor) -> None:
+    def feedback(self, error: Tensor) -> Tensor:
         delta = error.detach() @ self.fb_weight  # (batch_size, out_features)
-        torch.autograd.backward(self.activations, delta)
-        # nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+        target = self.activations.detach() - delta  # same shape as activations
+        return F.mse_loss(self.activations, target, reduction="mean")
 
     def reset_feedback(self) -> None:
         limit = 1.0 / math.sqrt(self.error_features)
@@ -87,9 +87,11 @@ class Encoder(nn.Module):
         h2 = self.layer2(h1)
         return [h1, h2]
 
-    def feedback(self, reconstruction_err: Tensor) -> None:
-        self.layer2.feedback(reconstruction_err)
-        self.layer1.feedback(reconstruction_err)
+    def feedback(self, reconstruction_err: Tensor) -> Tensor:
+        local_loss = torch.zeros(1, device=reconstruction_err.device)
+        local_loss += self.layer2.feedback(reconstruction_err)
+        local_loss += self.layer1.feedback(reconstruction_err)
+        return local_loss
 
 
 # -------------------------------------------------------------------------------------------
@@ -111,12 +113,11 @@ class HTLLayer(nn.Linear):
         """Number of output features of the layer."""
         return self.out_features
 
-    def feedback(self, targets: Tensor, context: Tensor) -> None:
+    def feedback(self, targets: Tensor, context: Tensor) -> Tensor:
         output = super().forward(context.detach())  # Detach pre-synaptic
         output = self.activation_fn(output)
         targets = targets @ self.fb_weight  # (batch_size, out_features)
-        F.mse_loss(output, targets.detach(), reduction="mean").backward()
-        # nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+        return F.mse_loss(output, targets.detach(), reduction="mean")
 
     def reset_feedback(self) -> None:
         if self.fb_weight.shape[0] != self.out_features:
@@ -136,9 +137,11 @@ class Decoder(nn.Module):
         h1 = self.layer1(h2)
         return [h1, h2]
 
-    def feedback(self, encoder: Encoder, latent: Tensor) -> None:
-        self.layer2.feedback(encoder.layer2.activations, context=latent)
-        self.layer1.feedback(encoder.layer1.activations, context=encoder.layer2.activations)
+    def feedback(self, encoder: Encoder, latent: Tensor) -> Tensor:
+        local_loss = torch.zeros(1, device=latent.device)
+        local_loss += self.layer2.feedback(encoder.layer2.activations, context=latent)
+        local_loss += self.layer1.feedback(encoder.layer1.activations, context=encoder.layer2.activations)
+        return local_loss
 
 
 # -------------------------------------------------------------------------------------------
@@ -223,7 +226,7 @@ class Autoencoder(pl.LightningModule):
         return reconstruction, latent
 
     # -----------------------------------------------------------------------------------
-    def feedback(self, first_prediction: Tensor, batch: Tensor) -> None:
+    def feedback(self, first_prediction: Tensor, batch: Tensor) -> Tensor:
         sensors, targets = batch
         x_incomplete, mask = sensors[:, 0], sensors[:, 1]
 
@@ -239,10 +242,12 @@ class Autoencoder(pl.LightningModule):
         reconstruction = self._decode(latent.detach())
 
         # Train the autoencoder layers with dfa, sparsity, htl and standard loss
-        self.encoder.feedback(flatten(error, start_dim=1))
-        self.sparsity_loss(latent).backward()
-        self.decoder.feedback(self.encoder, latent.detach())
-        self.reconstruction_loss(reconstruction, completion.detach()).backward()
+        local_loss = self.encoder.feedback(flatten(error, start_dim=1))
+        local_loss += 0.1 * self.sparsity_loss(latent)
+        local_loss += self.decoder.feedback(self.encoder, latent.detach())
+        local_loss += self.reconstruction_loss(reconstruction, completion.detach())
+
+        return local_loss
 
     # -----------------------------------------------------------------------------------
     def on_train_epoch_start(self) -> None:
@@ -255,7 +260,8 @@ class Autoencoder(pl.LightningModule):
 
         # Now we train using feedback connections
         self.optimizers().zero_grad()
-        self.feedback(first_prediction, batch)
+        local_loss = self.feedback(first_prediction, batch)
+        self.manual_backward(local_loss)
         self.optimizers().step()
 
     # -----------------------------------------------------------------------------------
