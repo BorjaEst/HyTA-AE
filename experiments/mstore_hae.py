@@ -71,7 +71,7 @@ class DFALayer(nn.Linear):
 
     def reset_feedback(self) -> None:
         limit = 1.0 / math.sqrt(self.error_features)
-        torch.nn.init.uniform_(self.fb_weight, -limit, limit)
+        nn.init.uniform_(self.fb_weight, -limit, limit)
 
 
 # -------------------------------------------------------------------------------------------
@@ -119,7 +119,7 @@ class HTLLayer(nn.Linear):
     def reset_feedback(self) -> None:
         if self.fb_weight.shape[0] != self.out_features:
             raise ValueError("HTL only supports identity matrix for now.")
-        torch.nn.init.eye_(self.fb_weight)
+        nn.init.eye_(self.fb_weight)
 
 
 # -------------------------------------------------------------------------------------------
