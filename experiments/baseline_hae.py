@@ -83,8 +83,8 @@ class DFALayer(nn.Linear):
     def __init__(self, n_in: int, n_out: int, n_error: int, activation_fn: Optional[nn.Module] = None):
         super().__init__(in_features=n_in, out_features=n_out, bias=True)
         self.error_features = n_error
-        self.register_buffer("activations", None)  # Starts without activation values
         self.activation_fn = activation_fn or nn.Identity()
+        self.register_buffer("activations", None)  # Starts without activation values
         self.register_buffer("fb_weight", torch.zeros(n_error, self.out_features))
         self.reset_feedback()  # Initialize weights properly
 
@@ -260,7 +260,7 @@ class Autoencoder(pl.LightningModule):
 
     def log_metrics_z(self, latent: Tensor) -> None:
         sparsity_rate = (latent.abs() < 0.01).float().mean()
-        self.log("val/latent_sparsity", sparsity_rate, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("val/sparsity_rate", sparsity_rate, prog_bar=True, on_step=False, on_epoch=True)
 
     def log_metrics_hi(self, i: int, h1_decoder: Tensor, h1_encoder: Tensor) -> None:
         self.log(f"val/h{i}_mean", h1_encoder.mean(), prog_bar=False, on_step=False, on_epoch=True)
