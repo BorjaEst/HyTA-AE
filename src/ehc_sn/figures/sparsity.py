@@ -14,9 +14,7 @@ class SparsityParams(FigureParams):
     """Parameters specific to sparsity analysis plots."""
 
     n_bins: int = Field(default=50, ge=10, le=100, description="Number of histogram bins")
-    threshold: float = Field(
-        default=0.01, ge=0.0, le=1.0, description="Threshold for considering activation as 'active'"
-    )
+    threshold: float = Field(default=0.02, ge=0.0, le=1.0, description="Threshold for considering 'active'")
     show_threshold: bool = Field(default=True, description="Show threshold line on histogram")
     alpha: float = Field(default=0.7, ge=0.1, le=1.0, description="Histogram alpha")
     color: str = Field(default="tab:blue", description="Histogram color")
@@ -52,6 +50,7 @@ class SparsityFigure(BaseFigure):
             AssertionError: If tensor doesn't have expected shape
         """
         assert activations.ndim == 2, "Expected (N, D) tensor for activations"
+        activations = activations.abs()  # Use absolute values for sparsity analysis
 
         n = self.select_n(activations.shape[0])
         x = self.to_numpy(activations[:n])
@@ -88,7 +87,7 @@ class SparsityFigure(BaseFigure):
                 ax_hist.axvline(
                     self.p.threshold, color="red", linestyle="--", alpha=0.8, label=f"Threshold ({self.p.threshold})"
                 )
-                ax_hist.axvline(-self.p.threshold, color="red", linestyle="--", alpha=0.8)
+                ax_hist.axvline(0, color="red", linestyle="--", alpha=0.8)  # activations measure absolute value
                 ax_hist.legend()
 
             # Sparsity visualization (activation pattern)
