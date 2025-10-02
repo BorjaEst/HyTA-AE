@@ -34,7 +34,7 @@ class Experiment(BaseSettings):
     # Data and augmentation parameters
     data: DataParams = Field(default_factory=DataParams, description="Data generation parameters")
     datamodule: DataModuleParams = Field(default_factory=DataModuleParams, description="Data module parameters")
-    mask_ratio: float = Field(default=0.0, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
+    mask_ratio: float = Field(default=0.4, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
 
     # Training Settings
     max_epochs: PositiveInt = Field(default=200, ge=1, le=1000, description="Maximum training epochs")
@@ -137,10 +137,10 @@ class Decoder(nn.Module):
         h1 = self.layer1(h2)
         return [h1, h2]
 
-    def feedback(self, encoder: Encoder, latent: Tensor) -> Tensor:
+    def feedback(self, targets: List[Tensor], latent: Tensor) -> Tensor:
         local_loss = torch.zeros(1, device=latent.device)
-        local_loss += self.layer2.feedback(encoder.layer2.activations, context=latent)
-        local_loss += self.layer1.feedback(encoder.layer1.activations, context=encoder.layer2.activations)
+        local_loss += self.layer2.feedback(targets[1], context=latent)
+        local_loss += self.layer1.feedback(targets[0], context=targets[1])
         return local_loss
 
 
@@ -226,7 +226,7 @@ class Autoencoder(pl.LightningModule):
         return reconstruction, latent
 
     # -----------------------------------------------------------------------------------
-    def feedback(self, first_prediction: Tensor, batch: Tensor) -> Tensor:
+    def feedback(self, first_prediction: Tensor, batch: Tuple[Tensor, Tensor]) -> Tensor:
         sensors, targets = batch
         x_incomplete, mask = sensors[:, 0], sensors[:, 1]
 
@@ -235,8 +235,8 @@ class Autoencoder(pl.LightningModule):
         error = first_prediction * mask - x_incomplete  # DFA feedback error only on visible pixels
 
         # Create targets and contexts for feedback paths
-        targets = self.encoder(flatten(completion, start_dim=1))
-        latent = self.latent(targets[-1])  # detached by DFALayer
+        decoder_targets = self.encoder(flatten(completion, start_dim=1))
+        latent = self.latent(decoder_targets[-1])  # detached by DFALayer
 
         # Second pass to update activations and reconstruction
         reconstruction = self._decode(latent.detach())
@@ -244,7 +244,7 @@ class Autoencoder(pl.LightningModule):
         # Train the autoencoder layers with dfa, sparsity, htl and standard loss
         local_loss = self.encoder.feedback(flatten(error, start_dim=1))
         local_loss += 0.1 * self.sparsity_loss(latent)
-        local_loss += self.decoder.feedback(self.encoder, latent.detach())
+        local_loss += self.decoder.feedback(decoder_targets, latent.detach())
         local_loss += self.reconstruction_loss(reconstruction, completion.detach())
 
         return local_loss
