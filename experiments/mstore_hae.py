@@ -27,7 +27,7 @@ class Experiment(BaseSettings):
 
     # Encoder and decoder components
     latent_units: PositiveInt = Field(default=2000, gt=0, description="Dimensionality of the latent code.")
-    layer2_units: PositiveInt = Field(default=500, gt=0, description="Number of hidden units per layer.")
+    layer2_units: PositiveInt = Field(default=400, gt=0, description="Number of hidden units per layer.")
     layer1_units: PositiveInt = Field(default=5000, gt=0, description="Number of hidden units per layer.")
     output_shape: List[PositiveInt] = Field([25, 25], description="Dimensionality of the input and output.")
 
@@ -180,7 +180,7 @@ class Autoencoder(pl.LightningModule):
 
         # Initialize encoder and decoder with DFA layers
         self.encoder = Encoder(n_output, n_layer1, n_layer2)
-        self.latent = DGLayer(n_layer2, n_latent // 40, n_latent)
+        self.latent = DGLayer(n_layer2, n_latent // 10, n_latent)
         self.decoder = Decoder(n_layer1, n_layer2, n_latent)
         self.output = nn.Linear(n_layer1, n_output)
 
@@ -225,7 +225,7 @@ class Autoencoder(pl.LightningModule):
         return reconstruction, latent
 
     # -----------------------------------------------------------------------------------
-    def feedback(self, first_prediction: Tensor, batch: Tuple[Tensor, Tensor]) -> Tensor:
+    def feedback(self, first_prediction: Tensor, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Any]:
         sensors, targets = batch
         x_incomplete, mask = sensors[:, 0], sensors[:, 1]
 
@@ -246,11 +246,11 @@ class Autoencoder(pl.LightningModule):
         local_loss += self.decoder.feedback(decoder_targets, latent.detach())
         local_loss += self.reconstruction_loss(reconstruction, completion.detach())
 
-        return local_loss
+        return local_loss, (reconstruction, latent)
 
     # -----------------------------------------------------------------------------------
     def on_train_epoch_start(self) -> None:
-        self.latent.grow(12)  # Grow latent units per epoch till maximum capacity
+        self.latent.grow(8)  # Grow latent units per epoch till maximum capacity
 
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
         # First we produce the reconstruction, we ignore the latent obtained from targets
@@ -259,31 +259,31 @@ class Autoencoder(pl.LightningModule):
 
         # Now we train using feedback connections
         self.optimizers().zero_grad()
-        local_loss = self.feedback(first_prediction, batch)
+        local_loss, (reconstruction, latent) = self.feedback(first_prediction, batch)
         self.manual_backward(local_loss)
         self.optimizers().step()
 
-    # -----------------------------------------------------------------------------------
+        # Logging metrics
+        self.log_metrics("train", reconstruction, batch[1], latent)
+
     def validation_step(self, batch: Tensor, batch_idx: int) -> List[Tensor]:
         reconstruction, latent = self(batch)
-        self.log_metrics_x(reconstruction, batch[1])  # targets to measure reconstruction loss
-        self.log_metrics_z(latent)
+        self.log_metrics("val", reconstruction, batch[1], latent)
         encoder_signals = self.encoder(flatten(reconstruction, start_dim=1))
         decoder_signals = self.decoder(latent)
-        self.log_metrics_hi("1", decoder_signals[0], encoder_signals[0])
-        self.log_metrics_hi("2", decoder_signals[1], encoder_signals[1])
+        self.log_hidden("val", "1", decoder_signals[0], encoder_signals[0])
+        self.log_hidden("val", "2", decoder_signals[1], encoder_signals[1])
 
-    def log_metrics_x(self, reconstruction: Tensor, targets: Tensor) -> None:
+    # -----------------------------------------------------------------------------------
+    def log_metrics(self, stage: str, reconstruction: Tensor, targets: Tensor, latent: Tensor) -> None:
         x_mseloss = F.mse_loss(reconstruction, targets, reduction="mean")
-        self.log("val/reconstruction_loss", x_mseloss, prog_bar=True, on_step=False, on_epoch=True)
-
-    def log_metrics_z(self, latent: Tensor) -> None:
+        self.log(f"{stage}/reconstruction_loss", x_mseloss, prog_bar=True, on_step=False, on_epoch=True)
         sparsity_rate = (latent.abs() < 0.01).float().mean()
-        self.log("val/sparsity_rate", sparsity_rate, prog_bar=True, on_step=False, on_epoch=True)
+        self.log(f"{stage}/sparsity_rate", sparsity_rate, prog_bar=True, on_step=False, on_epoch=True)
 
-    def log_metrics_hi(self, i: int, h1_decoder: Tensor, h1_encoder: Tensor) -> None:
-        h1_mseloss = F.mse_loss(h1_decoder, h1_encoder.detach(), reduction="mean")
-        self.log(f"val/h{i}_mseloss", h1_mseloss, prog_bar=True, on_step=False, on_epoch=True)
+    def log_hidden(self, stage: str, i: int, hi_decoder: Tensor, hi_encoder: Tensor) -> None:
+        h1_mseloss = F.mse_loss(hi_decoder, hi_encoder.detach(), reduction="mean")
+        self.log(f"{stage}/h{i}_mseloss", h1_mseloss, prog_bar=True, on_step=False, on_epoch=True)
 
 
 # -------------------------------------------------------------------------------------------
