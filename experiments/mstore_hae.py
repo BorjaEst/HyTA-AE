@@ -18,7 +18,7 @@ from ehc_sn.data.obstacle_maps import DataGenerator, DataParams
 from ehc_sn.figures.decoder_montage import DecoderMontageFigure
 from ehc_sn.figures.reconstruction_map import ReconstructionMapFigure
 from ehc_sn.figures.sparsity import SparsityFigure
-from ehc_sn.modules.loss import GramianOrthogonalityLoss as SparsityLoss
+from ehc_sn.modules.loss import HomeostaticActivityLoss as SparsityLoss
 
 
 # -----------------------------------------------------------------------------------
@@ -26,15 +26,15 @@ class Experiment(BaseSettings):
     model_config = SettingsConfigDict(extra="forbid", cli_parse_args=True)
 
     # Encoder and decoder components
-    latent_units: PositiveInt = Field(default=2048, gt=0, description="Dimensionality of the latent code.")
-    layer2_units: PositiveInt = Field(default=512, gt=0, description="Number of hidden units per layer.")
-    layer1_units: PositiveInt = Field(default=1024, gt=0, description="Number of hidden units per layer.")
+    latent_units: PositiveInt = Field(default=2000, gt=0, description="Dimensionality of the latent code.")
+    layer2_units: PositiveInt = Field(default=500, gt=0, description="Number of hidden units per layer.")
+    layer1_units: PositiveInt = Field(default=5000, gt=0, description="Number of hidden units per layer.")
     output_shape: List[PositiveInt] = Field([25, 25], description="Dimensionality of the input and output.")
 
     # Data and augmentation parameters
     data: DataParams = Field(default_factory=DataParams, description="Data generation parameters")
     datamodule: DataModuleParams = Field(default_factory=DataModuleParams, description="Data module parameters")
-    mask_ratio: float = Field(default=0.4, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
+    mask_ratio: float = Field(default=0.25, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
 
     # Training Settings
     max_epochs: PositiveInt = Field(default=200, ge=1, le=1000, description="Maximum training epochs")
@@ -57,7 +57,7 @@ class DFALayer(nn.Linear):
 
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
         currents = super().forward(*args, **kwargs)
-        self.activations = self.activation_fn(currents)
+        self.activations = F.tanh(self.activation_fn(currents))
         return self.activations.detach()  # enforce locality
 
     @property
@@ -105,7 +105,7 @@ class HTLLayer(nn.Linear):
 
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
         currents = super().forward(*args, **kwargs)
-        activations = self.activation_fn(currents)
+        activations = F.tanh(self.activation_fn(currents))
         return activations.detach()  # enforce locality
 
     @property
@@ -146,16 +146,15 @@ class Decoder(nn.Module):
 
 # -------------------------------------------------------------------------------------------
 class DGLayer(nn.Linear):
-    def __init__(self, n_in: int, n_init: int, n_max: int, activation_fn: Optional[nn.Module] = None):
+    def __init__(self, n_in: int, n_init: int, n_max: int):
         super().__init__(in_features=n_in, out_features=n_max, bias=True)
-        self.activation_fn = activation_fn or nn.ReLU()
         self.register_buffer("output_mask", torch.zeros(n_max, dtype=torch.float32))
         self.grow(n_init)  # Initialize with n_init active units
 
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
         out = super().forward(*args, **kwargs)
         out = out * self.output_mask  # Masked units are zeroed; grads do not flow to their rows
-        return self.activation_fn(out)
+        return F.tanh(F.relu(out))  # Using ReLU followed by Tanh for bounded activations
 
     @property
     def out_active(self) -> int:
@@ -181,13 +180,13 @@ class Autoencoder(pl.LightningModule):
 
         # Initialize encoder and decoder with DFA layers
         self.encoder = Encoder(n_output, n_layer1, n_layer2)
-        self.latent = DGLayer(n_layer2, n_latent // 10, n_latent)
+        self.latent = DGLayer(n_layer2, n_latent // 40, n_latent)
         self.decoder = Decoder(n_layer1, n_layer2, n_latent)
         self.output = nn.Linear(n_layer1, n_output)
 
         # Loss functions
         self.reconstruction_loss = nn.BCELoss(reduction="mean")
-        self.sparsity_loss = SparsityLoss(center=True)
+        self.sparsity_loss = SparsityLoss(target_rate=0.05, min_active=8)
 
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
@@ -243,7 +242,7 @@ class Autoencoder(pl.LightningModule):
 
         # Train the autoencoder layers with dfa, sparsity, htl and standard loss
         local_loss = self.encoder.feedback(flatten(error, start_dim=1))
-        local_loss += 0.1 * self.sparsity_loss(latent)
+        local_loss += self.sparsity_loss(latent)
         local_loss += self.decoder.feedback(decoder_targets, latent.detach())
         local_loss += self.reconstruction_loss(reconstruction, completion.detach())
 
@@ -251,7 +250,7 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def on_train_epoch_start(self) -> None:
-        self.latent.grow(10)  # Grow latent units per epoch till maximum capacity
+        self.latent.grow(12)  # Grow latent units per epoch till maximum capacity
 
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
         # First we produce the reconstruction, we ignore the latent obtained from targets
