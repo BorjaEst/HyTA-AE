@@ -225,7 +225,7 @@ class Autoencoder(pl.LightningModule):
         return reconstruction, latent
 
     # -----------------------------------------------------------------------------------
-    def feedback(self, first_prediction: Tensor, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Any]:
+    def feedback(self, first_prediction: Tensor, batch: Tuple[Tensor, Tensor]) -> Tensor:
         sensors, targets = batch
         x_incomplete, mask = sensors[:, 0], sensors[:, 1]
 
@@ -246,7 +246,7 @@ class Autoencoder(pl.LightningModule):
         local_loss += self.decoder.feedback(decoder_targets, latent.detach())
         local_loss += self.reconstruction_loss(reconstruction, completion.detach())
 
-        return local_loss, (reconstruction, latent)
+        return local_loss
 
     # -----------------------------------------------------------------------------------
     def on_train_epoch_start(self) -> None:
@@ -255,16 +255,16 @@ class Autoencoder(pl.LightningModule):
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
         # First we produce the reconstruction, we ignore the latent obtained from targets
         with torch.no_grad():
-            first_prediction, _latent_from_target = self(batch)
+            first_prediction, first_latent = self(batch)
 
         # Now we train using feedback connections
         self.optimizers().zero_grad()
-        local_loss, (reconstruction, latent) = self.feedback(first_prediction, batch)
+        local_loss = self.feedback(first_prediction, batch)
         self.manual_backward(local_loss)
         self.optimizers().step()
 
-        # Logging metrics
-        self.log_metrics("train", reconstruction, batch[1], latent)
+        # Logging metrics: use first prediction to match validation
+        self.log_metrics("train", first_prediction, batch[1], first_latent)
 
     def validation_step(self, batch: Tensor, batch_idx: int) -> List[Tensor]:
         reconstruction, latent = self(batch)
