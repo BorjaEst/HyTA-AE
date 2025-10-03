@@ -5,6 +5,7 @@
 - Corruption (masking) is applied only to the input to create incomplete maps.
 """
 
+import math  # added
 from typing import Optional, Tuple
 
 import torch
@@ -21,27 +22,42 @@ class ComposeParams(BaseModel):
 
     # Geometry
     hflip_p: float = Field(default=0.5, ge=0.0, le=1.0, description="Horizontal flip probability")
-    vflip_p: float = Field(default=0.0, ge=0.0, le=1.0, description="Vertical flip probability")
+    vflip_p: float = Field(default=0.5, ge=0.0, le=1.0, description="Vertical flip probability")
 
     # Corruption (incomplete maps)
-    mask_ratio: float = Field(default=0.6, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
+    mask_ratio: float = Field(default=0.65, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
     mask_value: float = Field(default=0.0, description="Value used for masked-out locations")
+
+    # Visible-rectangle sampling (prevents always-centered visibility)
+    keep_rects: int = Field(default=1, ge=1, le=8, description="Number of visible rectangles to keep (union)")
+    aspect_min: float = Field(default=0.5, gt=0.0, description="Min aspect ratio (w/h) for visible rectangles")
+    aspect_max: float = Field(default=2.0, gt=0.0, description="Max aspect ratio (w/h) for visible rectangles")
 
 
 # -------------------------------------------------------------------------------------------
 class RandomMask:
-    """Randomly keep a single visible rectangle and mask the rest.
+    """Randomly keep one or more visible rectangles and mask the rest.
 
     Mask channel semantics:
       - 1.0 on visible (unmasked) positions
       - mask_value on masked positions
 
-    The masked input is computed as x * mask (i.e., values are faded, not replaced).
+    The masked input is computed as x * mask (values are faded, not replaced).
     """
 
-    def __init__(self, ratio: float = 0.3, value: float = 0.0):
+    def __init__(
+        self,
+        ratio: float = 0.3,
+        value: float = 0.0,
+        keep_rects: int = 1,
+        aspect_min: float = 0.5,
+        aspect_max: float = 2.0,
+    ):
         self.ratio = float(ratio)
         self.value = float(value)
+        self.keep_rects = int(keep_rects)
+        self.aspect_min = float(aspect_min)
+        self.aspect_max = float(aspect_max)
         # Stores last mask (1,H,W): 1.0 where visible, mask_value where masked
         self.last_mask: Optional[Tensor] = None
 
@@ -53,39 +69,38 @@ class RandomMask:
 
         c, h, w = x.shape
         if self.ratio <= 0.0:
-            # No masking: mask is all ones, input unchanged
             self.last_mask = torch.ones((1, h, w), device=x.device, dtype=x.dtype)
             return x
 
-        # Compute visible area ratio; keep a single rectangle with this area
         visible_ratio = max(0.0, min(1.0, 1.0 - self.ratio))
+        keep = torch.zeros((h, w), device=x.device, dtype=x.dtype)
 
-        if visible_ratio <= 0.0:
-            keep = torch.zeros((h, w), device=x.device, dtype=x.dtype)
-        else:
-            # Keep rectangle with approximately visible_ratio area.
-            # Maintain map aspect by scaling both dims by sqrt(visible_ratio).
-            scale = visible_ratio**0.5
-            vh = max(1, int(round(h * scale)))
-            vw = max(1, int(round(w * scale)))
+        # Sample one or more visible rectangles with random aspect ratio
+        for _ in range(self.keep_rects):
+            if visible_ratio <= 0.0:
+                continue
+
+            # Log-uniform aspect sampling is common; uniform is fine too
+            a = float(torch.empty(1, device=x.device).uniform_(self.aspect_min, self.aspect_max))
+            # Ensure h_frac * w_frac ≈ visible_ratio while varying aspect
+            h_frac = math.sqrt(visible_ratio / a)
+            w_frac = math.sqrt(visible_ratio * a)
+
+            vh = max(1, int(round(h * max(0.0, min(1.0, h_frac)))))
+            vw = max(1, int(round(w * max(0.0, min(1.0, w_frac)))))
 
             max_i = max(0, h - vh)
             max_j = max(0, w - vw)
             i = 0 if max_i == 0 else int(torch.randint(0, max_i + 1, (1,), device=x.device))
             j = 0 if max_j == 0 else int(torch.randint(0, max_j + 1, (1,), device=x.device))
 
-            keep = torch.zeros((h, w), device=x.device, dtype=x.dtype)
             keep[i : i + vh, j : j + vw] = 1.0
 
         keep1 = keep.unsqueeze(0)  # (1,H,W)
-
-        # Build mask channel: 1.0 where visible, mask_value where masked
         mask1 = keep1 * 1.0 + (1.0 - keep1) * self.value  # (1,H,W)
         self.last_mask = mask1
 
-        # Apply faded masking to input: x_incomplete = x * mask
         x_incomplete = x * mask1.expand(c, -1, -1)
-
         return x_incomplete
 
 
@@ -106,6 +121,9 @@ class Augmentation:
         self._mask = RandomMask(
             ratio=self.params.mask_ratio,
             value=self.params.mask_value,
+            keep_rects=self.params.keep_rects,
+            aspect_min=self.params.aspect_min,
+            aspect_max=self.params.aspect_max,
         )
 
     # -----------------------------------------------------------------------------------
@@ -144,7 +162,7 @@ if __name__ == "__main__":
     from ehc_sn.figures.reconstruction_map import ReconstructionMapFigure
 
     # Create data generator with augmentation
-    compose_params = ComposeParams(hflip_p=0.0, vflip_p=0.0, mask_ratio=0.6, mask_value=0.2)
+    compose_params = ComposeParams(mask_value=0.2)
     augmentation = Augmentation(compose_params)
     data_params = DataParams(env_id="MiniGrid-MultiRoom-N6-v0", seed=42, invert_walls=False)
     generator = DataGenerator(data_params, transform=augmentation)
