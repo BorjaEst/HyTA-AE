@@ -13,7 +13,6 @@ from torch.nn import functional as F
 from torch.optim import Adam, Optimizer
 
 from ehc_sn.augmentation.incomplete_maps import Augmentation, ComposeParams
-from ehc_sn.core import ann
 from ehc_sn.core.datamodule import BaseDataModule, DataModuleParams
 from ehc_sn.data.obstacle_maps import DataGenerator, DataParams
 from ehc_sn.figures.decoder_montage import DecoderMontageFigure
@@ -30,10 +29,9 @@ class Experiment(BaseSettings):
     model_config = SettingsConfigDict(extra="forbid", cli_parse_args=True)
 
     # Autoencoder model configuration
-    layer2_units: PositiveInt = Field(default=1024, gt=0, description="Number of hidden units in layer 2.")
-    layer1_units: PositiveInt = Field(default=1024, gt=0, description="Number of hidden units in layer 1.")
+    layer1_units: PositiveInt = Field(default=1024, gt=0, description="Number of hidden units per layer.")
     output_shape: List[PositiveInt] = Field([25, 25], description="Dimensionality of the input and output.")
-    teacher_path: str = Field(default="models/overcomplete_autoencoders/backprop_2048.ckpt")
+    teacher_path: str = Field(default="models/overcomplete_autoencoders/hybrid_2048.ckpt")
 
     # Data and augmentation parameters
     data: DataParams = Field(default_factory=DataParams, description="Data generation parameters")
@@ -45,7 +43,7 @@ class Experiment(BaseSettings):
 
     # Logging and Output Settings
     log_dir: str = Field(default="logs", description="Directory for experiment logs")
-    experiment_name: str = Field("teacher_2layers", description="Experiment name")
+    experiment_name: str = Field("teacher_hae1ly", description="Experiment name")
     checkpoint_freq: PositiveInt = Field(default=5, ge=1, le=50, description="Checkpoint frequency")
 
 
@@ -71,7 +69,6 @@ class DFALayer(nn.Linear):
 
     def feedback(self, error: Tensor) -> None:
         delta = error.detach() @ self.fb_weight  # (batch_size, out_features)
-        # torch.autograd.backward(self.currents, delta)
         torch.autograd.backward(self.activations, delta)
 
     def reset_feedback(self) -> None:
@@ -83,26 +80,24 @@ class DFALayer(nn.Linear):
 class HTLLayer(nn.Linear):
     def __init__(self, n_in: int, n_out: int, n_target: int, activation_fn: Optional[nn.Module] = None):
         super().__init__(in_features=n_in, out_features=n_out, bias=True)
-        self.register_buffer("currents", None)  # Starts without current values
-        self.register_buffer("activations", None)  # Starts without activation values
         self.activation_fn = activation_fn or nn.Identity()
         self.register_buffer("fb_weight", torch.zeros(n_target, self.out_features))
         self.reset_feedback()  # Initialize weights properly
 
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
-        self.currents = super().forward(*args, **kwargs)
-        self.activations = self.activation_fn(self.currents)
-        return self.activations.detach()  # enforce locality
+        currents = super().forward(*args, **kwargs)
+        activations = self.activation_fn(currents)
+        return activations.detach()  # enforce locality
 
     @property
     def features(self) -> int:
         """Number of output features of the layer."""
         return self.out_features
 
-    def feedback(self, targets: Tensor) -> None:
-        # F.mse_loss(self.currents, target.detach(), reduction="mean").backward()
-        targets = targets @ self.fb_weight  # (batch_size, out_features)
-        F.mse_loss(self.activations, targets.detach(), reduction="mean").backward()
+    def feedback(self, targets: Tensor, context: Tensor) -> None:
+        currents = super().forward(context.detach())  # Detach pre-synaptic
+        output = self.activation_fn(currents)
+        F.mse_loss(output, targets.detach(), reduction="mean").backward()
 
     def reset_feedback(self) -> None:
         if self.fb_weight.shape[0] != self.out_features:
@@ -112,20 +107,18 @@ class HTLLayer(nn.Linear):
 
 # -------------------------------------------------------------------------------------------
 class Autoencoder(pl.LightningModule):
-    def __init__(self, output_shape: List[int], n_layer1: int, n_layer2: int, teacher: nn.Module):
+    def __init__(self, output_shape: List[int], n_layer1: int, teacher: nn.Module):
         super().__init__()
         self.save_hyperparameters(ignore=["teacher"])
         self.automatic_optimization = False
         self.output_shape = output_shape
         n_output = math.prod(output_shape)
-        n_memory = teacher.encoder.layer2.out_features
+        n_layer2 = teacher.encoder.layer2.out_features
 
         # Initialize encoder and decoder with DFA and HTL layers
         self.teacher = teacher
-        self.encoder_layer1 = DFALayer(n_output, n_layer1, n_output, nn.GELU())
-        self.encoder_layer2 = DFALayer(n_output, n_layer2, n_output, nn.GELU())
-        self.decoder_layer2 = HTLLayer(n_memory, n_layer2, n_layer2, nn.GELU())
-        self.decoder_layer1 = HTLLayer(n_layer2, n_layer1, n_layer1, nn.GELU())
+        self.encoder_layer1 = DFALayer(n_output, n_layer1, n_output, nn.ReLU())
+        self.decoder_layer1 = HTLLayer(n_layer2, n_layer1, n_layer1, nn.ReLU())
         self.output_layer = nn.Linear(n_layer1, n_output)  # Output layer (no HTL)
 
         # Loss functions
@@ -136,39 +129,34 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
         optimizer_parameters = [
-            {"params": self.encoder_layer1.parameters(), "lr": 1e-4},
-            {"params": self.encoder_layer2.parameters(), "lr": 1e-4},
-            {"params": self.decoder_layer2.parameters(), "lr": 1e-3},
-            {"params": self.decoder_layer1.parameters(), "lr": 1e-3},
-            {"params": self.output_layer.parameters(), "lr": 1e-3},
+            {"params": self.encoder_layer1.parameters(), "lr": 2e-6},
+            {"params": self.decoder_layer1.parameters(), "lr": 1e-4},
+            {"params": self.output_layer.parameters(), "lr": 1e-4},
         ]
         return Adam(optimizer_parameters)
 
     # -----------------------------------------------------------------------------------
     @torch.no_grad()
-    def memory(self, targets: Tensor) -> Tensor:
+    def sample_h2(self, targets: Tensor) -> Tensor:
         latent = self.teacher.encode(targets)
         return self.teacher.decoder.layer2(latent)
 
     # -----------------------------------------------------------------------------------
     def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
         _sensors, targets = batch
-        memory = self.memory(flatten(targets, start_dim=1))  # Detach by @torch.no_grad
-        h2 = self.decoder_layer2(memory)  # Detached by DFALayer
-        h1 = self.decoder_layer1(h2)  # Detached by HTLLayer
+        h2_teacher = self.sample_h2(flatten(targets, start_dim=1))  # Detach by @torch.no_grad
+        h1 = self.decoder_layer1(h2_teacher)  # Detached by HTLLayer
         logits = self.output_layer(h1)
         reconstruction = torch.sigmoid(logits)
-        return unflatten(reconstruction, 1, targets.shape[1:]), memory
+        return unflatten(reconstruction, 1, targets.shape[1:]), h2_teacher
 
     @torch.inference_mode()
     def encode(self, sensors: Tensor) -> Tensor:
         h1 = self.encoder_layer1(flatten(sensors, start_dim=1))
-        h2 = self.encoder_layer2(h1)
-        return h2
+        return h1
 
     @torch.inference_mode()
-    def decode(self, h2: Tensor) -> Tensor:
-        h1 = self.decoder_layer1(h2)
+    def decode(self, h1: Tensor) -> Tensor:
         reconstruction = unflatten(self.output_layer(h1), 1, self.output_shape)
         return torch.sigmoid(reconstruction)
 
@@ -176,8 +164,8 @@ class Autoencoder(pl.LightningModule):
     def feedback(self, reconstruction: Tensor, batch: Tensor) -> None:
         sensors, targets = batch
         x_incomplete, mask = sensors[:, 0], sensors[:, 1]
-        reconstruction = torch.nan_to_num(reconstruction, nan=0.5, posinf=1.0, neginf=0.0)
-        reconstruction = reconstruction.clamp_(0.0, 1.0)
+        # reconstruction = torch.nan_to_num(reconstruction, nan=0.5, posinf=1.0, neginf=0.0)
+        # reconstruction = reconstruction.clamp_(0.0, 1.0)
 
         # Create completion target for encoder/decoder feedback paths
         completion = x_incomplete * mask + reconstruction * (1 - mask)
@@ -185,11 +173,9 @@ class Autoencoder(pl.LightningModule):
         # Encoder DFA feedback uses error only on visible pixels
         error = reconstruction * mask - x_incomplete
         h1_target = self.encoder_layer1(flatten(completion, start_dim=1).detach())
-        h2_target = self.encoder_layer2(flatten(completion, start_dim=1).detach())
         self.encoder_layer1.feedback(error.flatten(start_dim=1))
-        self.encoder_layer2.feedback(error.flatten(start_dim=1))
-        self.decoder_layer1.feedback(h1_target.detach())
-        self.decoder_layer2.feedback(h2_target.detach())
+        h1_context = self.teacher.encoder.layer2(h1_target)
+        self.decoder_layer1.feedback(h1_target, h1_context)
 
         # Loss propagation for output layer
         loss_output = nn.BCELoss(reduction="mean")(reconstruction, completion.detach())
@@ -200,15 +186,29 @@ class Autoencoder(pl.LightningModule):
         self.optimizers().zero_grad()
         reconstruction, _h2_teacher = self(batch)
         self.feedback(reconstruction, batch)
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
         self.optimizers().step()
+        with torch.no_grad():
+            self.encoder_layer1.weight.renorm_(p=2, dim=0, maxnorm=0.5)
+            self.decoder_layer1.weight.renorm_(p=2, dim=0, maxnorm=0.5)
 
     # -----------------------------------------------------------------------------------
     def validation_step(self, batch: Tensor, batch_idx: int) -> List[Tensor]:
-        sensors, targets = batch
-        reconstruction, _h2_teacher = self(batch)
-        reconstruction_loss = nn.MSELoss(reduction="mean")(reconstruction, targets)
-        self.log("val/reconstruction_loss", reconstruction_loss, prog_bar=True)
+        _sensors, targets = batch
+        reconstruction, h2_teacher = self(batch)  # Detach by @torch.inference_mode
+        h1_decoder = self.decoder_layer1(h2_teacher)  # Detached by HTLLayer
+        h1_encoder = self.encoder_layer1(flatten(reconstruction, start_dim=1).detach())
+        self.log_metrics_x(reconstruction, targets)
+        self.log_metrics_h1(h1_decoder, h1_encoder)
+
+    def log_metrics_x(self, reconstruction: Tensor, targets: Tensor) -> None:
+        x_mseloss = F.mse_loss(reconstruction, targets, reduction="mean")
+        self.log("val/reconstruction_loss", x_mseloss, prog_bar=True, on_step=False, on_epoch=True)
+
+    def log_metrics_h1(self, h1_decoder: Tensor, h1_encoder: Tensor) -> None:
+        self.log("val/h1_mean", h1_encoder.mean(), prog_bar=False, on_step=False, on_epoch=True)
+        self.log("val/h1_std", h1_encoder.std(unbiased=False), prog_bar=False, on_step=False, on_epoch=True)
+        h1_mseloss = F.mse_loss(h1_decoder, h1_encoder.detach(), reduction="mean")
+        self.log("val/h1_mseloss", h1_mseloss, prog_bar=True, on_step=False, on_epoch=True)
 
 
 # -------------------------------------------------------------------------------------------
@@ -261,7 +261,7 @@ if __name__ == "__main__":
     teacher.load_state_dict(filtered, strict=True)
 
     # Initialize model with specified architecture
-    model = Autoencoder(experiment.output_shape, experiment.layer1_units, experiment.layer2_units, teacher)
+    model = Autoencoder(experiment.output_shape, experiment.layer1_units, teacher)
 
     # Initialize trainer
     trainer = pl.Trainer(
