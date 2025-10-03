@@ -37,7 +37,7 @@ class Experiment(BaseSettings):
     mask_ratio: float = Field(default=0.25, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
 
     # Training Settings
-    max_epochs: PositiveInt = Field(default=200, ge=1, le=1000, description="Maximum training epochs")
+    max_epochs: PositiveInt = Field(default=200, ge=1, description="Maximum training epochs")
 
     # Logging and Output Settings
     log_dir: str = Field(default="logs", description="Directory for experiment logs")
