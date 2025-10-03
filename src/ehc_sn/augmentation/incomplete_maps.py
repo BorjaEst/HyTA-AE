@@ -25,13 +25,14 @@ class ComposeParams(BaseModel):
     vflip_p: float = Field(default=0.5, ge=0.0, le=1.0, description="Vertical flip probability")
 
     # Corruption (incomplete maps)
-    mask_ratio: float = Field(default=0.65, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
+    mask_ratio: float = Field(default=0.75, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
     mask_value: float = Field(default=0.0, description="Value used for masked-out locations")
 
     # Visible-rectangle sampling (prevents always-centered visibility)
     keep_rects: int = Field(default=1, ge=1, le=8, description="Number of visible rectangles to keep (union)")
     aspect_min: float = Field(default=0.5, gt=0.0, description="Min aspect ratio (w/h) for visible rectangles")
     aspect_max: float = Field(default=2.0, gt=0.0, description="Max aspect ratio (w/h) for visible rectangles")
+    wrap_shift: bool = Field(default=True, description="Random cyclic shift to mask to uniformize pixel inclusion")
 
 
 # -------------------------------------------------------------------------------------------
@@ -52,12 +53,14 @@ class RandomMask:
         keep_rects: int = 1,
         aspect_min: float = 0.5,
         aspect_max: float = 2.0,
+        wrap_shift: bool = True,
     ):
         self.ratio = float(ratio)
         self.value = float(value)
         self.keep_rects = int(keep_rects)
         self.aspect_min = float(aspect_min)
         self.aspect_max = float(aspect_max)
+        self.wrap_shift = bool(wrap_shift)
         # Stores last mask (1,H,W): 1.0 where visible, mask_value where masked
         self.last_mask: Optional[Tensor] = None
 
@@ -97,6 +100,13 @@ class RandomMask:
             keep[i : i + vh, j : j + vw] = 1.0
 
         keep1 = keep.unsqueeze(0)  # (1,H,W)
+
+        # Random cyclic shift to remove border bias
+        if self.wrap_shift:
+            di = int(torch.randint(0, h, (1,), device=x.device))
+            dj = int(torch.randint(0, w, (1,), device=x.device))
+            keep1 = torch.roll(keep1, shifts=(di, dj), dims=(-2, -1))
+
         mask1 = keep1 * 1.0 + (1.0 - keep1) * self.value  # (1,H,W)
         self.last_mask = mask1
 
@@ -124,6 +134,7 @@ class Augmentation:
             keep_rects=self.params.keep_rects,
             aspect_min=self.params.aspect_min,
             aspect_max=self.params.aspect_max,
+            wrap_shift=self.params.wrap_shift,
         )
 
     # -----------------------------------------------------------------------------------
