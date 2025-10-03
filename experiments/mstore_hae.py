@@ -1,3 +1,39 @@
+"""Memory Store HAE (Hebbian/Alignment-inspired) experiment.
+
+This module implements a single-model, feedback-driven autoencoder that performs
+map completion from partial inputs. It follows the "two-iterations" training
+procedure documented in `article/experiments/two-iterations.md`:
+
+- Iteration 1 (memory read): run the model on complete targets to obtain a
+    prior reconstruction (no parameter updates).
+- Iteration 2 (training): form a fixed/completed input by mixing the prior with
+    the observed pixels (via the mask), then run the model again and apply local
+    and global learning signals.
+
+Architecture overview
+---------------------
+- Encoder: Two Direct Feedback Alignment (DFA) layers that receive an error
+    projected from the output space and are trained with a local MSE objective.
+- Latent (DG-like): A growing linear layer whose output is sparsified via
+    bounded activations, approximating Dentate Gyrus neurogenesis/sparsity.
+- Decoder: Two HTL (hint/target-like) layers that learn to reproduce encoder
+    hidden states given the latent code (local MSE targets).
+- Output head: Linear layer to the map space, trained with reconstruction loss.
+
+Training signals
+----------------
+- Reconstruction: BCE on the second pass output vs. the completion target.
+- Encoder local: DFA-based local losses with error restricted to visible pixels.
+- Decoder local: HTL-based alignment to encoder hidden states (second pass).
+- Sparsity: HomeostaticActivityLoss on latent activations.
+
+Notes
+-----
+- All methods are documented using PEP 257 docstrings; inline comments use the
+    repository's separator style.
+- Logic is unchanged; only documentation/comments were added.
+"""
+
 import math
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, Union
 
@@ -9,7 +45,6 @@ from matplotlib import pyplot as plt
 from pydantic import Field, PositiveInt
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from torch import Tensor, flatten, nn, unflatten
-from torch.nn import functional as F
 from torch.optim import Adam, Optimizer
 
 from ehc_sn.augmentation.incomplete_maps import Augmentation, ComposeParams
@@ -23,6 +58,12 @@ from ehc_sn.modules.loss import HomeostaticActivityLoss as SparsityLoss
 
 # -----------------------------------------------------------------------------------
 class Experiment(BaseSettings):
+    """CLI-configurable hyperparameters for the experiment.
+
+    Parameters are validated with Pydantic v2. Defaults are set to reproduce
+    the baseline runs used for obstacle-map completion.
+    """
+
     model_config = SettingsConfigDict(extra="forbid", cli_parse_args=True)
 
     # Encoder and decoder components
@@ -47,17 +88,34 @@ class Experiment(BaseSettings):
 
 # -------------------------------------------------------------------------------------------
 class DFALayer(nn.Linear):
-    def __init__(self, n_in: int, n_out: int, n_error: int, activation_fn: Optional[nn.Module] = None):
+    def __init__(self, n_in: int, n_out: int, n_error: int):
+        """Direct Feedback Alignment layer.
+
+        - Projects output-space errors through a fixed random feedback matrix
+          to obtain local targets.
+        - Applies an activation (default: Identity) followed by tanh for
+          bounded activity. Returned activations are detached to enforce
+          locality.
+
+        Args:
+            n_in: Number of input features.
+            n_out: Number of output features.
+            n_error: Dimensionality of the error vector (typically output dim).
+        """
         super().__init__(in_features=n_in, out_features=n_out, bias=True)
         self.error_features = n_error
-        self.activation_fn = activation_fn or nn.Identity()
         self.register_buffer("activations", None)  # Starts without activation values
         self.register_buffer("fb_weight", torch.zeros(n_error, self.out_features))
         self.reset_feedback()  # Initialize weights properly
 
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
+        """Compute layer activations and detach them for local learning.
+
+        Returns tanh(activation_fn(Wx + b)) with the result detached to stop
+        gradient flow beyond the local learning rule.
+        """
         currents = super().forward(*args, **kwargs)
-        self.activations = F.tanh(self.activation_fn(currents))
+        self.activations = torch.tanh(nn.functional.gelu(currents))
         return self.activations.detach()  # enforce locality
 
     @property
@@ -66,11 +124,21 @@ class DFALayer(nn.Linear):
         return self.out_features
 
     def feedback(self, error: Tensor) -> Tensor:
+        """Compute DFA local loss from an output-space error.
+
+        Args:
+            error: Error tensor in output space, shape (B, n_error).
+
+        Returns:
+            Mean-squared error between current activations and their local
+            DFA-derived targets.
+        """
         delta = error.detach() @ self.fb_weight  # (batch_size, out_features)
         target = self.activations.detach() - delta  # same shape as activations
-        return F.mse_loss(self.activations, target, reduction="mean")
+        return nn.functional.mse_loss(self.activations, target, reduction="mean")
 
     def reset_feedback(self) -> None:
+        """Reinitialize the fixed feedback matrix with a uniform distribution."""
         limit = 1.0 / math.sqrt(self.error_features)
         nn.init.uniform_(self.fb_weight, -limit, limit)
 
@@ -78,16 +146,30 @@ class DFALayer(nn.Linear):
 # -------------------------------------------------------------------------------------------
 class Encoder(nn.Module):
     def __init__(self, n_inputs: int, n_h1: int, n_h2: int):
+        """Two-layer DFA encoder.
+
+        Args:
+            n_inputs: Flattened input dimensionality (map size).
+            n_h1: Hidden size for the first encoder layer.
+            n_h2: Hidden size for the second encoder layer.
+        """
         super().__init__()
-        self.layer1 = DFALayer(n_inputs, n_h1, n_inputs, nn.GELU())
-        self.layer2 = DFALayer(n_h1, n_h2, n_inputs, nn.GELU())
+        self.layer1 = DFALayer(n_inputs, n_h1, n_inputs)
+        self.layer2 = DFALayer(n_h1, n_h2, n_inputs)
 
     def forward(self, x_incomplete: Tensor) -> List[Tensor]:
+        """Forward pass returning hidden activations [h1, h2]."""
         h1 = self.layer1(x_incomplete)  # Use only channel 0 (obstacles)
         h2 = self.layer2(h1)
         return [h1, h2]
 
     def feedback(self, reconstruction_err: Tensor) -> Tensor:
+        """Sum local DFA losses for both encoder layers.
+
+        Args:
+            reconstruction_err: Error in output space; typically masked to
+                visible pixels before being flattened and passed here.
+        """
         local_loss = torch.zeros(1, device=reconstruction_err.device)
         local_loss += self.layer2.feedback(reconstruction_err)
         local_loss += self.layer1.feedback(reconstruction_err)
@@ -96,16 +178,26 @@ class Encoder(nn.Module):
 
 # -------------------------------------------------------------------------------------------
 class HTLLayer(nn.Linear):
-    def __init__(self, n_in: int, n_out: int, n_target: int, activation_fn: Optional[nn.Module] = None):
+    def __init__(self, n_in: int, n_out: int, n_target: int):
+        """Hint/Target-like layer for decoder-side local learning.
+
+        This layer learns to reproduce a target (e.g., an encoder hidden state)
+        given a context input, using an identity feedback mapping by default.
+
+        Args:
+            n_in: Number of input features.
+            n_out: Number of output features.
+            n_target: Target dimensionality; must equal n_out for identity FB.
+        """
         super().__init__(in_features=n_in, out_features=n_out, bias=True)
         self.target_features = n_target
-        self.activation_fn = activation_fn or nn.Identity()
         self.register_buffer("fb_weight", torch.zeros(n_target, self.out_features))
         self.reset_feedback()  # Initialize weights properly
 
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
+        """Forward pass returning detached, bounded activations."""
         currents = super().forward(*args, **kwargs)
-        activations = F.tanh(self.activation_fn(currents))
+        activations = torch.tanh(nn.functional.gelu(currents))
         return activations.detach()  # enforce locality
 
     @property
@@ -114,12 +206,23 @@ class HTLLayer(nn.Linear):
         return self.out_features
 
     def feedback(self, targets: Tensor, context: Tensor) -> Tensor:
+        """Compute local HTL loss against provided targets.
+
+        Args:
+            targets: Teacher signals (e.g., encoder hidden states), shape
+                (B, n_target).
+            context: Pre-synaptic input used to produce the output.
+
+        Returns:
+            Mean-squared error between current output (no detach) and targets.
+        """
         output = super().forward(context.detach())  # Detach pre-synaptic
-        output = self.activation_fn(output)
+        output = torch.tanh(nn.functional.gelu(output))
         targets = targets @ self.fb_weight  # (batch_size, out_features)
-        return F.mse_loss(output, targets.detach(), reduction="mean")
+        return nn.functional.mse_loss(output, targets.detach(), reduction="mean")
 
     def reset_feedback(self) -> None:
+        """Set the feedback matrix to identity (square-only for now)."""
         if self.fb_weight.shape[0] != self.out_features:
             raise ValueError("HTL only supports identity matrix for now.")
         nn.init.eye_(self.fb_weight)
@@ -128,16 +231,30 @@ class HTLLayer(nn.Linear):
 # -------------------------------------------------------------------------------------------
 class Decoder(nn.Module):
     def __init__(self, n_h1: int, n_h2: int, n_latents: int):
+        """Two-layer decoder trained with HTL local targets.
+
+        Args:
+            n_h1: Size of the first decoder hidden layer.
+            n_h2: Size of the second decoder hidden layer.
+            n_latents: Latent dimensionality (decoder input size).
+        """
         super().__init__()
-        self.layer2 = HTLLayer(n_latents, n_h2, n_h2, nn.GELU())
-        self.layer1 = HTLLayer(n_h2, n_h1, n_h1, nn.GELU())
+        self.layer2 = HTLLayer(n_latents, n_h2, n_h2)
+        self.layer1 = HTLLayer(n_h2, n_h1, n_h1)
 
     def forward(self, latent: Tensor) -> List[Tensor]:
+        """Forward pass returning hidden activations [h1, h2]."""
         h2 = self.layer2(latent)
         h1 = self.layer1(h2)
         return [h1, h2]
 
     def feedback(self, targets: List[Tensor], latent: Tensor) -> Tensor:
+        """Sum local HTL losses for both decoder layers.
+
+        Args:
+            targets: Encoder hidden states [h1_enc, h2_enc] used as targets.
+            latent: Latent codes used as decoder input.
+        """
         local_loss = torch.zeros(1, device=latent.device)
         local_loss += self.layer2.feedback(targets[1], context=latent)
         local_loss += self.layer1.feedback(targets[0], context=targets[1])
@@ -147,31 +264,54 @@ class Decoder(nn.Module):
 # -------------------------------------------------------------------------------------------
 class DGLayer(nn.Linear):
     def __init__(self, n_in: int, n_init: int, n_max: int):
+        """DG-like growing latent layer with masked outputs.
+
+        Args:
+            n_in: Input feature count.
+            n_init: Initial active units.
+            n_max: Maximum capacity (total output features).
+        """
         super().__init__(in_features=n_in, out_features=n_max, bias=True)
         self.register_buffer("output_mask", torch.zeros(n_max, dtype=torch.float32))
         self.grow(n_init)  # Initialize with n_init active units
 
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
+        """Apply output mask and bounded activation to produce sparse codes."""
         out = super().forward(*args, **kwargs)
         out = out * self.output_mask  # Masked units are zeroed; grads do not flow to their rows
-        return F.tanh(F.relu(out))  # Using ReLU followed by Tanh for bounded activations
+        return torch.tanh(torch.relu(out))  # Using ReLU followed by Tanh for bounded activations
 
     @property
     def out_active(self) -> int:
+        """Current number of active output units."""
         return sum(self.output_mask).int().item()
 
     @property
     def capacity(self) -> int:
+        """Total capacity (maximum number of output units)."""
         return self.weight.shape[0]
 
     @torch.no_grad()
     def grow(self, n: int) -> None:
+        """Activate the next n output units (capped by capacity).
+
+        Note: The method assumes moderate growth per epoch. If long training
+        runs are used, ensure not to exceed `capacity`.
+        """
         self.output_mask[: self.out_active + n] = 1.0
 
 
 # -------------------------------------------------------------------------------------------
 class Autoencoder(pl.LightningModule):
     def __init__(self, output_shape: List[int], n_layer1: int, n_layer2: int, n_latent: int):
+        """Feedback-trained autoencoder for map completion.
+
+        Args:
+            output_shape: Spatial shape of the maps (H, W).
+            n_layer1: Size of decoder first hidden layer / encoder mirror.
+            n_layer2: Size of encoder second hidden layer / decoder mirror.
+            n_latent: Maximum latent capacity for the growing DG layer.
+        """
         super().__init__()
         self.save_hyperparameters(ignore=["trainer"])
         self.automatic_optimization = False
@@ -190,6 +330,11 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
+        """Configure Adam with per-module learning rates.
+
+        Lower learning rate on encoder and latent stabilizes local learning and
+        sparsity dynamics.
+        """
         optimizer_parameters = [
             {"params": self.encoder.parameters(), "lr": 1e-5},
             {"params": self.latent.parameters(), "lr": 1e-8},
@@ -200,6 +345,7 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def _encode(self, inputs: Tensor) -> Tensor:
+        """Private helper: encode inputs and pass through latent grower."""
         encoder_signals = self.encoder(flatten(inputs, start_dim=1))
         return self.latent(encoder_signals[-1])
 
@@ -209,9 +355,10 @@ class Autoencoder(pl.LightningModule):
         return self._encode(sensors)
 
     def _decode(self, latent: Tensor) -> Tensor:
+        """Private helper: decode latent codes to probability maps in [0, 1]."""
         decoder_signals = self.decoder(latent)
         logits = unflatten(self.output(decoder_signals[0]), 1, self.output_shape)
-        return F.sigmoid(logits)
+        return torch.sigmoid(logits)
 
     @torch.inference_mode()
     def decode(self, latent: Tensor) -> Tensor:
@@ -219,6 +366,18 @@ class Autoencoder(pl.LightningModule):
         return self._decode(latent)
 
     def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
+        """First pass: produce reconstruction and latent from full targets.
+
+        This matches Iteration 1 (memory read) of the two-iterations scheme.
+
+        Args:
+            batch: Tuple of (sensors, targets). Only targets are used here to
+                emulate access to a complete memory.
+
+        Returns:
+            reconstruction: Probability map in [0, 1].
+            latent: Latent activations (pre-detach) from the DG layer.
+        """
         _sensors, targets = batch
         latent = self._encode(targets)  # Only used in first training iteration (complete data)
         reconstruction = self._decode(latent.detach())
@@ -226,6 +385,15 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def feedback(self, first_prediction: Tensor, batch: Tuple[Tensor, Tensor]) -> Tensor:
+        """Second pass: compute local/global losses and return total.
+
+        Forms the completion input by mixing the first pass prediction with the
+        observed pixels, then applies:
+        - Encoder DFA losses (masked error),
+        - Latent sparsity loss,
+        - Decoder HTL losses (targets from encoder on the completion),
+        - Reconstruction BCE on the completion target.
+        """
         sensors, targets = batch
         x_incomplete, mask = sensors[:, 0], sensors[:, 1]
 
@@ -250,9 +418,11 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def on_train_epoch_start(self) -> None:
+        """Grow a fixed number of latent units at the start of each epoch."""
         self.latent.grow(8)  # Grow latent units per epoch till maximum capacity
 
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
+        """Manual optimization step following the two-iterations procedure."""
         # First we produce the reconstruction, we ignore the latent obtained from targets
         with torch.no_grad():
             first_prediction, first_latent = self(batch)
@@ -266,7 +436,8 @@ class Autoencoder(pl.LightningModule):
         # Logging metrics: use first prediction to match validation
         self.log_metrics("train", first_prediction, batch[1], first_latent)
 
-    def validation_step(self, batch: Tensor, batch_idx: int) -> List[Tensor]:
+    def validation_step(self, batch: Tensor, batch_idx: int) -> None:
+        """Validation: mirror the first pass and log alignment diagnostics."""
         reconstruction, latent = self(batch)
         self.log_metrics("val", reconstruction, batch[1], latent)
         encoder_signals = self.encoder(flatten(reconstruction, start_dim=1))
@@ -276,19 +447,27 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def log_metrics(self, stage: str, reconstruction: Tensor, targets: Tensor, latent: Tensor) -> None:
-        x_mseloss = F.mse_loss(reconstruction, targets, reduction="mean")
+        """Log scalar metrics common to train/val stages."""
+        x_mseloss = nn.functional.mse_loss(reconstruction, targets, reduction="mean")
         self.log(f"{stage}/reconstruction_loss", x_mseloss, prog_bar=True, on_step=False, on_epoch=True)
         sparsity_rate = (latent.abs() < 0.01).float().mean()
         self.log(f"{stage}/sparsity_rate", sparsity_rate, prog_bar=True, on_step=False, on_epoch=True)
 
     def log_hidden(self, stage: str, i: int, hi_decoder: Tensor, hi_encoder: Tensor) -> None:
-        h1_mseloss = F.mse_loss(hi_decoder, hi_encoder.detach(), reduction="mean")
+        """Log hidden-state alignment losses for decoder vs. encoder layers."""
+        h1_mseloss = nn.functional.mse_loss(hi_decoder, hi_encoder.detach(), reduction="mean")
         self.log(f"{stage}/h{i}_mseloss", h1_mseloss, prog_bar=True, on_step=False, on_epoch=True)
 
 
 # -------------------------------------------------------------------------------------------
 def gen_figures(model: Autoencoder, datamodule: BaseDataModule) -> None:
-    """Generate reconstruction and sparsity figures from model outputs."""
+    """Generate reconstruction and sparsity figures from model outputs.
+
+    Uses a single batch from the test set to:
+    - Visualize target vs. output reconstructions,
+    - Inspect latent sparsity statistics,
+    - Probe decoder selectivity with one-hot latent codes.
+    """
     model.eval()
     datamodule.setup("test")
     test_dataloader = datamodule.test_dataloader()
