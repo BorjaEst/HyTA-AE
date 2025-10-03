@@ -34,7 +34,7 @@ class Experiment(BaseSettings):
     # Data and augmentation parameters
     data: DataParams = Field(default_factory=DataParams, description="Data generation parameters")
     num_samples: PositiveInt = Field(default=4000, ge=100, le=10000, description="Number of samples to generate")
-    mask_ratio: float = Field(default=0.25, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
+    mask_ratio: float = Field(default=0.65, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
 
     # Training Settings
     max_epochs: PositiveInt = Field(default=200, ge=1, description="Maximum training epochs")
