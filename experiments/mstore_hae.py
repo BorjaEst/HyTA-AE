@@ -33,7 +33,7 @@ class Experiment(BaseSettings):
 
     # Data and augmentation parameters
     data: DataParams = Field(default_factory=DataParams, description="Data generation parameters")
-    datamodule: DataModuleParams = Field(default_factory=DataModuleParams, description="Data module parameters")
+    num_samples: PositiveInt = Field(default=4000, ge=100, le=10000, description="Number of samples to generate")
     mask_ratio: float = Field(default=0.25, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
 
     # Training Settings
@@ -329,7 +329,8 @@ if __name__ == "__main__":
     composition_params = ComposeParams(mask_ratio=experiment.mask_ratio)
     augmentation = Augmentation(composition_params)
     data_gen = DataGenerator(experiment.data, augmentation)
-    datamodule = BaseDataModule(data_gen, experiment.datamodule)
+    datamodule_params = DataModuleParams(num_samples=experiment.num_samples)
+    datamodule = BaseDataModule(data_gen, datamodule_params)
 
     # Initialize model with specified architecture
     model = Autoencoder(
