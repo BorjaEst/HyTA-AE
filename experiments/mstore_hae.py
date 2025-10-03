@@ -219,8 +219,8 @@ class Autoencoder(pl.LightningModule):
         return self._decode(latent)
 
     def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
-        sensors, _targets = batch
-        latent = self._encode(sensors[:, 0])  # Use channel 0 with masked targets
+        _sensors, targets = batch
+        latent = self._encode(targets)  # Only used in first training iteration (complete data)
         reconstruction = self._decode(latent.detach())
         return reconstruction, latent
 
