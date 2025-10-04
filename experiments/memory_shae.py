@@ -167,8 +167,8 @@ class DFALayer(nn.Linear):
 
     def reset_feedback(self) -> None:
         """Reinitialize the fixed feedback matrix with a uniform distribution."""
-        limit = 1.0 / math.sqrt(self.error_features)
-        nn.init.uniform_(self.fb_weight, -limit, limit)
+        inv_limit = math.sqrt(self.error_features)
+        self.fb_weight.bernoulli_(0.5).mul_(2).sub_(1).div_(inv_limit)
 
 
 # -------------------------------------------------------------------------------------------
