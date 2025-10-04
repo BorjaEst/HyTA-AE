@@ -418,10 +418,6 @@ class Autoencoder(pl.LightningModule):
     def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
         """Iteration 1 (current placeholder): reconstruction/latent from targets.
 
-        SHAE goal (TODO): Use partial sensors (sensors[:, 0]) and a recurrent
-        settle in decoder.layer2 to recover the closest stored state (latent).
-        This method currently mirrors the HAE behavior for compatibility.
-
         Args:
             batch: Tuple of (sensors, targets). Targets are used here but will
                 be replaced by partial sensors in the SHAE refactor.
@@ -430,8 +426,8 @@ class Autoencoder(pl.LightningModule):
             reconstruction: Probability map in [0, 1].
             latent: Latent activations (pre-detach) from the DG layer.
         """
-        _sensors, targets = batch
-        latent = self._encode(targets)  # Only used in first training iteration (complete data)
+        sensors, _targets = batch
+        latent = self._encode(sensors[:, 0])  # Use only channel 0 (obstacles)
         reconstruction = self._decode(latent.detach())
         return reconstruction, latent
 
