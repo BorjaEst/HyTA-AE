@@ -37,17 +37,15 @@ Notes and TODOs
 - The current implementation still mirrors the previous memory-store HAE logic
     and uses targets in the first pass. The following tasks are planned:
     - TODO(SHAE): Make decoder.layer2 recurrent (simple fixed-point iteration or
-        RNN block) and add a settling loop with parameters:
-        - max_settle_steps (e.g., 8–32),
-        - settle_tolerance (e.g., 1e-4 in L2 norm),
-        - settle_damping (optional, 0<gamma<=1).
+        RNN block) and add a settling loop with a fixed number of iterations
+        controlled by `settle_iterations`.
     - TODO(SHAE): Change `Autoencoder.forward` to take partial sensors input
         (sensors[:, 0]) and run the recurrent settle to obtain the attractor state
         before decoding the first reconstruction.
     - TODO(SHAE): Keep using mask channel (sensors[:, 1]) to compute completion
         targets and mask-aware DFA errors as in the HAE experiment.
-    - TODO(SHAE): Add Pydantic config parameters to `Experiment` for the settle
-        procedure (max steps, tolerance, damping) and logging switches.
+    - TODO(SHAE): Use the `settle_iterations` parameter from `Experiment` to
+        control the number of decoder layer2 recurrent iterations in Iteration 1.
     - TODO(SHAE): Add validation visualizations to inspect convergence traces of
         the recurrent layer per sample (optional).
 
@@ -83,13 +81,7 @@ class Experiment(BaseSettings):
     """CLI-configurable hyperparameters for SHAE.
 
     Parameters are validated with Pydantic v2. Defaults are set to reproduce
-    baseline runs. SHAE-specific parameters will be introduced in a later
-    change without altering the public API of this module yet.
-
-    Future additions (not yet implemented):
-    - max_settle_steps: int — maximum recurrent iterations in decoder.layer2.
-    - settle_tolerance: float — early-stop tolerance for fixed-point settling.
-    - settle_damping: float — optional damping factor in [0, 1].
+    baseline runs.
     """
 
     model_config = SettingsConfigDict(extra="forbid", cli_parse_args=True)
@@ -112,6 +104,7 @@ class Experiment(BaseSettings):
     log_dir: str = Field(default="logs", description="Directory for experiment logs")
     experiment_name: str = Field("mstore_hae", description="Experiment name")
     checkpoint_freq: PositiveInt = Field(default=5, ge=1, le=50, description="Checkpoint frequency")
+    settle_iterations: PositiveInt = Field(default=12, ge=1, description="Recurrent iterations for attractor.")
 
 
 # -------------------------------------------------------------------------------------------
