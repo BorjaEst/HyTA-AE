@@ -255,10 +255,9 @@ class Decoder(nn.Module):
             targets: Encoder hidden states [h1_enc, h2_enc] used as targets.
             latent: Latent codes used as decoder input.
         """
-        local_loss = torch.zeros(1, device=latent.device)
-        local_loss += self.layer2.feedback(targets[1], context=latent)
-        local_loss += self.layer1.feedback(targets[0], context=targets[1])
-        return local_loss
+        loss_l2 += self.layer2.feedback(targets[1], context=latent)
+        loss_l1 += self.layer1.feedback(targets[0], context=targets[1])
+        return loss_l2 + loss_l1
 
 
 # -------------------------------------------------------------------------------------------
