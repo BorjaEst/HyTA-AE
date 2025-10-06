@@ -32,23 +32,6 @@ Training signals
 - Decoder local: HTL-based alignment to encoder hidden states (second pass).
 - Sparsity: HomeostaticActivityLoss on latent activations.
 
-Notes and TODOs
----------------
-- The current implementation still mirrors the previous memory-store HAE logic
-    and uses targets in the first pass. The following tasks are planned:
-    - TODO(SHAE): Make decoder.layer2 recurrent (simple fixed-point iteration or
-        RNN block) and add a settling loop with a fixed number of iterations
-        controlled by `settle_iterations`.
-    - TODO(SHAE): Change `Autoencoder.forward` to take partial sensors input
-        (sensors[:, 0]) and run the recurrent settle to obtain the attractor state
-        before decoding the first reconstruction.
-    - TODO(SHAE): Keep using mask channel (sensors[:, 1]) to compute completion
-        targets and mask-aware DFA errors as in the HAE experiment.
-    - TODO(SHAE): Use the `settle_iterations` parameter from `Experiment` to
-        control the number of decoder layer2 recurrent iterations in Iteration 1.
-    - TODO(SHAE): Add validation visualizations to inspect convergence traces of
-        the recurrent layer per sample (optional).
-
 All methods have PEP 257 docstrings and inline comments use the repository's
 separator style. Logic is not modified in this refactor step; only
 documentation/comments and TODOs are added.
@@ -87,6 +70,7 @@ class Experiment(BaseSettings):
     model_config = SettingsConfigDict(extra="forbid", cli_parse_args=True)
 
     # Encoder and decoder components
+    state_iterations: PositiveInt = Field(default=18, ge=1, description="Recurrent iterations for attractor.")
     latent_units: PositiveInt = Field(default=2000, gt=0, description="Dimensionality of the latent code.")
     layer2_units: PositiveInt = Field(default=400, gt=0, description="Number of hidden units per layer.")
     layer1_units: PositiveInt = Field(default=5000, gt=0, description="Number of hidden units per layer.")
@@ -95,16 +79,17 @@ class Experiment(BaseSettings):
     # Data and augmentation parameters
     data: DataParams = Field(default_factory=DataParams, description="Data generation parameters")
     num_samples: PositiveInt = Field(default=4000, ge=100, le=10000, description="Number of samples to generate")
-    mask_ratio: float = Field(default=0.65, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
+    mask_ratio: float = Field(
+        default=0.65, ge=0.0, le=1.0, description="Fraction of spatial locations to mask"
+    )  # TODO: First we are testing with no masking
 
     # Training Settings
-    max_epochs: PositiveInt = Field(default=200, ge=1, description="Maximum training epochs")
+    max_epochs: PositiveInt = Field(default=400, ge=1, description="Maximum training epochs")
 
     # Logging and Output Settings
     log_dir: str = Field(default="logs", description="Directory for experiment logs")
-    experiment_name: str = Field("mstore_hae", description="Experiment name")
+    experiment_name: str = Field("memory_shae", description="Experiment name")
     checkpoint_freq: PositiveInt = Field(default=5, ge=1, le=50, description="Checkpoint frequency")
-    settle_iterations: PositiveInt = Field(default=12, ge=1, description="Recurrent iterations for attractor.")
 
 
 # -------------------------------------------------------------------------------------------
@@ -198,6 +183,39 @@ class Encoder(nn.Module):
 
 
 # -------------------------------------------------------------------------------------------
+class HTLRNNLayer(nn.RNN):
+    def __init__(self, n_in: int, n_out: int, n_target: int):
+        if n_out != n_target:
+            raise ValueError("HTLRNNLayer requires n_out == n_target for identity FB.")
+        super().__init__(n_in, n_out, bias=True, dropout=0.0, batch_first=True)
+        self.target_features = n_target
+        self.register_buffer("activations", None)
+        self.register_buffer("fb_weight", torch.eye(n_out))
+        self.reset_feedback()
+
+    def forward(self, drive: Tensor, h: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+        drive_seq = drive.unsqueeze(1)  # (B, 1, n_in)
+        out, h_n = super().forward(drive_seq, h)  # out: (B, T, H), h_n: (1, B, H)
+        h_cur = torch.tanh(nn.functional.gelu(h_n.squeeze(0)))  # (B, H)
+        self.activations = h_cur  # keep for feedback (no detach)
+        return h_cur.detach(), h_n
+
+    @torch.no_grad()
+    def settle(self, drive: Tensor, steps: int) -> Tensor:
+        h: Optional[Tensor] = None
+        for _ in range(steps):
+            act, h = self.forward(drive, h)
+        return act  # (B, H)
+
+    def feedback(self, targets: Tensor) -> Tensor:
+        mapped = targets @ self.fb_weight  # identity mapping
+        return nn.functional.mse_loss(self.activations, mapped.detach(), reduction="mean")
+
+    def reset_feedback(self) -> None:
+        """Set the feedback matrix to identity (square-only for now)."""
+        nn.init.eye_(self.fb_weight)
+
+
 class HTLLayer(nn.Linear):
     def __init__(self, n_in: int, n_out: int, n_target: int):
         """Hint/Target-like layer for decoder-side local learning.
@@ -210,6 +228,8 @@ class HTLLayer(nn.Linear):
             n_out: Number of output features.
             n_target: Target dimensionality; must equal n_out for identity FB.
         """
+        if n_out != n_target:
+            raise ValueError("HTLLayer requires n_out == n_target for identity FB.")
         super().__init__(in_features=n_in, out_features=n_out, bias=True)
         self.target_features = n_target
         self.register_buffer("fb_weight", torch.zeros(n_target, self.out_features))
@@ -237,45 +257,43 @@ class HTLLayer(nn.Linear):
         Returns:
             Mean-squared error between current output (no detach) and targets.
         """
-        output = super().forward(context.detach())  # Detach pre-synaptic
-        output = torch.tanh(nn.functional.gelu(output))
-        targets = targets @ self.fb_weight  # (batch_size, out_features)
-        return nn.functional.mse_loss(output, targets.detach(), reduction="mean")
+        outputs = super().forward(context.detach())  # Detach pre-synaptic
+        outputs = torch.tanh(nn.functional.gelu(outputs))
+        mapped = targets @ self.fb_weight  # identity
+        return nn.functional.mse_loss(outputs, mapped.detach(), reduction="mean")
 
     def reset_feedback(self) -> None:
         """Set the feedback matrix to identity (square-only for now)."""
-        if self.fb_weight.shape[0] != self.out_features:
-            raise ValueError("HTL only supports identity matrix for now.")
         nn.init.eye_(self.fb_weight)
 
 
 # -------------------------------------------------------------------------------------------
 class Decoder(nn.Module):
-    def __init__(self, n_h1: int, n_h2: int, n_latents: int):
-        """Two-layer decoder trained with HTL local targets.
+    def __init__(self, n_h1: int, n_h2: int, n_latents: int, state_iterations: int):
+        """Decoder with an inline recurrent attractor (layer2) and HTL layer1.
 
-        SHAE note:
-        - layer2 will become recurrent to implement attractor dynamics used in
-          the first iteration (state recall). For now it remains feed-forward
-          until the refactor lands.
+        Recurrent dynamics are implemented directly in ``forward`` using:
+
+            h_{t+1} = tanh( GELU( W_in * latent + W_rec * h_t + b ) )
+
+        Run for a fixed number of iterations (no adaptive early stop) specified
+        externally by `state_iterations`. The final settled activation acts as
+        a recalled state aiding pattern completion from partial cues.
 
         Args:
-            n_h1: Size of the first decoder hidden layer.
-            n_h2: Size of the second decoder hidden layer.
-            n_latents: Latent dimensionality (decoder input size).
+            n_h1: Hidden size for decoder layer1 (HTL trained).
+            n_h2: Hidden size for decoder recurrent layer2 (HTL trained).
+            n_latents: Dimensionality of latent code input.
+            state_iterations: Fixed number of recurrent refinement steps.
         """
         super().__init__()
-        self.layer2 = HTLLayer(n_latents, n_h2, n_h2)
+        self.layer2 = HTLRNNLayer(n_latents, n_h2, n_h2)
         self.layer1 = HTLLayer(n_h2, n_h1, n_h1)
+        self.l2rcc = nn.Linear(n_h2, n_h2, bias=False)
+        self.state_iterations = state_iterations
 
     def forward(self, latent: Tensor) -> List[Tensor]:
-        """Forward pass returning hidden activations [h1, h2].
-
-        TODO(SHAE): When layer2 becomes recurrent, add an optional settle path
-        here or expose a dedicated `settle` method that iterates layer2 until
-        convergence. Keep this function simple and side-effect free.
-        """
-        h2 = self.layer2(latent)
+        h2 = self.layer2.settle(latent, self.state_iterations)
         h1 = self.layer1(h2)
         return [h1, h2]
 
@@ -285,14 +303,10 @@ class Decoder(nn.Module):
         Args:
             targets: Encoder hidden states [h1_enc, h2_enc] used as targets.
             latent: Latent codes used as decoder input.
-
-        Returns:
-            Local MSE loss accumulated over both decoder layers.
         """
-        local_loss = torch.zeros(1, device=latent.device)
-        local_loss += self.layer2.feedback(targets[1], context=latent)
-        local_loss += self.layer1.feedback(targets[0], context=targets[1])
-        return local_loss
+        loss_l2 = self.layer2.feedback(targets[1])
+        loss_l1 = self.layer1.feedback(targets[0], context=targets[1])
+        return loss_l2 + loss_l1
 
 
 # -------------------------------------------------------------------------------------------
@@ -337,7 +351,7 @@ class DGLayer(nn.Linear):
 
 # -------------------------------------------------------------------------------------------
 class Autoencoder(pl.LightningModule):
-    def __init__(self, output_shape: List[int], n_layer1: int, n_layer2: int, n_latent: int):
+    def __init__(self, output_shape: List[int], n_layer1: int, n_layer2: int, n_latent: int, state_iterations: int):
         """State Hybrid Autoencoder for map completion.
 
         Args:
@@ -345,6 +359,7 @@ class Autoencoder(pl.LightningModule):
             n_layer1: Size of decoder first hidden layer / encoder mirror.
             n_layer2: Size of encoder second hidden layer / decoder mirror.
             n_latent: Maximum latent capacity for the growing DG layer.
+            state_iterations: Fixed number of recurrent iterations in decoder layer2.
         """
         super().__init__()
         self.save_hyperparameters(ignore=["trainer"])
@@ -355,7 +370,7 @@ class Autoencoder(pl.LightningModule):
         # Initialize encoder and decoder (decoder.layer2 will be recurrent in SHAE)
         self.encoder = Encoder(n_output, n_layer1, n_layer2)
         self.latent = DGLayer(n_layer2, n_latent // 10, n_latent)
-        self.decoder = Decoder(n_layer1, n_layer2, n_latent)
+        self.decoder = Decoder(n_layer1, n_layer2, n_latent, state_iterations)
         self.output = nn.Linear(n_layer1, n_output)
 
         # Loss functions
@@ -394,12 +409,8 @@ class Autoencoder(pl.LightningModule):
         return self._encode(sensors)
 
     def _decode(self, latent: Tensor) -> Tensor:
-        """Private helper: decode latent codes to probability maps in [0, 1].
-
-        TODO(SHAE): When the recurrent settle is available, decoding after the
-        attractor will be applied here (no change required to the API).
-        """
-        decoder_signals = self.decoder(latent)
+        """Private helper: decode latent codes to probability maps in [0, 1]."""
+        decoder_signals = self.decoder(latent)  # uses configured settle iterations
         logits = unflatten(self.output(decoder_signals[0]), 1, self.output_shape)
         return torch.sigmoid(logits)
 
@@ -574,6 +585,7 @@ if __name__ == "__main__":
         n_layer1=experiment.layer1_units,
         n_layer2=experiment.layer2_units,
         n_latent=experiment.latent_units,
+        state_iterations=experiment.state_iterations,
     )
 
     # Initialize trainer
