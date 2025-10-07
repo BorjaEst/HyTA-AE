@@ -170,10 +170,9 @@ class Encoder(nn.Module):
             reconstruction_err: Error in output space; typically masked to
                 visible pixels before being flattened and passed here.
         """
-        local_loss = torch.zeros(1, device=reconstruction_err.device)
-        local_loss += self.layer2.feedback(reconstruction_err)
-        local_loss += self.layer1.feedback(reconstruction_err)
-        return local_loss
+        loss_l1 = self.layer2.feedback(reconstruction_err)
+        loss_l2 = self.layer1.feedback(reconstruction_err)
+        return loss_l1 + loss_l2
 
 
 # -------------------------------------------------------------------------------------------
@@ -255,8 +254,8 @@ class Decoder(nn.Module):
             targets: Encoder hidden states [h1_enc, h2_enc] used as targets.
             latent: Latent codes used as decoder input.
         """
-        loss_l2 += self.layer2.feedback(targets[1], context=latent)
-        loss_l1 += self.layer1.feedback(targets[0], context=targets[1])
+        loss_l2 = self.layer2.feedback(targets[1], context=latent)
+        loss_l1 = self.layer1.feedback(targets[0], context=targets[1])
         return loss_l2 + loss_l1
 
 
@@ -408,12 +407,12 @@ class Autoencoder(pl.LightningModule):
         reconstruction = self._decode(latent.detach())
 
         # Train the autoencoder layers with dfa, sparsity, htl and standard loss
-        local_loss = self.encoder.feedback(flatten(error, start_dim=1))
-        local_loss += self.sparsity_loss(latent)
-        local_loss += self.decoder.feedback(decoder_targets, latent.detach())
-        local_loss += self.reconstruction_loss(reconstruction, completion.detach())
+        local_l1 = self.encoder.feedback(flatten(error, start_dim=1))
+        local_l2 = self.decoder.feedback(decoder_targets, latent.detach())
+        local_l3 = self.reconstruction_loss(reconstruction, completion.detach())
+        local_l4 = self.sparsity_loss(latent)
 
-        return local_loss
+        return local_l1 + local_l2 + local_l3 + local_l4
 
     # -----------------------------------------------------------------------------------
     def on_train_epoch_start(self) -> None:
