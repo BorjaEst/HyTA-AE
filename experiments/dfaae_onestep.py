@@ -56,8 +56,7 @@ class DFALayer(nn.Linear):
 
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
         currents = super().forward(*args, **kwargs)
-        # self.activations = torch.tanh(nn.functional.gelu(currents))
-        self.activations = nn.functional.gelu(currents)
+        self.activations = torch.tanh(nn.functional.gelu(currents))
         return self.activations.detach()  # enforce locality
 
     @property
@@ -131,7 +130,7 @@ class Autoencoder(pl.LightningModule):
     def configure_optimizers(self) -> Optimizer:
         optimizer_parameters = [
             {"params": self.encoder.parameters(), "lr": 1e-5},
-            {"params": self.latent.parameters(), "lr": 2e-6},
+            {"params": self.latent.parameters(), "lr": 1e-5},
             {"params": self.decoder.parameters(), "lr": 1e-4},
             {"params": self.output.parameters(), "lr": 1e-4},
         ]
@@ -141,7 +140,7 @@ class Autoencoder(pl.LightningModule):
     def _encode(self, inputs: Tensor) -> Tensor:
         encoder_signals = self.encoder(flatten(inputs, start_dim=1))
         activations = self.latent(encoder_signals[-1])
-        return nn.functional.relu(activations)
+        return torch.tanh(nn.functional.relu(activations))
 
     @torch.inference_mode()
     def encode(self, sensors: Tensor) -> Tensor:

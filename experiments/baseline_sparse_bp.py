@@ -53,8 +53,8 @@ class Encoder(nn.Module):
         self.layer2 = nn.Linear(n_h1, n_h2)
 
     def forward(self, x: Tensor) -> List[Tensor]:
-        h1 = nn.functional.gelu(self.layer1(x))
-        h2 = nn.functional.gelu(self.layer2(h1))
+        h1 = torch.tanh(nn.functional.gelu(self.layer1(x)))
+        h2 = torch.tanh(nn.functional.gelu(self.layer2(h1)))
         return [h1, h2]
 
 
@@ -66,8 +66,8 @@ class Decoder(nn.Module):
         self.layer1 = nn.Linear(n_h2, n_h1)
 
     def forward(self, latent: Tensor) -> List[Tensor]:
-        h2 = nn.functional.gelu(self.layer2(latent))
-        h1 = nn.functional.gelu(self.layer1(h2))
+        h2 = torch.tanh(nn.functional.gelu(self.layer2(latent)))
+        h1 = torch.tanh(nn.functional.gelu(self.layer1(h2)))
         return [h1, h2]
 
 
@@ -92,7 +92,7 @@ class Autoencoder(pl.LightningModule):
     def configure_optimizers(self) -> Optimizer:
         optimizer_parameters = [
             {"params": self.encoder.parameters(), "lr": 1e-5},
-            {"params": self.latent.parameters(), "lr": 2e-6},
+            {"params": self.latent.parameters(), "lr": 1e-5},
             {"params": self.decoder.parameters(), "lr": 1e-4},
             {"params": self.output.parameters(), "lr": 1e-4},
         ]
@@ -102,7 +102,7 @@ class Autoencoder(pl.LightningModule):
     def _encode(self, inputs: Tensor) -> Tensor:
         encoder_signals = self.encoder(flatten(inputs, start_dim=1))
         latent = self.latent(encoder_signals[-1])
-        return nn.functional.relu(latent)  # Nonlinearity on latent code
+        return torch.tanh(nn.functional.relu(latent))  # Nonlinearity on latent code
 
     @torch.inference_mode()
     def encode(self, sensors: Tensor) -> Tensor:

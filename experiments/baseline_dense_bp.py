@@ -28,7 +28,6 @@ class Experiment(BaseSettings):
     latent_size: PositiveInt = Field(default=2000, gt=0, description="Dimensionality of the latent code.")
     layer2_size: PositiveInt = Field(default=400, gt=0, description="Number of hidden units in layer 2.")
     layer1_size: PositiveInt = Field(default=5000, gt=0, description="Number of hidden units in layer 1.")
-    learning_rate: float = Field(default=1e-3, gt=0.0, le=1.0, description="Learning rate for the optimizer")
 
     # Data and augmentation parameters
     mask_ratio: float = Field(default=0.00, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
@@ -52,8 +51,8 @@ class Encoder(nn.Module):
         self.layer2 = nn.Linear(n_h1, n_h2)
 
     def forward(self, x: Tensor) -> List[Tensor]:
-        h1 = nn.functional.gelu(self.layer1(x))
-        h2 = nn.functional.gelu(self.layer2(h1))
+        h1 = torch.tanh(nn.functional.gelu(self.layer1(x)))
+        h2 = torch.tanh(nn.functional.gelu(self.layer2(h1)))
         return [h1, h2]
 
 
@@ -65,14 +64,14 @@ class Decoder(nn.Module):
         self.layer1 = nn.Linear(n_h2, n_h1)
 
     def forward(self, latent: Tensor) -> List[Tensor]:
-        h2 = nn.functional.gelu(self.layer2(latent))
-        h1 = nn.functional.gelu(self.layer1(h2))
+        h2 = torch.tanh(nn.functional.gelu(self.layer2(latent)))
+        h1 = torch.tanh(nn.functional.gelu(self.layer1(h2)))
         return [h1, h2]
 
 
 # -------------------------------------------------------------------------------------------
 class Autoencoder(pl.LightningModule):
-    def __init__(self, latent_size: int, layer2_size: int, layer1_size: int, learning_rate: float):
+    def __init__(self, latent_size: int, layer2_size: int, layer1_size: int):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
@@ -90,7 +89,7 @@ class Autoencoder(pl.LightningModule):
     def configure_optimizers(self) -> Optimizer:
         optimizer_parameters = [
             {"params": self.encoder.parameters(), "lr": 1e-5},
-            {"params": self.latent.parameters(), "lr": 2e-6},
+            {"params": self.latent.parameters(), "lr": 1e-5},
             {"params": self.decoder.parameters(), "lr": 1e-4},
             {"params": self.output.parameters(), "lr": 1e-4},
         ]
@@ -100,7 +99,7 @@ class Autoencoder(pl.LightningModule):
     def _encode(self, inputs: Tensor) -> Tensor:
         encoder_signals = self.encoder(flatten(inputs, start_dim=1))
         latent = self.latent(encoder_signals[-1])
-        return nn.functional.relu(latent)  # Nonlinearity on latent code
+        return torch.tanh(nn.functional.relu(latent))  # Nonlinearity on latent code
 
     @torch.inference_mode()
     def encode(self, sensors: Tensor) -> Tensor:

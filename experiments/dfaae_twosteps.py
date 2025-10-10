@@ -132,7 +132,7 @@ class Autoencoder(pl.LightningModule):
     def configure_optimizers(self) -> Optimizer:
         optimizer_parameters = [
             {"params": self.encoder.parameters(), "lr": 1e-5},
-            {"params": self.latent.parameters(), "lr": 2e-6},
+            {"params": self.latent.parameters(), "lr": 1e-5},
             {"params": self.decoder.parameters(), "lr": 1e-4},
             {"params": self.output.parameters(), "lr": 1e-4},
         ]
