@@ -29,7 +29,7 @@ class Experiment(BaseSettings):
     latent_size: PositiveInt = Field(default=2000, gt=0, description="Dimensionality of the latent code.")
     layer2_size: PositiveInt = Field(default=400, gt=0, description="Number of hidden units in layer 2.")
     layer1_size: PositiveInt = Field(default=5000, gt=0, description="Number of hidden units in layer 1.")
-    sparsity_lambda: float = Field(default=0.05, gt=0.0, le=1.0, description="Weight of the sparsity loss term.")
+    sparsity_lambda: float = Field(default=0.00, ge=0.0, le=1.0, description="Weight of the sparsity loss term.")
 
     # Data and augmentation parameters
     mask_ratio: float = Field(default=0.00, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
