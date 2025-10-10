@@ -9,7 +9,6 @@ from matplotlib import pyplot as plt
 from pydantic import Field, PositiveInt
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from torch import Tensor, flatten, nn, unflatten
-from torch.nn import functional as F
 from torch.optim import Adam, Optimizer
 
 from ehc_sn.augmentation.incomplete_maps import Augmentation, ComposeParams
@@ -97,7 +96,7 @@ class Autoencoder(pl.LightningModule):
     def _encode(self, inputs: Tensor) -> Tensor:
         encoder_signals = self.encoder(flatten(inputs, start_dim=1))
         latent = self.latent(encoder_signals[-1])
-        return F.relu(latent)  # Nonlinearity on latent code
+        return nn.functional.relu(latent)  # Nonlinearity on latent code
 
     @torch.inference_mode()
     def encode(self, sensors: Tensor) -> Tensor:
@@ -107,7 +106,7 @@ class Autoencoder(pl.LightningModule):
     def _decode(self, latent: Tensor) -> Tensor:
         decoder_signals = self.decoder(latent)
         logits = unflatten(self.output(decoder_signals[0]), 1, (25, 25))
-        return F.sigmoid(logits)
+        return torch.sigmoid(logits)
 
     @torch.inference_mode()
     def decode(self, latent: Tensor) -> Tensor:

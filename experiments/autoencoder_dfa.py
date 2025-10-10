@@ -31,43 +31,82 @@ class Experiment(BaseSettings):
     learning_rate: float = Field(default=1e-3, gt=0.0, le=1.0, description="Learning rate for the optimizer")
 
     # Data and augmentation parameters
-    mask_ratio: float = Field(default=0.4, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
+    mask_ratio: float = Field(default=0.00, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
     seed: int = Field(default=0, ge=0, description="Random seed for reproducibility")
 
     # Training Settings
-    max_epochs: PositiveInt = Field(default=200, ge=1, le=1000, description="Maximum training epochs")
+    max_epochs: PositiveInt = Field(default=200, ge=1, description="Maximum training epochs")
     batch_size: PositiveInt = Field(default=32, gt=0, le=1024, description="Batch size for training")
 
     # Logging and Output Settings
     log_dir: str = Field(default="logs", description="Directory for experiment logs")
-    experiment_name: str = Field("baseline_dense_bp", description="Experiment name")
-    checkpoint_freq: PositiveInt = Field(default=5, ge=1, le=50, description="Checkpoint frequency")
+    experiment_name: str = Field("autoencoder_dfa", description="Experiment name")
+    checkpoint_freq: PositiveInt = Field(default=50, ge=1, le=50, description="Checkpoint frequency")
+
+
+# -------------------------------------------------------------------------------------------
+class DFALayer(nn.Linear):
+    def __init__(self, n_in: int, n_out: int, n_error: int):
+
+        super().__init__(in_features=n_in, out_features=n_out, bias=True)
+        self.error_features = n_error
+        self.register_buffer("activations", None)  # Starts without activation values
+        self.register_buffer("fb_weight", torch.zeros(n_error, self.out_features))
+        self.reset_feedback()  # Initialize weights properly
+
+    def forward(self, *args: Any, **kwargs: Any) -> Tensor:
+        currents = super().forward(*args, **kwargs)
+        self.activations = torch.tanh(nn.functional.gelu(currents))
+        return self.activations.detach()  # enforce locality
+
+    @property
+    def features(self) -> int:
+        return self.out_features
+
+    def feedback(self, error: Tensor) -> Tensor:
+        delta = error.detach() @ self.fb_weight  # (batch_size, out_features)
+        target = self.activations.detach() - delta  # same shape as activations
+        return nn.functional.mse_loss(self.activations, target, reduction="mean")
+
+    def reset_feedback(self) -> None:
+        inv_limit = math.sqrt(self.error_features)
+        self.fb_weight.bernoulli_(0.5).mul_(2).sub_(1).div_(inv_limit)
 
 
 # -------------------------------------------------------------------------------------------
 class Encoder(nn.Module):
     def __init__(self, n_inputs: int, n_h1: int, n_h2: int):
         super().__init__()
-        self.layer1 = nn.Linear(n_inputs, n_h1)
-        self.layer2 = nn.Linear(n_h1, n_h2)
+        self.layer1 = DFALayer(n_inputs, n_h1, n_error=n_inputs)
+        self.layer2 = DFALayer(n_h1, n_h2, n_error=n_inputs)
 
-    def forward(self, x: Tensor) -> List[Tensor]:
-        h1 = nn.functional.gelu(self.layer1(x))
-        h2 = nn.functional.gelu(self.layer2(h1))
+    def forward(self, x_incomplete: Tensor) -> List[Tensor]:
+        h1 = self.layer1(x_incomplete)  # Use only channel 0 (obstacles)
+        h2 = self.layer2(h1)
         return [h1, h2]
+
+    def feedback(self, reconstruction_err: Tensor) -> Tensor:
+        loss_l1 = self.layer2.feedback(reconstruction_err)
+        loss_l2 = self.layer1.feedback(reconstruction_err)
+        return loss_l1 + loss_l2
 
 
 # -------------------------------------------------------------------------------------------
 class Decoder(nn.Module):
-    def __init__(self, n_latents: int, n_h2: int, n_h1: int):
+    def __init__(self, n_dg: int, n_h2: int, n_h1: int, n_inputs: int):
         super().__init__()
-        self.layer2 = nn.Linear(n_latents, n_h2)
-        self.layer1 = nn.Linear(n_h2, n_h1)
+        self.layer2 = DFALayer(n_dg, n_h2, n_error=n_inputs)
+        self.layer1 = DFALayer(n_h2, n_h1, n_error=n_inputs)
 
     def forward(self, latent: Tensor) -> List[Tensor]:
-        h2 = nn.functional.gelu(self.layer2(latent))
-        h1 = nn.functional.gelu(self.layer1(h2))
+        h2 = self.layer2(latent)
+        h1 = self.layer1(h2)
         return [h1, h2]
+
+    def feedback(self, reconstruction_err: Tensor) -> Tensor:
+        loss_l2 = self.layer1.feedback(reconstruction_err)
+        loss_l1 = self.layer2.feedback(reconstruction_err)
+        return loss_l2 + loss_l1
 
 
 # -------------------------------------------------------------------------------------------
@@ -80,67 +119,87 @@ class Autoencoder(pl.LightningModule):
         # Initialize encoder and decoder with DFA layers
         self.encoder = Encoder(n_inputs=25**2, n_h1=layer1_size, n_h2=layer2_size)
         self.latent = nn.Linear(layer2_size, latent_size)
-        self.decoder = Decoder(latent_size, n_h2=layer2_size, n_h1=layer1_size)
-        self.output = nn.Linear(layer1_size, 25**2)
+        self.decoder = Decoder(latent_size, layer2_size, layer1_size, n_inputs=25**2)
+        self.output = nn.Linear(layer1_size, out_features=25**2)
 
         # Loss functions and metrics
         self.reconstruction_loss = nn.BCELoss(reduction="mean")
         self.metrics = MetricsLogger(self)
 
+    # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
         return Adam(self.parameters(), lr=self.hparams.learning_rate)
 
     # -----------------------------------------------------------------------------------
     def _encode(self, inputs: Tensor) -> Tensor:
         encoder_signals = self.encoder(flatten(inputs, start_dim=1))
-        latent = self.latent(encoder_signals[-1])
-        return nn.functional.relu(latent)  # Nonlinearity on latent code
+        activations = self.latent(encoder_signals[-1])
+        return nn.functional.relu(activations)
 
     @torch.inference_mode()
     def encode(self, sensors: Tensor) -> Tensor:
-        """Encode sensors into latent space using the DFA-based encoder."""
         return self._encode(sensors)
 
     def _decode(self, latent: Tensor) -> Tensor:
         decoder_signals = self.decoder(latent)
-        logits = unflatten(self.output(decoder_signals[0]), 1, (25, 25))
+        logits = unflatten(self.output(decoder_signals[0]), 1, [25] * 2)
         return torch.sigmoid(logits)
 
     @torch.inference_mode()
     def decode(self, latent: Tensor) -> Tensor:
-        """Decode latent codes into map space using the HTL-based decoder."""
         return self._decode(latent)
 
     def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
         sensors, _targets = batch
-        latent = self._encode(sensors[:, 0])
-        reconstruction = self._decode(latent)
+        latent = self._encode(sensors[:, 0])  # Use only channel 0 (obstacles)
+        reconstruction = self._decode(latent.detach())
         return reconstruction, latent
 
     # -----------------------------------------------------------------------------------
+    def feedback(self, output: Tuple[Tensor, Tensor], batch: Tuple[Tensor, Tensor]) -> Tensor:
+        reconstruction, latent = output
+        sensors, targets = batch
+        x_incomplete, mask = sensors[:, 0], sensors[:, 1]
+
+        # Create completion target for encoder/decoder feedback paths
+        completion = x_incomplete * mask + reconstruction * (1 - mask)
+        error = reconstruction * mask - x_incomplete  # DFA feedback error only on visible pixels
+
+        # Train the autoencoder layers with dfa, sparsity, htl and standard loss
+        local_l1 = self.encoder.feedback(flatten(error, start_dim=1))
+        local_l2 = self.decoder.feedback(flatten(error, start_dim=1))
+        local_l3 = self.reconstruction_loss(reconstruction, completion.detach())
+
+        return local_l1 + local_l2 + local_l3
+
+    # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
-        _sensors, targets = batch
         self.optimizers().zero_grad()
-        reconstruction, latent = self(batch)
-        loss = self.reconstruction_loss(reconstruction, targets)
-        self.manual_backward(loss)
+        output = reconstruction, latent = self(batch)
+        local_loss = self.feedback(output, batch)
+        self.manual_backward(local_loss)
         self.optimizers().step()
 
         # Log metrics using MetricsLogger
+        _, targets = batch
         self.metrics.log_all_training(reconstruction, latent, targets, include_stats=False)
 
-    # -----------------------------------------------------------------------------------
     def validation_step(self, batch: Tensor, batch_idx: int) -> None:
-        _sensors, targets = batch
+        _, targets = batch
         reconstruction, latent = self(batch)
+        encoder_signals = self.encoder(flatten(reconstruction, start_dim=1))
+        decoder_signals = self.decoder(latent)
 
         # Log validation metrics using MetricsLogger
         self.metrics.log_all_validation(reconstruction, latent, targets, include_stats=True)
 
+        # Log layer alignment for decoder-encoder hidden states
+        self.metrics.log_layer_alignment(decoder_signals[0], encoder_signals[0], layer_idx=1, prefix="val")
+        self.metrics.log_layer_alignment(decoder_signals[1], encoder_signals[1], layer_idx=2, prefix="val")
+
 
 # -------------------------------------------------------------------------------------------
 def gen_figures(model: Autoencoder, datamodule: BaseDataModule) -> None:
-    """Generate reconstruction and sparsity figures from model outputs."""
     model.eval()
     datamodule.setup("test")
     test_dataloader = datamodule.test_dataloader()
@@ -204,7 +263,8 @@ if __name__ == "__main__":
         profiler="simple",
     )
 
-    try:  # Train till end of training or keyboard interup
+    # Train till end of training or keyboard interup
+    try:
         trainer.fit(model, datamodule=datamodule)
     except KeyboardInterrupt:
         print("Training interrupted by user. Generating figures...")
