@@ -126,20 +126,32 @@ class Autoencoder(pl.LightningModule):
         return reconstruction, latent
 
     # -----------------------------------------------------------------------------------
-    def training_step(self, batch: Tensor, batch_idx: int) -> None:
-        _sensors, targets = batch
-        self.optimizers().zero_grad()
-        reconstruction, latent = self(batch)
-        loss_rec = self.reconstruction_loss(reconstruction, targets)
+    def compute_loss(self, output: Tuple[Tensor, Tensor], batch: Tuple[Tensor, Tensor]) -> Tensor:
+        reconstruction, latent = output
+        sensors, targets = batch
+        x_incomplete, mask = sensors[:, 0], sensors[:, 1]
+
+        # Create completion target for encoder/decoder feedback paths
+        completion = x_incomplete * mask + reconstruction * (1 - mask)
+        _error = reconstruction * mask - x_incomplete  # DFA feedback error only on visible pixels
+
+        # Compute losses
+        loss_reconstruction = self.reconstruction_loss(reconstruction, completion.detach())
         loss_sparse = self.sparsity_loss(latent)
-        loss = loss_rec + self.hparams.sparsity_lambda * loss_sparse
-        self.manual_backward(loss)
+
+        return loss_reconstruction + self.hparams.sparsity_lambda * loss_sparse
+
+    # -----------------------------------------------------------------------------------
+    def training_step(self, batch: Tensor, batch_idx: int) -> None:
+        self.optimizers().zero_grad()
+        output = reconstruction, latent = self(batch)
+        global_loss = self.compute_loss(output, batch)
+        self.manual_backward(global_loss)
         self.optimizers().step()
 
         # Log metrics using MetricsLogger
+        _, targets = batch
         self.metrics.log_all_training(reconstruction, latent, targets, include_stats=False)
-        self.metrics.log_loss_component(loss_sparse, "loss_gramian", prefix="train", prog_bar=True)
-        self.metrics.log_loss_component(loss, "loss_total", prefix="train", prog_bar=False)
 
     # -----------------------------------------------------------------------------------
     def validation_step(self, batch: Tensor, batch_idx: int) -> None:
@@ -148,13 +160,13 @@ class Autoencoder(pl.LightningModule):
 
         # Compute losses for validation
         loss_rec = self.reconstruction_loss(reconstruction, targets)
-        loss_sparse = self.sparsity_loss(latent)
-        loss = loss_rec + self.hparams.sparsity_lambda * loss_sparse
+        encoder_signals = self.encoder(flatten(reconstruction, start_dim=1))
+        decoder_signals = self.decoder(latent)
 
         # Log validation metrics using MetricsLogger
         self.metrics.log_all_validation(reconstruction, latent, targets, include_stats=True)
-        self.metrics.log_loss_component(loss_sparse, "loss_gramian", prefix="val", prog_bar=True)
-        self.metrics.log_loss_component(loss, "loss_total", prefix="val", prog_bar=False)
+        self.metrics.log_layer_alignment(decoder_signals[0], encoder_signals[0], layer_idx=1, prefix="val")
+        self.metrics.log_layer_alignment(decoder_signals[1], encoder_signals[1], layer_idx=2, prefix="val")
 
         # HParams plugin: provide a single comparable metric
         self.log("hp_metric", loss_rec, on_epoch=True, prog_bar=False)

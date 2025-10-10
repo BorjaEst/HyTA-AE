@@ -177,9 +177,9 @@ class Autoencoder(pl.LightningModule):
         local_l1 = self.encoder.feedback(flatten(error, start_dim=1))
         local_l2 = self.decoder.feedback(flatten(error, start_dim=1))
         local_l3 = self.reconstruction_loss(reconstruction, completion.detach())
-        local_l4 = self.sparsity_loss(latent) * self.hparams.sparsity_lambda
+        local_l4 = self.sparsity_loss(latent)
 
-        return local_l1 + local_l2 + local_l3 + local_l4
+        return local_l1 + local_l2 + local_l3 + local_l4 * self.hparams.sparsity_lambda
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
