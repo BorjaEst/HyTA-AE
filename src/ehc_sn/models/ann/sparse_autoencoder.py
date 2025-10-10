@@ -93,9 +93,9 @@ class Autoencoder(pl.LightningModule):
         return Adam([optm_pe, optm_pd])
 
     # -----------------------------------------------------------------------------------
-    def forward(self, sensors: Tensor) -> Tuple[Tensor, Tensor]:
-        latent = self.encoder(flatten(sensors, start_dim=1))
-        reconstruction = unflatten(self.decoder(latent), 1, sensors.shape[1:])
+    def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
+        latent = self.encoder(flatten(batch[0][:, 0], start_dim=1))
+        reconstruction = unflatten(self.decoder(latent), 1, self.config.output_shape)
         return reconstruction, latent
 
     @torch.inference_mode()
@@ -116,15 +116,15 @@ class Autoencoder(pl.LightningModule):
 
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
         self.trainer_module.training_step(self, batch, batch_idx)
-        outputs = self(batch[0])
-        reconstruction_loss = nn.MSELoss(reduction="mean")(outputs[0], batch[0])
+        outputs = self(batch)
+        reconstruction_loss = nn.MSELoss(reduction="mean")(outputs[0], batch[1])
         sparsity_rate = (outputs[1] > 0.01).float().mean()
         self.log("train/sparsity_rate", sparsity_rate, prog_bar=True)
         self.log("train/reconstruction_loss", reconstruction_loss, prog_bar=True)
 
     def validation_step(self, batch: Tensor, batch_idx: int) -> List[Tensor]:
-        outputs = self(batch[0])
-        reconstruction_loss = nn.MSELoss(reduction="mean")(outputs[0], batch[0])
+        outputs = self(batch)
+        reconstruction_loss = nn.MSELoss(reduction="mean")(outputs[0], batch[1])
         sparsity_rate = (outputs[1] > 0.01).float().mean()
         self.log("val/sparsity_rate", sparsity_rate, prog_bar=True)
         self.log("val/reconstruction_loss", reconstruction_loss, prog_bar=True)

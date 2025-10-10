@@ -25,7 +25,6 @@ class Experiment(BaseSettings):
 
     model_config = SettingsConfigDict(extra="forbid", cli_parse_args=True)
 
-    augmentation: ComposeParams = Field(default_factory=ComposeParams, description="Data augmentation parameters")
     data: DataParams = Field(default_factory=DataParams, description="Data generation parameters")
     datamodule: DataModuleParams = Field(default_factory=DataModuleParams, description="Data module parameters")
     model: ModelParams = Field(default_factory=ModelParams, description="Autoencoder parameters")
@@ -43,7 +42,8 @@ class Experiment(BaseSettings):
 # -------------------------------------------------------------------------------------------
 def main(experiment: Experiment) -> None:
     """Run the sparse autoencoder experiment."""
-    augmentation = Augmentation(experiment.augmentation)
+    augmention_params = ComposeParams(mask_ratio=0.00)
+    augmentation = Augmentation(augmention_params)
     data_gen = DataGenerator(experiment.data, augmentation)
     datamodule = BaseDataModule(data_gen, experiment.datamodule)
     trainer = BackwardTrainer(experiment.trainer)

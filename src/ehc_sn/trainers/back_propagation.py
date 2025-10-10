@@ -43,8 +43,6 @@ class BackwardTrainer(BaseTrainer):
     # -----------------------------------------------------------------------------------
     def training_step(self, model: pl.LightningModule, batch: Tensor, batch_idx: int) -> None:
 
-        sensors, *_ = batch
-
         # Clear any previous gradients from model parameters
         optimizers = model.optimizers()
         if not isinstance(optimizers, list):
@@ -54,7 +52,7 @@ class BackwardTrainer(BaseTrainer):
             optm.zero_grad()
 
         # Forward pass and loss computation
-        outputs = model(sensors)
+        outputs = model(batch)
         loss_components = model.compute_loss(outputs, batch)
 
         # Calculate gradients using full backpropagation
