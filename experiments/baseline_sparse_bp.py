@@ -1,0 +1,226 @@
+import math
+from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Tuple, Type, Union
+
+import torch
+from lightning import pytorch as pl
+from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.loggers import TensorBoardLogger
+from matplotlib import pyplot as plt
+from pydantic import Field, PositiveInt
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from torch import Tensor, flatten, nn, unflatten
+from torch.nn import functional as F
+from torch.optim import Adam, Optimizer
+
+from ehc_sn.augmentation.incomplete_maps import Augmentation, ComposeParams
+from ehc_sn.core.datamodule import BaseDataModule, DataModuleParams
+from ehc_sn.data.obstacle_maps import DataGenerator, DataParams
+from ehc_sn.figures.decoder_montage import DecoderMontageFigure
+from ehc_sn.figures.reconstruction_map import ReconstructionMapFigure
+from ehc_sn.figures.sparsity import SparsityFigure
+from ehc_sn.loss import GramianOrthogonalityLoss as SparsityLoss
+from ehc_sn.metrics import MetricsLogger
+
+
+# -----------------------------------------------------------------------------------
+class Experiment(BaseSettings):
+    model_config = SettingsConfigDict(extra="forbid", cli_parse_args=True)
+
+    # Model architecture parameters
+    latent_size: PositiveInt = Field(default=64, gt=0, description="Dimensionality of the latent code.")
+    layer2_size: PositiveInt = Field(default=512, gt=0, description="Number of hidden units in layer 2.")
+    layer1_size: PositiveInt = Field(default=1024, gt=0, description="Number of hidden units in layer 1.")
+    sparsity_lambda: float = Field(default=0.05, gt=0.0, le=1.0, description="Weight of the sparsity loss term.")
+
+    # Data and augmentation parameters
+    mask_ratio: float = Field(default=0.4, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
+    seed: int = Field(default=0, ge=0, description="Random seed for reproducibility")
+
+    # Training Settings
+    max_epochs: PositiveInt = Field(default=200, ge=1, le=1000, description="Maximum training epochs")
+    batch_size: PositiveInt = Field(default=32, gt=0, le=1024, description="Batch size for training")
+
+    # Logging and Output Settings
+    log_dir: str = Field(default="logs", description="Directory for experiment logs")
+    experiment_name: str = Field(default="baseline_sparse_bp", description="Experiment name")
+    checkpoint_freq: PositiveInt = Field(default=5, ge=1, le=50, description="Checkpoint frequency")
+
+
+# -------------------------------------------------------------------------------------------
+class Encoder(nn.Module):
+    def __init__(self, n_inputs: int, n_h1: int, n_h2: int):
+        super().__init__()
+        self.layer1 = nn.Linear(n_inputs, n_h1)
+        self.layer2 = nn.Linear(n_h1, n_h2)
+
+    def forward(self, x: Tensor) -> List[Tensor]:
+        h1 = nn.functional.gelu(self.layer1(x))
+        h2 = nn.functional.gelu(self.layer2(h1))
+        return [h1, h2]
+
+
+# -------------------------------------------------------------------------------------------
+class Decoder(nn.Module):
+    def __init__(self, n_latents: int, n_h2: int, n_h1: int):
+        super().__init__()
+        self.layer2 = nn.Linear(n_latents, n_h2)
+        self.layer1 = nn.Linear(n_h2, n_h1)
+
+    def forward(self, latent: Tensor) -> List[Tensor]:
+        h2 = nn.functional.gelu(self.layer2(latent))
+        h1 = nn.functional.gelu(self.layer1(h2))
+        return [h1, h2]
+
+
+# -------------------------------------------------------------------------------------------
+class Autoencoder(pl.LightningModule):
+    def __init__(self, latent_size: int, layer2_size: int, layer1_size: int, sparsity_lambda: float):
+        super().__init__()
+        self.save_hyperparameters()
+        self.automatic_optimization = False
+
+        # Initialize encoder and decoder
+        self.encoder = Encoder(n_inputs=25**2, n_h1=layer1_size, n_h2=layer2_size)
+        self.latent = nn.Linear(layer2_size, latent_size)
+        self.decoder = Decoder(latent_size, n_h2=layer2_size, n_h1=layer1_size)
+        self.output = nn.Linear(layer1_size, 25**2)
+
+        # Loss functions and metrics
+        self.reconstruction_loss = nn.BCELoss(reduction="mean")
+        self.sparsity_loss = SparsityLoss(center=True)
+        self.metrics = MetricsLogger(self)
+
+    def configure_optimizers(self) -> Optimizer:
+        return Adam(self.parameters(), lr=self.hparams.learning_rate)
+
+    # -----------------------------------------------------------------------------------
+    def _encode(self, inputs: Tensor) -> Tensor:
+        encoder_signals = self.encoder(flatten(inputs, start_dim=1))
+        latent = self.latent(encoder_signals[-1])
+        return F.relu(latent)  # Nonlinearity on latent code
+
+    @torch.inference_mode()
+    def encode(self, sensors: Tensor) -> Tensor:
+        """Encode sensors into latent space using the DFA-based encoder."""
+        return self._encode(sensors)
+
+    def _decode(self, latent: Tensor) -> Tensor:
+        decoder_signals = self.decoder(latent)
+        logits = unflatten(self.output(decoder_signals[0]), 1, (25, 25))
+        return F.sigmoid(logits)
+
+    @torch.inference_mode()
+    def decode(self, latent: Tensor) -> Tensor:
+        """Decode latent codes into map space using the HTL-based decoder."""
+        return self._decode(latent)
+
+    def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
+        sensors, _targets = batch
+        latent = self._encode(sensors[:, 0])  # Use channel 0 with masked targets
+        reconstruction = self._decode(latent)  # Remove .detach() to allow gradients
+        return reconstruction, latent
+
+    # -----------------------------------------------------------------------------------
+    def training_step(self, batch: Tensor, batch_idx: int) -> None:
+        _sensors, targets = batch
+        self.optimizers().zero_grad()
+        reconstruction, latent = self(batch)
+        loss_rec = self.reconstruction_loss(reconstruction, targets)
+        loss_sparse = self.sparsity_loss(latent)
+        loss = loss_rec + self.hparams.sparsity_lambda * loss_sparse
+        self.manual_backward(loss)
+        self.optimizers().step()
+
+        # Log metrics using MetricsLogger
+        self.metrics.log_all_training(reconstruction, latent, targets, include_stats=False)
+        self.metrics.log_loss_component(loss_sparse, "loss_gramian", prefix="train", prog_bar=True)
+        self.metrics.log_loss_component(loss, "loss_total", prefix="train", prog_bar=False)
+
+    # -----------------------------------------------------------------------------------
+    def validation_step(self, batch: Tensor, batch_idx: int) -> None:
+        _sensors, targets = batch
+        reconstruction, latent = self(batch)
+
+        # Compute losses for validation
+        loss_rec = self.reconstruction_loss(reconstruction, targets)
+        loss_sparse = self.sparsity_loss(latent)
+        loss = loss_rec + self.hparams.sparsity_lambda * loss_sparse
+
+        # Log validation metrics using MetricsLogger
+        self.metrics.log_all_validation(reconstruction, latent, targets, include_stats=True)
+        self.metrics.log_loss_component(loss_sparse, "loss_gramian", prefix="val", prog_bar=True)
+        self.metrics.log_loss_component(loss, "loss_total", prefix="val", prog_bar=False)
+
+
+# -------------------------------------------------------------------------------------------
+def gen_figures(model: Autoencoder, datamodule: BaseDataModule) -> None:
+    """Generate reconstruction and sparsity figures from model outputs."""
+    model.eval()
+    datamodule.setup("test")
+    test_dataloader = datamodule.test_dataloader()
+
+    _, targets = batch = next(iter(test_dataloader))
+    with torch.inference_mode():
+        outputs, activations = model(batch)
+
+    # Figure 1: Reconstruction map comparing inputs and outputs
+    fig_reconstruction = ReconstructionMapFigure()
+    _ = fig_reconstruction.plot(targets, outputs)
+    plt.show()
+
+    # Figure 2: Sparsity plot showing latent activations
+    sparsity_figure = SparsityFigure()
+    _ = sparsity_figure.plot(activations)
+    plt.show()
+
+    # Probe decoder by activating one latent unit at a time (one-hot codes)
+    latent_dim = activations.shape[1]  # Number of latent units
+    latents = torch.eye(latent_dim)[:18]  # One-hot encoding for each unit
+
+    # Generate decoder outputs for one-hot latents
+    reconstructions = model.decode(latents)
+
+    # Figure 3: Decoder montage showing individual latent unit reconstructions
+    decoder_montage_figure = DecoderMontageFigure()
+    _ = decoder_montage_figure.plot(latents, reconstructions)
+    plt.show()
+
+
+# -------------------------------------------------------------------------------------------
+if __name__ == "__main__":
+    print(f"\n--- Running Baseline Sparse BP Experiment ---")
+
+    # Initialize experiment configuration
+    experiment = Experiment()
+    composition_params = ComposeParams(mask_ratio=experiment.mask_ratio)
+    data_params = DataParams(seed=experiment.seed, invert_walls=False)
+    datamodule_params = DataModuleParams(batch_size=experiment.batch_size, num_samples=4000)
+
+    # Create data generator and datamodule
+    augmentation = Augmentation(composition_params)
+    data_gen = DataGenerator(data_params, augmentation)
+    datamodule = BaseDataModule(data_gen, datamodule_params)
+
+    # Initialize model with specified architecture
+    model = Autoencoder(
+        latent_size=experiment.latent_size,
+        layer2_size=experiment.layer2_size,
+        layer1_size=experiment.layer1_size,
+        sparsity_lambda=experiment.sparsity_lambda,
+    )
+
+    # Initialize trainer
+    trainer = pl.Trainer(
+        accelerator="cuda" if torch.cuda.is_available() else "cpu",
+        max_epochs=experiment.max_epochs,
+        callbacks=[ModelCheckpoint(every_n_epochs=experiment.checkpoint_freq, save_weights_only=True)],
+        logger=TensorBoardLogger(experiment.log_dir, name=experiment.experiment_name),
+        profiler="simple",
+    )
+
+    try:  # Train till end of training or keyboard interup
+        trainer.fit(model, datamodule=datamodule)
+    except KeyboardInterrupt:
+        print("Training interrupted by user. Generating figures...")
+    finally:
+        gen_figures(model, datamodule)
