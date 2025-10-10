@@ -26,13 +26,13 @@ class Experiment(BaseSettings):
     model_config = SettingsConfigDict(extra="forbid", cli_parse_args=True)
 
     # Model architecture parameters
-    latent_size: PositiveInt = Field(default=64, gt=0, description="Dimensionality of the latent code.")
-    layer2_size: PositiveInt = Field(default=512, gt=0, description="Number of hidden units in layer 2.")
-    layer1_size: PositiveInt = Field(default=1024, gt=0, description="Number of hidden units in layer 1.")
+    latent_size: PositiveInt = Field(default=2000, gt=0, description="Dimensionality of the latent code.")
+    layer2_size: PositiveInt = Field(default=400, gt=0, description="Number of hidden units in layer 2.")
+    layer1_size: PositiveInt = Field(default=5000, gt=0, description="Number of hidden units in layer 1.")
     sparsity_lambda: float = Field(default=0.05, gt=0.0, le=1.0, description="Weight of the sparsity loss term.")
 
     # Data and augmentation parameters
-    mask_ratio: float = Field(default=0.4, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
+    mask_ratio: float = Field(default=0.00, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
     seed: int = Field(default=0, ge=0, description="Random seed for reproducibility")
 
     # Training Settings
@@ -41,8 +41,8 @@ class Experiment(BaseSettings):
 
     # Logging and Output Settings
     log_dir: str = Field(default="logs", description="Directory for experiment logs")
-    experiment_name: str = Field(default="baseline_sparse_bp", description="Experiment name")
-    checkpoint_freq: PositiveInt = Field(default=5, ge=1, le=50, description="Checkpoint frequency")
+    experiment_name: str = Field(__file__.split("/")[-1].replace(".py", ""), description="Experiment name")
+    checkpoint_freq: PositiveInt = Field(default=50, ge=1, le=50, description="Checkpoint frequency")
 
 
 # -------------------------------------------------------------------------------------------
@@ -90,7 +90,13 @@ class Autoencoder(pl.LightningModule):
         self.metrics = MetricsLogger(self)
 
     def configure_optimizers(self) -> Optimizer:
-        return Adam(self.parameters(), lr=self.hparams.learning_rate)
+        optimizer_parameters = [
+            {"params": self.encoder.parameters(), "lr": 1e-5},
+            {"params": self.latent.parameters(), "lr": 2e-6},
+            {"params": self.decoder.parameters(), "lr": 1e-4},
+            {"params": self.output.parameters(), "lr": 1e-4},
+        ]
+        return Adam(optimizer_parameters)
 
     # -----------------------------------------------------------------------------------
     def _encode(self, inputs: Tensor) -> Tensor:

@@ -25,9 +25,9 @@ class Experiment(BaseSettings):
     model_config = SettingsConfigDict(extra="forbid", cli_parse_args=True)
 
     # Model architecture parameters
-    latent_size: PositiveInt = Field(default=32, gt=0, description="Dimensionality of the latent code.")
-    layer2_size: PositiveInt = Field(default=512, gt=0, description="Number of hidden units in layer 2.")
-    layer1_size: PositiveInt = Field(default=1024, gt=0, description="Number of hidden units in layer 1.")
+    latent_size: PositiveInt = Field(default=2000, gt=0, description="Dimensionality of the latent code.")
+    layer2_size: PositiveInt = Field(default=400, gt=0, description="Number of hidden units in layer 2.")
+    layer1_size: PositiveInt = Field(default=5000, gt=0, description="Number of hidden units in layer 1.")
     learning_rate: float = Field(default=1e-3, gt=0.0, le=1.0, description="Learning rate for the optimizer")
 
     # Data and augmentation parameters
@@ -40,7 +40,7 @@ class Experiment(BaseSettings):
 
     # Logging and Output Settings
     log_dir: str = Field(default="logs", description="Directory for experiment logs")
-    experiment_name: str = Field("autoencoder_dfa", description="Experiment name")
+    experiment_name: str = Field(__file__.split("/")[-1].replace(".py", ""), description="Experiment name")
     checkpoint_freq: PositiveInt = Field(default=50, ge=1, le=50, description="Checkpoint frequency")
 
 
@@ -56,7 +56,8 @@ class DFALayer(nn.Linear):
 
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
         currents = super().forward(*args, **kwargs)
-        self.activations = torch.tanh(nn.functional.gelu(currents))
+        # self.activations = torch.tanh(nn.functional.gelu(currents))
+        self.activations = nn.functional.gelu(currents)
         return self.activations.detach()  # enforce locality
 
     @property
@@ -86,8 +87,8 @@ class Encoder(nn.Module):
         return [h1, h2]
 
     def feedback(self, reconstruction_err: Tensor) -> Tensor:
-        loss_l1 = self.layer2.feedback(reconstruction_err)
-        loss_l2 = self.layer1.feedback(reconstruction_err)
+        loss_l1 = self.layer1.feedback(reconstruction_err)
+        loss_l2 = self.layer2.feedback(reconstruction_err)
         return loss_l1 + loss_l2
 
 
@@ -104,8 +105,8 @@ class Decoder(nn.Module):
         return [h1, h2]
 
     def feedback(self, reconstruction_err: Tensor) -> Tensor:
-        loss_l2 = self.layer1.feedback(reconstruction_err)
-        loss_l1 = self.layer2.feedback(reconstruction_err)
+        loss_l2 = self.layer2.feedback(reconstruction_err)
+        loss_l1 = self.layer1.feedback(reconstruction_err)
         return loss_l2 + loss_l1
 
 
@@ -128,7 +129,13 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
-        return Adam(self.parameters(), lr=self.hparams.learning_rate)
+        optimizer_parameters = [
+            {"params": self.encoder.parameters(), "lr": 1e-5},
+            {"params": self.latent.parameters(), "lr": 2e-6},
+            {"params": self.decoder.parameters(), "lr": 1e-4},
+            {"params": self.output.parameters(), "lr": 1e-4},
+        ]
+        return Adam(optimizer_parameters)
 
     # -----------------------------------------------------------------------------------
     def _encode(self, inputs: Tensor) -> Tensor:
