@@ -196,15 +196,19 @@ class Autoencoder(pl.LightningModule):
     def validation_step(self, batch: Tensor, batch_idx: int) -> None:
         _, targets = batch
         reconstruction, latent = self(batch)
+
+        # Compute losses and signals for validation
+        loss_rec = self.reconstruction_loss(reconstruction, targets)
         encoder_signals = self.encoder(flatten(reconstruction, start_dim=1))
         decoder_signals = self.decoder(latent)
 
         # Log validation metrics using MetricsLogger
         self.metrics.log_all_validation(reconstruction, latent, targets, include_stats=True)
-
-        # Log layer alignment for decoder-encoder hidden states
         self.metrics.log_layer_alignment(decoder_signals[0], encoder_signals[0], layer_idx=1, prefix="val")
         self.metrics.log_layer_alignment(decoder_signals[1], encoder_signals[1], layer_idx=2, prefix="val")
+
+        # HParams plugin: provide a single comparable metric
+        self.log("hp_metric", loss_rec, on_epoch=True, prog_bar=False)
 
 
 # -------------------------------------------------------------------------------------------

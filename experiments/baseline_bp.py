@@ -156,6 +156,9 @@ class Autoencoder(pl.LightningModule):
         self.metrics.log_loss_component(loss_sparse, "loss_gramian", prefix="val", prog_bar=True)
         self.metrics.log_loss_component(loss, "loss_total", prefix="val", prog_bar=False)
 
+        # HParams plugin: provide a single comparable metric
+        self.log("hp_metric", loss_rec, on_epoch=True, prog_bar=False)
+
 
 # -------------------------------------------------------------------------------------------
 def gen_figures(model: Autoencoder, datamodule: BaseDataModule) -> None:
