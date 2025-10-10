@@ -17,6 +17,7 @@ from ehc_sn.data.obstacle_maps import DataGenerator, DataParams
 from ehc_sn.figures.decoder_montage import DecoderMontageFigure
 from ehc_sn.figures.reconstruction_map import ReconstructionMapFigure
 from ehc_sn.figures.sparsity import SparsityFigure
+from ehc_sn.loss import GramianOrthogonalityLoss as SparsityLoss
 from ehc_sn.metrics import MetricsLogger
 
 
@@ -28,7 +29,7 @@ class Experiment(BaseSettings):
     latent_size: PositiveInt = Field(default=2000, gt=0, description="Dimensionality of the latent code.")
     layer2_size: PositiveInt = Field(default=400, gt=0, description="Number of hidden units in layer 2.")
     layer1_size: PositiveInt = Field(default=5000, gt=0, description="Number of hidden units in layer 1.")
-    learning_rate: float = Field(default=1e-3, gt=0.0, le=1.0, description="Learning rate for the optimizer")
+    sparsity_lambda: float = Field(default=0.05, gt=0.0, le=1.0, description="Weight of the sparsity loss term.")
 
     # Data and augmentation parameters
     mask_ratio: float = Field(default=0.00, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
@@ -111,7 +112,7 @@ class Decoder(nn.Module):
 
 # -------------------------------------------------------------------------------------------
 class Autoencoder(pl.LightningModule):
-    def __init__(self, latent_size: int, layer2_size: int, layer1_size: int, learning_rate: float):
+    def __init__(self, latent_size: int, layer2_size: int, layer1_size: int, sparsity_lambda: float):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
@@ -124,6 +125,7 @@ class Autoencoder(pl.LightningModule):
 
         # Loss functions and metrics
         self.reconstruction_loss = nn.BCELoss(reduction="mean")
+        self.sparsity_loss = SparsityLoss(center=True)
         self.metrics = MetricsLogger(self)
 
     # -----------------------------------------------------------------------------------
@@ -257,7 +259,7 @@ if __name__ == "__main__":
         latent_size=experiment.latent_size,
         layer2_size=experiment.layer2_size,
         layer1_size=experiment.layer1_size,
-        learning_rate=experiment.learning_rate,
+        sparsity_lambda=experiment.sparsity_lambda,
     )
 
     # Initialize trainer
