@@ -4,8 +4,8 @@ import torch
 from pydantic import BaseModel, Field
 from torch import Tensor, cat, nn
 
+from ehc_sn.loss import GramianOrthogonalityLoss as SparsityLoss
 from ehc_sn.modules import drtp
-from ehc_sn.modules.loss import GramianOrthogonalityLoss as SparsityLoss
 from ehc_sn.utils import encoding_utils
 
 

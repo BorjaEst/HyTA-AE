@@ -9,7 +9,7 @@ from torch.optim import Adam, Optimizer
 
 from ehc_sn.core import ann
 from ehc_sn.core.trainer import BaseTrainer
-from ehc_sn.modules.loss import GramianOrthogonalityLoss as SparsityLoss
+from ehc_sn.loss import GramianOrthogonalityLoss as SparsityLoss
 
 
 # -------------------------------------------------------------------------------------------
