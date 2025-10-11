@@ -10,16 +10,27 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
-import matplotlib as mpl
 import matplotlib.pyplot as plt
-from matplotlib import colors as mcolors
-from matplotlib.backends.backend_pdf import PdfPages
-from matplotlib.patches import Patch
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from tensorboard.backend.event_processing import event_accumulator
+
+from ehc_sn.utils.figures import (
+    COLOR_SWATCH_SYMBOL,
+    SWATCH_COLUMN_INDEX,
+    SWATCH_MIN_WIDTH,
+    TABLE_WIDTH,
+    apply_swatch_colors,
+    apply_table_cell_styles,
+    assign_folder_based_colors,
+    configure_matplotlib,
+    create_figure_with_table,
+    extract_top_level_folder,
+    fit_table_to_full_width,
+    format_float,
+)
 
 try:  # YAML is used to read hyperparameters
     import yaml
@@ -32,23 +43,7 @@ except Exception:  # pragma: no cover - surfaced at runtime with clear error
 # -------------------------------------------------------------------------------------------
 HYPERPARAMETER_KEY = "latent_size"  # The hyperparameter to plot on x-axis
 DEFAULT_LEGEND_HPARAMS = ["layer2_size", "sparsity_lambda"]  # Hparams to display in legend
-
-SWATCH_COLUMN_INDEX = 0
-COLOR_SWATCH_SYMBOL = "■"
-
-# Default figure and table dimensions
-FIGURE_WIDTH = 7.5
-TABLE_WIDTH = 0.98
-SWATCH_MIN_WIDTH = 0.02
-
-# Font sizes
-FONT_SIZE_VALUE = 9
-FONT_SIZE_TITLE = 11
-
-# Dynamic sizing for plots with many legend/table rows
-BASE_PLOT_HEIGHT_IN = 3.6
-TABLE_ROW_HEIGHT_IN = 0.25
-TABLE_HEADER_HEIGHT_IN = 0.35
+GROUP_COLUMN_INDEX = 1
 
 
 # -------------------------------------------------------------------------------------------
@@ -179,43 +174,23 @@ def _load_all_metrics(run_dir: Path) -> List[str]:
 
 
 # -------------------------------------------------------------------------------------------
-# Matplotlib Configuration
-# -------------------------------------------------------------------------------------------
-def _configure_matplotlib() -> None:
-    """Set Matplotlib defaults for publication-ready vector output."""
-    mpl.rcParams["pdf.fonttype"] = 42  # Embed TrueType fonts
-    mpl.rcParams["ps.fonttype"] = 42
-    mpl.rcParams["figure.dpi"] = 150
-    mpl.rcParams["savefig.bbox"] = "tight"
-    mpl.rcParams["axes.grid"] = True
-    mpl.rcParams["grid.alpha"] = 0.25
-
-    # Consistent font sizes
-    mpl.rcParams["font.size"] = FONT_SIZE_VALUE
-    mpl.rcParams["axes.labelsize"] = FONT_SIZE_VALUE
-    mpl.rcParams["axes.titlesize"] = FONT_SIZE_TITLE
-    mpl.rcParams["xtick.labelsize"] = FONT_SIZE_VALUE
-    mpl.rcParams["ytick.labelsize"] = FONT_SIZE_VALUE
-    mpl.rcParams["legend.fontsize"] = FONT_SIZE_VALUE
-
-
-def _format_float(value: float) -> str:
-    """Format floats compactly for display."""
-    try:
-        return f"{value:.4g}"
-    except Exception:
-        return str(value)
-
-
-# -------------------------------------------------------------------------------------------
 # Grouping & Color Mapping
 # -------------------------------------------------------------------------------------------
-def _top_level_folder(run_name: str) -> str:
-    """Extract the top-level folder from a run name like 'folder/sub/run'."""
-    if not run_name:
-        return ""
-    parts = run_name.split("/")
-    return parts[0] if parts else run_name
+def _extract_folder_from_group_key(group_key: str) -> str:
+    """Extract folder from a group key like 'folder|hp1=val1|hp2=val2'.
+
+    Parameters
+    ----------
+    group_key : str
+        Group key containing folder and hyperparameters.
+
+    Returns
+    -------
+    str
+        The folder component.
+    """
+    parts = group_key.split("|", 1)
+    return parts[0] if parts else group_key
 
 
 def _build_group_key(run_name: str, hparams: Dict[str, Any], legend_hparams: List[str]) -> str:
@@ -235,7 +210,7 @@ def _build_group_key(run_name: str, hparams: Dict[str, Any], legend_hparams: Lis
     str
         Group key like 'folder|hp1=val1|hp2=val2'.
     """
-    folder = _top_level_folder(run_name)
+    folder = extract_top_level_folder(run_name)
     hp_parts = []
     for hp in sorted(legend_hparams):
         val = hparams.get(hp, "N/A")
@@ -245,184 +220,9 @@ def _build_group_key(run_name: str, hparams: Dict[str, Any], legend_hparams: Lis
     return folder
 
 
-def _build_group_color_map(group_keys: List[str]) -> Dict[str, str]:
-    """Assign colors per group with high contrast across folders, low within folder.
-
-    Groups from different folders get distinct base hues (high contrast).
-    Groups from the same folder with different hyperparameters get saturation/value
-    variants of that folder's hue (low contrast).
-
-    Parameters
-    ----------
-    group_keys : List[str]
-        Group keys like 'folder|hp1=val1|hp2=val2'.
-
-    Returns
-    -------
-    Dict[str, str]
-        Mapping group_key -> hex color string.
-    """
-    if not group_keys:
-        return {}
-
-    # Parse group keys into (folder, hparam_signature)
-    folder_groups: Dict[str, List[str]] = {}
-    for gk in group_keys:
-        parts = gk.split("|", 1)
-        folder = parts[0]
-        folder_groups.setdefault(folder, []).append(gk)
-
-    folder_names = sorted(folder_groups.keys())
-    n_folders = max(1, len(folder_names))
-
-    # Evenly spaced base hues for high contrast across folders
-    hue_offset = 0.07
-    base_hues = {f: (hue_offset + i / n_folders) % 1.0 for i, f in enumerate(folder_names)}
-
-    # Four distinct variants within each folder: vary saturation and brightness
-    variants: List[tuple[float, float]] = [
-        (0.95, 0.90),  # vivid and bright
-        (0.60, 0.90),  # pastel bright
-        (0.85, 0.70),  # vivid mid-bright
-        (1.00, 0.55),  # dark vivid
-    ]
-    variants = sorted(variants, key=lambda sv: (sv[1], sv[0]), reverse=True)
-
-    color_map: Dict[str, str] = {}
-    for folder in folder_names:
-        groups_in_folder = sorted(folder_groups[folder])
-        hue = base_hues[folder]
-        for idx, gk in enumerate(groups_in_folder):
-            sat, val = variants[idx % len(variants)]
-            rgb = mcolors.hsv_to_rgb((hue, sat, val))
-            color_map[gk] = mcolors.to_hex(rgb)
-
-    return color_map
-
-
-# -------------------------------------------------------------------------------------------
-# Table Utilities
-# -------------------------------------------------------------------------------------------
-def _apply_table_cell_styles(table, num_cols: int, num_data_rows: int) -> None:
-    """Apply consistent styling to all table cells."""
-    # Style header row (row 0)
-    for col in range(num_cols):
-        if (0, col) not in table.get_celld():
-            continue
-        header_cell = table[(0, col)]
-        header_cell.get_text().set_weight("bold")
-        header_cell.get_text().set_ha("left")
-        header_cell.set_edgecolor("none")
-        header_cell.set_facecolor("none")
-
-    # Style data rows (rows 1+)
-    for row in range(1, num_data_rows + 1):
-        for col in range(num_cols):
-            if (row, col) not in table.get_celld():
-                continue
-            data_cell = table[(row, col)]
-            data_cell.get_text().set_ha("left")
-            data_cell.set_edgecolor("none")
-            data_cell.set_facecolor("none")
-
-
-def _apply_swatch_colors(table, colors: List[str]) -> None:
-    """Apply color swatches to the first column of data rows."""
-    for row_idx, color in enumerate(colors, start=1):
-        if (row_idx, SWATCH_COLUMN_INDEX) not in table.get_celld():
-            continue
-        swatch_cell = table[(row_idx, SWATCH_COLUMN_INDEX)]
-        swatch_cell.get_text().set_color(color)
-        swatch_cell.get_text().set_ha("left")
-
-
-def _fit_table_full_width_by_content(
-    table: plt.Table,
-    ncols: int,
-    swatch_col: int = SWATCH_COLUMN_INDEX,
-    group_col: int = 1,
-    total_width: float = TABLE_WIDTH,
-    min_swatch: float = SWATCH_MIN_WIDTH,
-) -> None:
-    """Scale table columns to nearly fill figure width, with group column expandable.
-
-    This uses matplotlib's auto column width based on content, then scales to fill
-    the available width. The group column (similar to "run" in gen_timeseries) expands
-    to take remaining space after accounting for other columns.
-
-    Parameters
-    ----------
-    table : plt.Table
-        Table to adjust.
-    ncols : int
-        Number of columns in table.
-    swatch_col : int
-        Index of the color swatch column.
-    group_col : int
-        Index of group column to make expandable.
-    total_width : float
-        Target total width as fraction of axes width.
-    min_swatch : float
-        Minimum width for swatch column as fraction of axes width.
-    """
-    # Compute content-based widths
-    try:
-        table.auto_set_column_width(col=list(range(ncols)))
-    except Exception:
-        pass
-
-    # Extract current widths from header row
-    widths = [
-        table.get_celld().get((0, col), None).get_width() if (0, col) in table.get_celld() else 0.0
-        for col in range(ncols)
-    ]
-
-    # Enforce minimum swatch width
-    if 0 <= swatch_col < ncols:
-        widths[swatch_col] = max(widths[swatch_col], min_swatch)
-
-    # Validate group column index
-    group_col = group_col if 0 <= group_col < ncols else 1
-
-    # Calculate space available for group column
-    sum_non_group = sum(widths[col] for col in range(ncols) if col != group_col)
-    remaining = max(0.0, total_width) - sum_non_group
-
-    if remaining >= widths[group_col]:
-        # Enough space: allocate all remaining width to group column
-        new_widths = widths.copy()
-        new_widths[group_col] = remaining
-    else:
-        # Not enough space: scale all columns proportionally
-        total_current = sum(widths) or 1.0
-        scale = total_width / total_current
-        new_widths = [w * scale for w in widths]
-
-    # Apply new widths to all cells
-    for col in range(ncols):
-        for (row, c), cell in table.get_celld().items():
-            if c == col:
-                cell.set_width(new_widths[col])
-
-
 # -------------------------------------------------------------------------------------------
 # Figure Creation
 # -------------------------------------------------------------------------------------------
-def _create_figure_with_table(num_rows: int) -> tuple:
-    """Create a figure with plot axes and table axes sized for table rows."""
-    num_rows = max(0, int(num_rows))
-    table_h = TABLE_HEADER_HEIGHT_IN + num_rows * TABLE_ROW_HEIGHT_IN
-    plot_h = BASE_PLOT_HEIGHT_IN
-    total_h = plot_h + table_h
-
-    return plt.subplots(
-        2,
-        1,
-        figsize=(FIGURE_WIDTH, total_h),
-        gridspec_kw={"height_ratios": [plot_h, table_h]},
-    )
-
-
 def _create_legend_table(
     table_axes,
     rows: List[List[str]],
@@ -452,23 +252,23 @@ def _create_legend_table(
         bbox=[0, 0, 1, 1],
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(FONT_SIZE_VALUE)
+    table.set_fontsize(9)
 
     # Apply column width fitting
-    _fit_table_full_width_by_content(
+    fit_table_to_full_width(
         table,
         ncols=len(column_labels),
         swatch_col=SWATCH_COLUMN_INDEX,
-        group_col=1,
+        expandable_col=GROUP_COLUMN_INDEX,
         total_width=TABLE_WIDTH,
         min_swatch=SWATCH_MIN_WIDTH,
     )
 
     # Apply cell styles
-    _apply_table_cell_styles(table, len(column_labels), len(rows))
+    apply_table_cell_styles(table, len(column_labels), len(rows))
 
     # Apply swatch colors
-    _apply_swatch_colors(table, row_colors)
+    apply_swatch_colors(table, row_colors)
 
     table_axes.axis("off")
 
@@ -524,7 +324,7 @@ def _plot_metric_by_latent_size(
         return
 
     # Create figure sized to number of groups (legend rows)
-    fig, (plot_ax, table_ax) = _create_figure_with_table(num_rows=len(group_entries))
+    fig, (plot_ax, table_ax) = create_figure_with_table(num_rows=len(group_entries))
 
     # Draw one line per group: sort by latent_size
     for g, pts in sorted(group_entries, key=lambda it: it[0]):
@@ -573,7 +373,7 @@ def _plot_metric_by_latent_size(
             # Try to format as float for numeric values
             try:
                 val_float = float(val)
-                row.append(_format_float(val_float))
+                row.append(format_float(val_float))
             except (ValueError, TypeError):
                 row.append(str(val))
 
@@ -608,7 +408,7 @@ def export_latent_eval_to_pdf(cfg: Arguments) -> None:
     - Only runs with both hparams.yaml and the metric are included.
     - One PDF is generated per metric tag found across all runs.
     """
-    _configure_matplotlib()
+    configure_matplotlib()
 
     root = Path(cfg.log_dir).expanduser().resolve()
     out_dir = Path(cfg.out_dir).expanduser().resolve()
@@ -665,7 +465,7 @@ def export_latent_eval_to_pdf(cfg: Arguments) -> None:
     hparams_dict = {rn: hp for rn, hp in zip(run_names, run_hparams)}
     group_key_for_run = {rn: _build_group_key(rn, hparams_dict[rn], cfg.legend_hparams) for rn in run_names}
     unique_groups = sorted(set(group_key_for_run.values()))
-    group_color_map = _build_group_color_map(unique_groups)
+    group_color_map = assign_folder_based_colors(unique_groups, _extract_folder_from_group_key)
 
     # For each metric tag, load values and create a plot
     for tag in sorted(all_tags):

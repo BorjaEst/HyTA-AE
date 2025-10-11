@@ -8,37 +8,31 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-import matplotlib as mpl
 import matplotlib.pyplot as plt
-from matplotlib import colors as mcolors
 from matplotlib.backends.backend_pdf import PdfPages
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from tensorboard.backend.event_processing import event_accumulator
 
+from ehc_sn.utils.figures import (
+    COLOR_SWATCH_SYMBOL,
+    SWATCH_COLUMN_INDEX,
+    SWATCH_MIN_WIDTH,
+    TABLE_WIDTH,
+    apply_swatch_colors,
+    apply_table_cell_styles,
+    assign_folder_based_colors,
+    configure_matplotlib,
+    create_figure_with_table,
+    fit_table_to_full_width,
+    format_float,
+)
+
 # -------------------------------------------------------------------------------------------
 # Constants
 # -------------------------------------------------------------------------------------------
 TABLE_COLUMN_LABELS = ["", "run", "min", "max", "end", "step"]
-SWATCH_COLUMN_INDEX = 0
 RUN_COLUMN_INDEX = 1
-COLOR_SWATCH_SYMBOL = "■"
-
-# Default figure and table dimensions
-FIGURE_WIDTH = 7.5
-FIGURE_HEIGHT = 5.5
-PLOT_TO_TABLE_RATIO = [3, 1]
-TABLE_WIDTH = 0.98
-SWATCH_MIN_WIDTH = 0.02
-
-# Font sizes
-FONT_SIZE_VALUE = 9
-FONT_SIZE_TITLE = 11
-
-# Dynamic sizing for plots with many legend/table rows
-BASE_PLOT_HEIGHT_IN = 3.6
-TABLE_ROW_HEIGHT_IN = 0.25
-TABLE_HEADER_HEIGHT_IN = 0.35
 
 
 # -------------------------------------------------------------------------------------------
@@ -195,244 +189,6 @@ def _ema(values: List[float], alpha: float) -> List[float]:
 
 
 # -------------------------------------------------------------------------------------------
-# Matplotlib Configuration
-# -------------------------------------------------------------------------------------------
-def _configure_matplotlib() -> None:
-    """Set Matplotlib defaults for publication-ready vector output."""
-    mpl.rcParams["pdf.fonttype"] = 42  # Embed TrueType fonts
-    mpl.rcParams["ps.fonttype"] = 42
-    mpl.rcParams["figure.dpi"] = 150
-    mpl.rcParams["savefig.bbox"] = "tight"
-    mpl.rcParams["axes.grid"] = True
-    mpl.rcParams["grid.alpha"] = 0.25
-
-    # Consistent font sizes
-    mpl.rcParams["font.size"] = FONT_SIZE_VALUE
-    mpl.rcParams["axes.labelsize"] = FONT_SIZE_VALUE
-    mpl.rcParams["axes.titlesize"] = FONT_SIZE_TITLE
-    mpl.rcParams["xtick.labelsize"] = FONT_SIZE_VALUE
-    mpl.rcParams["ytick.labelsize"] = FONT_SIZE_VALUE
-    mpl.rcParams["legend.fontsize"] = FONT_SIZE_VALUE
-
-
-def _format_float(value: float) -> str:
-    """Format floats compactly for table display.
-
-    Parameters
-    ----------
-    value : float
-        Number to format.
-
-    Returns
-    -------
-    str
-        Formatted string with up to 4 significant digits.
-    """
-    try:
-        return f"{value:.4g}"
-    except Exception:
-        return str(value)
-
-
-# -------------------------------------------------------------------------------------------
-# Table Formatting
-# -------------------------------------------------------------------------------------------
-def _top_level_folder(run_name: str) -> str:
-    """Extract the top-level folder from a run name like 'folder/sub/run'.
-
-    Parameters
-    ----------
-    run_name : str
-        Relative run path (root-relative), with '/' separators.
-
-    Returns
-    -------
-    str
-        The first path component, or the entire string if no '/' present.
-    """
-    if not run_name:
-        return ""
-    parts = run_name.split("/")
-    return parts[0] if parts else run_name
-
-
-def _build_run_color_map(run_names: List[str]) -> Dict[str, str]:
-    """Assign deterministic colors per run with grouping by top-level folder.
-
-    Different folders get distinct base hues (high contrast). Runs within the
-    same folder get shade variations of that hue (lower contrast).
-
-    Parameters
-    ----------
-    run_names : List[str]
-        Run identifiers (root-relative paths like 'folder/runX').
-
-    Returns
-    -------
-    Dict[str, str]
-        Mapping run_name -> hex color string.
-    """
-    if not run_names:
-        return {}
-
-    # Group run names by their top-level folder
-    groups: Dict[str, List[str]] = {}
-    for rn in run_names:
-        groups.setdefault(_top_level_folder(rn), []).append(rn)
-
-    group_names = sorted(groups.keys())
-    n_groups = max(1, len(group_names))
-
-    # Evenly spaced base hues for high contrast across groups
-    # Avoid starting exactly at 0.0 to reduce collision with default red
-    hue_offset = 0.07
-    base_hues = {g: (hue_offset + i / n_groups) % 1.0 for i, g in enumerate(group_names)}
-
-    # Four distinct variants within each group: vary saturation and brightness
-    # to produce four clearly distinguishable shades of the same hue before
-    # cycling. Order chosen for perceptual spread in typical themes.
-    variants: List[tuple[float, float]] = [
-        (0.95, 0.90),  # vivid and bright
-        (0.60, 0.90),  # pastel bright
-        (0.85, 0.70),  # vivid mid-bright
-        (1.00, 0.55),  # dark vivid
-    ]
-    # Ensure ordering from more bright to less bright (value desc, then sat desc)
-    variants = sorted(variants, key=lambda sv: (sv[1], sv[0]), reverse=True)
-
-    color_map: Dict[str, str] = {}
-    for g in group_names:
-        runs_in_group = sorted(groups[g])
-        hue = base_hues[g]
-        for idx, rn in enumerate(runs_in_group):
-            sat, val = variants[idx % len(variants)]
-            rgb = mcolors.hsv_to_rgb((hue, sat, val))
-            color_map[rn] = mcolors.to_hex(rgb)
-
-    return color_map
-
-
-def _apply_table_cell_styles(table, num_cols: int, num_data_rows: int) -> None:
-    """Apply consistent styling to all table cells.
-
-    Parameters
-    ----------
-    table
-        Matplotlib table object.
-    num_cols : int
-        Number of columns in the table.
-    num_data_rows : int
-        Number of data rows (excluding header).
-    """
-    # Style header row (row 0)
-    for col in range(num_cols):
-        if (0, col) not in table.get_celld():
-            continue
-        header_cell = table[(0, col)]
-        header_cell.get_text().set_weight("bold")
-        header_cell.get_text().set_ha("left")
-        header_cell.set_edgecolor("none")
-        header_cell.set_facecolor("none")
-
-    # Style data rows (rows 1+)
-    for row in range(1, num_data_rows + 1):
-        for col in range(num_cols):
-            if (row, col) not in table.get_celld():
-                continue
-            data_cell = table[(row, col)]
-            data_cell.get_text().set_ha("left")
-            data_cell.set_edgecolor("none")
-            data_cell.set_facecolor("none")
-
-
-def _apply_swatch_colors(table, colors: List[str]) -> None:
-    """Apply color swatches to the first column of data rows.
-
-    Parameters
-    ----------
-    table
-        Matplotlib table object.
-    colors : List[str]
-        Color codes for each data row.
-    """
-    for row_idx, color in enumerate(colors, start=1):
-        if (row_idx, SWATCH_COLUMN_INDEX) not in table.get_celld():
-            continue
-        swatch_cell = table[(row_idx, SWATCH_COLUMN_INDEX)]
-        swatch_cell.get_text().set_color(color)
-        swatch_cell.get_text().set_ha("left")
-
-
-def _fit_table_full_width_by_content(
-    table,
-    ncols: int,
-    swatch_col: int = SWATCH_COLUMN_INDEX,
-    run_col: int = RUN_COLUMN_INDEX,
-    total_width: float = TABLE_WIDTH,
-    min_swatch: float = SWATCH_MIN_WIDTH,
-) -> None:
-    """Fit table columns to content, then scale to occupy nearly full width.
-
-    This preserves relative content-based widths while ensuring the table spans
-    almost the entire axes width. The swatch column gets a minimum width, and
-    the run column expands to fill remaining space.
-
-    Parameters
-    ----------
-    table
-        Matplotlib table object.
-    ncols : int
-        Number of columns.
-    swatch_col : int
-        Index of the color swatch column.
-    run_col : int
-        Index of the run name column (expands to fill space).
-    total_width : float
-        Target total width as fraction of axes width.
-    min_swatch : float
-        Minimum width for swatch column as fraction of axes width.
-    """
-    # Compute content-based widths
-    try:
-        table.auto_set_column_width(col=list(range(ncols)))
-    except Exception:
-        pass
-
-    # Extract current widths from header row
-    widths = [
-        table.get_celld().get((0, col), None).get_width() if (0, col) in table.get_celld() else 0.0
-        for col in range(ncols)
-    ]
-
-    # Enforce minimum swatch width
-    if 0 <= swatch_col < ncols:
-        widths[swatch_col] = max(widths[swatch_col], min_swatch)
-
-    # Validate run column index
-    run_col = run_col if 0 <= run_col < ncols else 1
-
-    # Calculate space available for run column
-    sum_non_run = sum(widths[col] for col in range(ncols) if col != run_col)
-    remaining = max(0.0, total_width) - sum_non_run
-
-    if remaining >= widths[run_col]:
-        # Enough space: allocate all remaining width to run column
-        new_widths = widths.copy()
-        new_widths[run_col] = remaining
-    else:
-        # Not enough space: scale all columns proportionally
-        total_current = sum(widths) or 1.0
-        scale = total_width / total_current
-        new_widths = [w * scale for w in widths]
-
-    # Apply new widths to all cells
-    for col in range(ncols):
-        for (row, c), cell in table.get_celld().items():
-            if c == col:
-                cell.set_width(new_widths[col])
-
-
-# -------------------------------------------------------------------------------------------
 # Statistics Calculation
 # -------------------------------------------------------------------------------------------
 def _compute_series_stats(steps: List[int], values: List[float]) -> Dict[str, str]:
@@ -452,16 +208,16 @@ def _compute_series_stats(steps: List[int], values: List[float]) -> Dict[str, st
     """
     if not values or not steps:
         return {
-            "min": _format_float(float("nan")),
-            "max": _format_float(float("nan")),
-            "end_value": _format_float(float("nan")),
+            "min": format_float(float("nan")),
+            "max": format_float(float("nan")),
+            "end_value": format_float(float("nan")),
             "end_step": "",
         }
 
     return {
-        "min": _format_float(min(values)),
-        "max": _format_float(max(values)),
-        "end_value": _format_float(values[-1]),
+        "min": format_float(min(values)),
+        "max": format_float(max(values)),
+        "end_value": format_float(values[-1]),
         "end_step": str(steps[-1]),
     }
 
@@ -494,33 +250,6 @@ def _build_stats_table_row(run_name: str, stats: Dict[str, str]) -> List[str]:
 # -------------------------------------------------------------------------------------------
 # Figure Creation
 # -------------------------------------------------------------------------------------------
-def _create_figure_with_table(num_rows: int) -> tuple:
-    """Create a figure with plot axes and table axes sized for table rows.
-
-    Parameters
-    ----------
-    num_rows : int
-        Number of data rows in the stats table (excluding header). Used to
-        compute a suitable figure height and the plot/table height ratio.
-
-    Returns
-    -------
-    tuple
-        (fig, plot_axes, table_axes)
-    """
-    num_rows = max(0, int(num_rows))
-    table_h = TABLE_HEADER_HEIGHT_IN + num_rows * TABLE_ROW_HEIGHT_IN
-    plot_h = BASE_PLOT_HEIGHT_IN
-    total_h = plot_h + table_h
-
-    return plt.subplots(
-        2,
-        1,
-        figsize=(FIGURE_WIDTH, total_h),
-        gridspec_kw={"height_ratios": [plot_h, table_h]},
-    )
-
-
 def _create_stats_table(table_axes, rows: List[List[str]], colors: List[str]) -> None:
     """Create and style a statistics table under a plot.
 
@@ -543,23 +272,23 @@ def _create_stats_table(table_axes, rows: List[List[str]], colors: List[str]) ->
         bbox=[0, 0, 1, 1],
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(FONT_SIZE_VALUE)
+    table.set_fontsize(9)
 
     # Apply column width fitting
-    _fit_table_full_width_by_content(
+    fit_table_to_full_width(
         table,
         ncols=len(TABLE_COLUMN_LABELS),
         swatch_col=SWATCH_COLUMN_INDEX,
-        run_col=RUN_COLUMN_INDEX,
+        expandable_col=RUN_COLUMN_INDEX,
         total_width=TABLE_WIDTH,
         min_swatch=SWATCH_MIN_WIDTH,
     )
 
     # Apply cell styles
-    _apply_table_cell_styles(table, len(TABLE_COLUMN_LABELS), len(rows))
+    apply_table_cell_styles(table, len(TABLE_COLUMN_LABELS), len(rows))
 
     # Apply color swatches
-    _apply_swatch_colors(table, colors)
+    apply_swatch_colors(table, colors)
 
     table_axes.axis("off")
 
@@ -597,7 +326,7 @@ def _plot_run_to_pdf(
             smoothed_values = _ema(values, smooth_alpha)
 
             # Create figure with plot and table
-            fig, (plot_ax, table_ax) = _create_figure_with_table(num_rows=1)
+            fig, (plot_ax, table_ax) = create_figure_with_table(num_rows=1)
 
             # Plot the series
             plot_ax.plot(steps, smoothed_values, label=run_name, lw=1.5)
@@ -640,7 +369,7 @@ def _plot_by_tag_across_runs(
         all_tags.update(run_scalars.keys())
 
     # Precompute colors per run for consistent coloring across all tags
-    run_color = _build_run_color_map(sorted(runs.keys()))
+    run_color = assign_folder_based_colors(sorted(runs.keys()))
 
     for tag in sorted(all_tags):
         # Build entries first to know table size
@@ -655,7 +384,7 @@ def _plot_by_tag_across_runs(
             entries.append((run_name, steps, smoothed_values, c if c is not None else "black"))
 
         # Create figure sized to number of table rows
-        fig, (plot_ax, table_ax) = _create_figure_with_table(num_rows=len(entries))
+        fig, (plot_ax, table_ax) = create_figure_with_table(num_rows=len(entries))
 
         rows: List[List[str]] = []
         colors: List[str] = []
@@ -707,7 +436,7 @@ def export_tensorboard_to_pdf(cfg: Arguments) -> None:
     - Image summaries are not exported (raster format not vectorizable).
     - Runs are discovered as any directories containing `events.out.tfevents.*`.
     """
-    _configure_matplotlib()
+    configure_matplotlib()
 
     root = Path(cfg.log_dir).expanduser().resolve()
     out_dir = Path(cfg.out_dir).expanduser().resolve()
