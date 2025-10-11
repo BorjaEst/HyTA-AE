@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
 from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.patches import Patch
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from tensorboard.backend.event_processing import event_accumulator
@@ -30,10 +31,9 @@ except Exception:  # pragma: no cover - surfaced at runtime with clear error
 # Constants
 # -------------------------------------------------------------------------------------------
 HYPERPARAMETER_KEY = "latent_size"  # The hyperparameter to plot on x-axis
+DEFAULT_LEGEND_HPARAMS = ["layer2_size", "sparsity_lambda"]  # Hparams to display in legend
 
-TABLE_COLUMN_LABELS = ["", "group"]
 SWATCH_COLUMN_INDEX = 0
-GROUP_COLUMN_INDEX = 1
 COLOR_SWATCH_SYMBOL = "■"
 
 # Default figure and table dimensions
@@ -76,6 +76,12 @@ class Arguments(BaseSettings):
 
     # Metric reduction
     metric_reduce: str = Field(default="last", description="Reduction: last|min|max")
+
+    # Legend hyperparameters
+    legend_hparams: List[str] = Field(
+        default_factory=lambda: DEFAULT_LEGEND_HPARAMS.copy(),
+        description="Hyperparameters to display in legend and use for grouping",
+    )
 
 
 # -------------------------------------------------------------------------------------------
@@ -212,21 +218,86 @@ def _top_level_folder(run_name: str) -> str:
     return parts[0] if parts else run_name
 
 
-def _build_group_color_map(group_names: List[str]) -> Dict[str, str]:
-    """Assign one deterministic color per group using distinct base hues."""
-    if not group_names:
+def _build_group_key(run_name: str, hparams: Dict[str, Any], legend_hparams: List[str]) -> str:
+    """Build a group key from folder and legend hyperparameters.
+
+    Parameters
+    ----------
+    run_name : str
+        Run identifier (relative path).
+    hparams : Dict[str, Any]
+        Hyperparameters for this run.
+    legend_hparams : List[str]
+        Hyperparameters to include in grouping.
+
+    Returns
+    -------
+    str
+        Group key like 'folder|hp1=val1|hp2=val2'.
+    """
+    folder = _top_level_folder(run_name)
+    hp_parts = []
+    for hp in sorted(legend_hparams):
+        val = hparams.get(hp, "N/A")
+        hp_parts.append(f"{hp}={val}")
+    if hp_parts:
+        return f"{folder}|{'|'.join(hp_parts)}"
+    return folder
+
+
+def _build_group_color_map(group_keys: List[str]) -> Dict[str, str]:
+    """Assign colors per group with high contrast across folders, low within folder.
+
+    Groups from different folders get distinct base hues (high contrast).
+    Groups from the same folder with different hyperparameters get saturation/value
+    variants of that folder's hue (low contrast).
+
+    Parameters
+    ----------
+    group_keys : List[str]
+        Group keys like 'folder|hp1=val1|hp2=val2'.
+
+    Returns
+    -------
+    Dict[str, str]
+        Mapping group_key -> hex color string.
+    """
+    if not group_keys:
         return {}
-    group_names = sorted(group_names)
-    n_groups = max(1, len(group_names))
+
+    # Parse group keys into (folder, hparam_signature)
+    folder_groups: Dict[str, List[str]] = {}
+    for gk in group_keys:
+        parts = gk.split("|", 1)
+        folder = parts[0]
+        folder_groups.setdefault(folder, []).append(gk)
+
+    folder_names = sorted(folder_groups.keys())
+    n_folders = max(1, len(folder_names))
+
+    # Evenly spaced base hues for high contrast across folders
     hue_offset = 0.07
-    base_hues = [(hue_offset + i / n_groups) % 1.0 for i in range(n_groups)]
-    # Pick the vivid bright variant
-    sat, val = (0.95, 0.90)
-    out: Dict[str, str] = {}
-    for name, hue in zip(group_names, base_hues):
-        rgb = mcolors.hsv_to_rgb((hue, sat, val))
-        out[name] = mcolors.to_hex(rgb)
-    return out
+    base_hues = {f: (hue_offset + i / n_folders) % 1.0 for i, f in enumerate(folder_names)}
+
+    # Four distinct variants within each folder: vary saturation and brightness
+    variants: List[tuple[float, float]] = [
+        (0.95, 0.90),  # vivid and bright
+        (0.60, 0.90),  # pastel bright
+        (0.85, 0.70),  # vivid mid-bright
+        (1.00, 0.55),  # dark vivid
+    ]
+    variants = sorted(variants, key=lambda sv: (sv[1], sv[0]), reverse=True)
+
+    color_map: Dict[str, str] = {}
+    for folder in folder_names:
+        groups_in_folder = sorted(folder_groups[folder])
+        hue = base_hues[folder]
+        for idx, gk in enumerate(groups_in_folder):
+            sat, val = variants[idx % len(variants)]
+            rgb = mcolors.hsv_to_rgb((hue, sat, val))
+            color_map[gk] = mcolors.to_hex(rgb)
+
+    return color_map
 
 
 # -------------------------------------------------------------------------------------------
@@ -266,40 +337,68 @@ def _apply_swatch_colors(table, colors: List[str]) -> None:
 
 
 def _fit_table_full_width_by_content(
-    table,
+    table: plt.Table,
     ncols: int,
     swatch_col: int = SWATCH_COLUMN_INDEX,
-    group_col: int = GROUP_COLUMN_INDEX,
+    group_col: int = 1,
     total_width: float = TABLE_WIDTH,
     min_swatch: float = SWATCH_MIN_WIDTH,
 ) -> None:
-    """Fit table columns to content, then scale to occupy nearly full width."""
+    """Scale table columns to nearly fill figure width, with group column expandable.
+
+    This uses matplotlib's auto column width based on content, then scales to fill
+    the available width. The group column (similar to "run" in gen_timeseries) expands
+    to take remaining space after accounting for other columns.
+
+    Parameters
+    ----------
+    table : plt.Table
+        Table to adjust.
+    ncols : int
+        Number of columns in table.
+    swatch_col : int
+        Index of the color swatch column.
+    group_col : int
+        Index of group column to make expandable.
+    total_width : float
+        Target total width as fraction of axes width.
+    min_swatch : float
+        Minimum width for swatch column as fraction of axes width.
+    """
+    # Compute content-based widths
     try:
         table.auto_set_column_width(col=list(range(ncols)))
     except Exception:
         pass
 
+    # Extract current widths from header row
     widths = [
         table.get_celld().get((0, col), None).get_width() if (0, col) in table.get_celld() else 0.0
         for col in range(ncols)
     ]
 
+    # Enforce minimum swatch width
     if 0 <= swatch_col < ncols:
         widths[swatch_col] = max(widths[swatch_col], min_swatch)
 
+    # Validate group column index
     group_col = group_col if 0 <= group_col < ncols else 1
 
+    # Calculate space available for group column
     sum_non_group = sum(widths[col] for col in range(ncols) if col != group_col)
     remaining = max(0.0, total_width) - sum_non_group
 
     if remaining >= widths[group_col]:
+        # Enough space: allocate all remaining width to group column
         new_widths = widths.copy()
         new_widths[group_col] = remaining
     else:
+        # Not enough space: scale all columns proportionally
         total_current = sum(widths) or 1.0
         scale = total_width / total_current
         new_widths = [w * scale for w in widths]
 
+    # Apply new widths to all cells
     for col in range(ncols):
         for (row, c), cell in table.get_celld().items():
             if c == col:
@@ -324,14 +423,31 @@ def _create_figure_with_table(num_rows: int) -> tuple:
     )
 
 
-def _create_legend_table(table_axes, rows: List[List[str]], colors: List[str]) -> None:
-    """Create and style a legend table under a plot."""
+def _create_legend_table(
+    table_axes,
+    rows: List[List[str]],
+    row_colors: List[str],
+    column_labels: List[str],
+) -> None:
+    """Create and style a legend table under a plot.
+
+    Parameters
+    ----------
+    table_axes
+        Axes for the legend table.
+    rows : List[List[str]]
+        Table rows with text (swatch column should contain COLOR_SWATCH_SYMBOL).
+    row_colors : List[str]
+        Colors for each row's swatch.
+    column_labels : List[str]
+        Column header labels.
+    """
     if not rows:
         return
 
     table = table_axes.table(
         cellText=rows,
-        colLabels=TABLE_COLUMN_LABELS,
+        colLabels=column_labels,
         loc="center",
         bbox=[0, 0, 1, 1],
     )
@@ -341,18 +457,18 @@ def _create_legend_table(table_axes, rows: List[List[str]], colors: List[str]) -
     # Apply column width fitting
     _fit_table_full_width_by_content(
         table,
-        ncols=len(TABLE_COLUMN_LABELS),
+        ncols=len(column_labels),
         swatch_col=SWATCH_COLUMN_INDEX,
-        group_col=GROUP_COLUMN_INDEX,
+        group_col=1,
         total_width=TABLE_WIDTH,
         min_swatch=SWATCH_MIN_WIDTH,
     )
 
     # Apply cell styles
-    _apply_table_cell_styles(table, len(TABLE_COLUMN_LABELS), len(rows))
+    _apply_table_cell_styles(table, len(column_labels), len(rows))
 
-    # Apply color swatches
-    _apply_swatch_colors(table, colors)
+    # Apply swatch colors
+    _apply_swatch_colors(table, row_colors)
 
     table_axes.axis("off")
 
@@ -363,7 +479,8 @@ def _create_legend_table(table_axes, rows: List[List[str]], colors: List[str]) -
 def _plot_metric_by_latent_size(
     metric_tag: str,
     runs_data: Dict[str, Tuple[Dict[str, Any], float]],
-    group_color: Dict[str, str],
+    group_color_map: Dict[str, str],
+    legend_hparams: List[str],
     out_path: Path,
 ) -> None:
     """Create one PDF for a metric showing latent_size (x) vs metric (y) per group.
@@ -374,11 +491,18 @@ def _plot_metric_by_latent_size(
         The metric tag to plot.
     runs_data : Dict[str, Tuple[Dict[str, Any], float]]
         Mapping from run_name to (hparams, metric_value).
-    group_color : Dict[str, str]
-        Mapping from group name to color.
+    group_color_map : Dict[str, str]
+        Mapping from group_key to color.
+    legend_hparams : List[str]
+        Hyperparameter keys to display in legend.
     out_path : Path
         Output PDF file path.
     """
+    # Build group keys for each run
+    group_key_for_run: Dict[str, str] = {}
+    for run_name, (hparams, _) in runs_data.items():
+        group_key_for_run[run_name] = _build_group_key(run_name, hparams, legend_hparams)
+
     # Aggregate per-group: collect (latent_size, metric_value) per run
     group_points: Dict[str, List[Tuple[float, float]]] = {}
 
@@ -391,7 +515,7 @@ def _plot_metric_by_latent_size(
         except Exception:
             continue
 
-        g = _top_level_folder(run_name)
+        g = group_key_for_run[run_name]
         group_points.setdefault(g, []).append((latent_size_float, metric_val))
 
     # Filter out groups with no points
@@ -407,7 +531,7 @@ def _plot_metric_by_latent_size(
         pts_sorted = sorted(pts, key=lambda p: p[0])
         xs = [p[0] for p in pts_sorted]
         ys = [p[1] for p in pts_sorted]
-        c = group_color.get(g, "black")
+        c = group_color_map.get(g, "black")
         plot_ax.plot(
             xs,
             ys,
@@ -425,14 +549,38 @@ def _plot_metric_by_latent_size(
     plot_ax.set_ylabel(metric_tag.split("/")[-1])
     plot_ax.set_title(metric_tag)
 
-    # Build legend table rows (swatch, group)
-    rows: List[List[str]] = []
+    # Build legend table rows with hyperparameters
+    column_labels = ["", "Group"] + legend_hparams
+    legend_rows: List[List[str]] = []
     row_colors: List[str] = []
-    for g, _pts in sorted(group_entries, key=lambda it: it[0]):
-        rows.append([COLOR_SWATCH_SYMBOL, g])
-        row_colors.append(group_color.get(g, "black"))
 
-    _create_legend_table(table_ax, rows, row_colors)
+    for g, _pts in sorted(group_entries, key=lambda it: it[0]):
+        c = group_color_map.get(g, "black")
+        row: List[str] = [COLOR_SWATCH_SYMBOL, g]
+
+        # Extract hparam values from group key
+        # Group key format: "folder|hp1=val1|hp2=val2"
+        parts = g.split("|")
+        hparam_dict: Dict[str, str] = {}
+        for part in parts[1:]:  # skip folder part
+            if "=" in part:
+                k, v = part.split("=", 1)
+                hparam_dict[k] = v
+
+        # Add only the values (not "hp=val"), formatted as floats if possible
+        for hp_key in legend_hparams:
+            val = hparam_dict.get(hp_key, "N/A")
+            # Try to format as float for numeric values
+            try:
+                val_float = float(val)
+                row.append(_format_float(val_float))
+            except (ValueError, TypeError):
+                row.append(str(val))
+
+        legend_rows.append(row)
+        row_colors.append(c)
+
+    _create_legend_table(table_ax, legend_rows, row_colors, column_labels)
 
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -513,11 +661,11 @@ def export_latent_eval_to_pdf(cfg: Arguments) -> None:
         print("[gen_latenteval] no metric tags found", file=sys.stderr)
         return
 
-    # Group runs by top-level folder and assign one color per group
-    groups: Dict[str, List[str]] = {}
-    for rn in run_names:
-        groups.setdefault(_top_level_folder(rn), []).append(rn)
-    group_color = _build_group_color_map(list(groups.keys()))
+    # Build group keys and color map using folder + legend_hparams
+    hparams_dict = {rn: hp for rn, hp in zip(run_names, run_hparams)}
+    group_key_for_run = {rn: _build_group_key(rn, hparams_dict[rn], cfg.legend_hparams) for rn in run_names}
+    unique_groups = sorted(set(group_key_for_run.values()))
+    group_color_map = _build_group_color_map(unique_groups)
 
     # For each metric tag, load values and create a plot
     for tag in sorted(all_tags):
@@ -536,7 +684,13 @@ def export_latent_eval_to_pdf(cfg: Arguments) -> None:
         # Create one PDF for this metric
         tag_safe = tag.replace("/", "_")
         out_path = out_dir / f"{tag_safe}.pdf"
-        _plot_metric_by_latent_size(tag, runs_with_metric, group_color, out_path)
+        _plot_metric_by_latent_size(
+            tag,
+            runs_with_metric,
+            group_color_map,
+            cfg.legend_hparams,
+            out_path,
+        )
         print(f"[gen_latenteval] exported: {out_path}")
 
 
