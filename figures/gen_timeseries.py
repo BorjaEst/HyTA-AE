@@ -58,7 +58,7 @@ class Arguments(BaseSettings):
 
     # IO settings
     log_dir: str = Field(default="logs", description="Directory with experiment logs to parse")
-    out_dir: str = Field(default="figures/tensorboard_pdf", description="Directory for output PDFs")
+    out_dir: str = Field(default="figures/timeseries", description="Directory for output PDFs")
 
     # Filtering & plotting
     smooth_alpha: float = Field(default=0.0, ge=0.0, lt=1.0, description="EMA smoothing factor (0=no smoothing)")
