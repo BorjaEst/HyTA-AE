@@ -10,6 +10,7 @@ from typing import Dict, List, Tuple
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+from matplotlib import colors as mcolors
 from matplotlib.backends.backend_pdf import PdfPages
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -33,6 +34,11 @@ SWATCH_MIN_WIDTH = 0.02
 # Font sizes
 FONT_SIZE_VALUE = 9
 FONT_SIZE_TITLE = 11
+
+# Dynamic sizing for plots with many legend/table rows
+BASE_PLOT_HEIGHT_IN = 3.6
+TABLE_ROW_HEIGHT_IN = 0.25
+TABLE_HEADER_HEIGHT_IN = 0.35
 
 
 # -------------------------------------------------------------------------------------------
@@ -190,8 +196,6 @@ def _ema(values: List[float], alpha: float) -> List[float]:
 
 # -------------------------------------------------------------------------------------------
 # Matplotlib Configuration
-# -------------------------------------------------------------------------------------------# -------------------------------------------------------------------------------------------
-# Matplotlib Configuration
 # -------------------------------------------------------------------------------------------
 def _configure_matplotlib() -> None:
     """Set Matplotlib defaults for publication-ready vector output."""
@@ -233,6 +237,81 @@ def _format_float(value: float) -> str:
 # -------------------------------------------------------------------------------------------
 # Table Formatting
 # -------------------------------------------------------------------------------------------
+def _top_level_folder(run_name: str) -> str:
+    """Extract the top-level folder from a run name like 'folder/sub/run'.
+
+    Parameters
+    ----------
+    run_name : str
+        Relative run path (root-relative), with '/' separators.
+
+    Returns
+    -------
+    str
+        The first path component, or the entire string if no '/' present.
+    """
+    if not run_name:
+        return ""
+    parts = run_name.split("/")
+    return parts[0] if parts else run_name
+
+
+def _build_run_color_map(run_names: List[str]) -> Dict[str, str]:
+    """Assign deterministic colors per run with grouping by top-level folder.
+
+    Different folders get distinct base hues (high contrast). Runs within the
+    same folder get shade variations of that hue (lower contrast).
+
+    Parameters
+    ----------
+    run_names : List[str]
+        Run identifiers (root-relative paths like 'folder/runX').
+
+    Returns
+    -------
+    Dict[str, str]
+        Mapping run_name -> hex color string.
+    """
+    if not run_names:
+        return {}
+
+    # Group run names by their top-level folder
+    groups: Dict[str, List[str]] = {}
+    for rn in run_names:
+        groups.setdefault(_top_level_folder(rn), []).append(rn)
+
+    group_names = sorted(groups.keys())
+    n_groups = max(1, len(group_names))
+
+    # Evenly spaced base hues for high contrast across groups
+    # Avoid starting exactly at 0.0 to reduce collision with default red
+    hue_offset = 0.07
+    base_hues = {g: (hue_offset + i / n_groups) % 1.0 for i, g in enumerate(group_names)}
+
+    # Four distinct variants within each group: vary saturation and brightness
+    # to produce four clearly distinguishable shades of the same hue before
+    # cycling. Order chosen for perceptual spread in typical themes.
+    variants: List[tuple[float, float]] = [
+        (0.95, 0.90),  # vivid and bright
+        (0.60, 0.90),  # pastel bright
+        (0.85, 0.70),  # vivid mid-bright
+        (1.00, 0.55),  # dark vivid
+    ]
+    # Ensure ordering from more bright to less bright (value desc, then sat desc)
+    variants = sorted(variants, key=lambda sv: (sv[1], sv[0]), reverse=True)
+
+    color_map: Dict[str, str] = {}
+    for g in group_names:
+        runs_in_group = sorted(groups[g])
+        hue = base_hues[g]
+        for idx, rn in enumerate(runs_in_group):
+            sat, val = variants[idx % len(variants)]
+            rgb = mcolors.hsv_to_rgb((hue, sat, val))
+            color_map[rn] = mcolors.to_hex(rgb)
+
+    return color_map
+
+
 def _apply_table_cell_styles(table, num_cols: int, num_data_rows: int) -> None:
     """Apply consistent styling to all table cells.
 
@@ -415,19 +494,30 @@ def _build_stats_table_row(run_name: str, stats: Dict[str, str]) -> List[str]:
 # -------------------------------------------------------------------------------------------
 # Figure Creation
 # -------------------------------------------------------------------------------------------
-def _create_figure_with_table():
-    """Create a figure with plot axes and table axes.
+def _create_figure_with_table(num_rows: int) -> tuple:
+    """Create a figure with plot axes and table axes sized for table rows.
+
+    Parameters
+    ----------
+    num_rows : int
+        Number of data rows in the stats table (excluding header). Used to
+        compute a suitable figure height and the plot/table height ratio.
 
     Returns
     -------
     tuple
         (fig, plot_axes, table_axes)
     """
+    num_rows = max(0, int(num_rows))
+    table_h = TABLE_HEADER_HEIGHT_IN + num_rows * TABLE_ROW_HEIGHT_IN
+    plot_h = BASE_PLOT_HEIGHT_IN
+    total_h = plot_h + table_h
+
     return plt.subplots(
         2,
         1,
-        figsize=(FIGURE_WIDTH, FIGURE_HEIGHT),
-        gridspec_kw={"height_ratios": PLOT_TO_TABLE_RATIO},
+        figsize=(FIGURE_WIDTH, total_h),
+        gridspec_kw={"height_ratios": [plot_h, table_h]},
     )
 
 
@@ -507,7 +597,7 @@ def _plot_run_to_pdf(
             smoothed_values = _ema(values, smooth_alpha)
 
             # Create figure with plot and table
-            fig, (plot_ax, table_ax) = _create_figure_with_table()
+            fig, (plot_ax, table_ax) = _create_figure_with_table(num_rows=1)
 
             # Plot the series
             plot_ax.plot(steps, smoothed_values, label=run_name, lw=1.5)
@@ -549,24 +639,30 @@ def _plot_by_tag_across_runs(
     for run_scalars in runs.values():
         all_tags.update(run_scalars.keys())
 
+    # Precompute colors per run for consistent coloring across all tags
+    run_color = _build_run_color_map(sorted(runs.keys()))
+
     for tag in sorted(all_tags):
-        # Create figure with plot and table
-        fig, (plot_ax, table_ax) = _create_figure_with_table()
-
-        rows: List[List[str]] = []
-        colors: List[str] = []
-
+        # Build entries first to know table size
+        entries: List[tuple[str, List[int], List[float], str]] = []  # (run_name, steps, smoothed, color)
         for run_name in sorted(runs.keys()):
             run_scalars = runs[run_name]
             if tag not in run_scalars:
                 continue
-
             steps, values = run_scalars[tag]
             smoothed_values = _ema(values, smooth_alpha)
+            c = run_color.get(run_name, None)
+            entries.append((run_name, steps, smoothed_values, c if c is not None else "black"))
 
+        # Create figure sized to number of table rows
+        fig, (plot_ax, table_ax) = _create_figure_with_table(num_rows=len(entries))
+
+        rows: List[List[str]] = []
+        colors: List[str] = []
+
+        for run_name, steps, smoothed_values, line_color in entries:
             # Plot the series
-            plot_ax.plot(steps, smoothed_values, lw=1.5, label=run_name)
-            line_color = plot_ax.lines[-1].get_color() if plot_ax.lines else "black"
+            plot_ax.plot(steps, smoothed_values, lw=1.5, label=run_name, color=line_color)
 
             # Build statistics row
             stats = _compute_series_stats(steps, smoothed_values)
@@ -618,13 +714,13 @@ def export_tensorboard_to_pdf(cfg: Arguments) -> None:
 
     # Validate input directory
     if not root.exists():
-        print(f"[logs2pdf] log_dir does not exist: {root}", file=sys.stderr)
+        print(f"[gen_timeseries] log_dir does not exist: {root}", file=sys.stderr)
         return
 
     # Discover run directories
     run_dirs = _find_run_dirs(root)
     if not run_dirs:
-        print(f"[logs2pdf] no TensorBoard runs found in: {root}", file=sys.stderr)
+        print(f"[gen_timeseries] no TensorBoard runs found in: {root}", file=sys.stderr)
         return
 
     # Load all scalar data
@@ -636,17 +732,18 @@ def export_tensorboard_to_pdf(cfg: Arguments) -> None:
             if scalars:
                 runs_data[run_name] = scalars
         except Exception as exc:  # pragma: no cover
-            print(f"[logs2pdf] failed to load {run_dir}: {exc}", file=sys.stderr)
+            print(f"[gen_timeseries] failed to load {run_dir}: {exc}", file=sys.stderr)
             continue
 
     if not runs_data:
-        print("[logs2pdf] no scalar tags found to export", file=sys.stderr)
+        print("[gen_timeseries] no scalar tags found to export", file=sys.stderr)
         return
 
     # Export based on configuration
     if cfg.combine_runs:
-        _plot_by_tag_across_runs(runs_data, out_dir, float(cfg.smooth_alpha))
-        print(f"[logs2pdf] exported PDFs by-tag under: {out_dir / 'by_tag'}")
+        by_tag_dir = out_dir / "by_tag"
+        _plot_by_tag_across_runs(runs_data, by_tag_dir, float(cfg.smooth_alpha))
+        print(f"[gen_timeseries] exported PDFs by-tag under: {by_tag_dir}")
     else:
         for run_name, series in runs_data.items():
             run_safe = run_name.replace("/", "_")
@@ -657,7 +754,7 @@ def export_tensorboard_to_pdf(cfg: Arguments) -> None:
                 pdf_path=pdf_path,
                 smooth_alpha=float(cfg.smooth_alpha),
             )
-        print(f"[logs2pdf] exported PDFs by-run under: {out_dir / 'by_run'}")
+        print(f"[gen_timeseries] exported PDFs by-run under: {out_dir / 'by_run'}")
 
 
 # -------------------------------------------------------------------------------------------
@@ -669,8 +766,8 @@ if __name__ == "__main__":
     Example
     -------
     Export all runs combined by tag with smoothing::
-    
-        python -m figures.logs2pdf --log_dir logs --out_dir figures/tb_pdf \\
+
+        python -m figures.gen_timeseries --log_dir logs --out_dir figures/timeseries \\
             --combine_runs true --smooth_alpha 0.9
     """
     cfg = Arguments()
