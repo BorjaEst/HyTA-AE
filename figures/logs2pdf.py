@@ -585,10 +585,8 @@ def _plot_by_tag_across_runs(
 
         # Save to PDF
         tag_safe = tag.replace("/", "_")
-        out_path = out_dir / "by_tag"
-        out_path.mkdir(parents=True, exist_ok=True)
-        pdf_path = out_path / f"{tag_safe}.pdf"
-        fig.savefig(pdf_path)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_dir / f"{tag_safe}.pdf")
         plt.close(fig)
 
 
