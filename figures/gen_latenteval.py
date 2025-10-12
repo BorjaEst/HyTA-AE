@@ -6,13 +6,12 @@ publication-ready line plots showing how metrics vary with latent_size.
 One PDF is created per metric, with runs grouped by top-level folder.
 """
 
-from __future__ import annotations
-
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
+import yaml
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from tensorboard.backend.event_processing import event_accumulator
@@ -31,12 +30,6 @@ from ehc_sn.utils.figures import (
     fit_table_to_full_width,
     format_float,
 )
-
-try:  # YAML is used to read hyperparameters
-    import yaml
-except Exception:  # pragma: no cover - surfaced at runtime with clear error
-    yaml = None  # type: ignore[assignment]
-
 
 # -------------------------------------------------------------------------------------------
 # Constants
@@ -58,9 +51,15 @@ class Arguments(BaseSettings):
         Directory containing TensorBoard experiment logs.
     out_dir : str
         Directory where output PDFs will be saved.
-    metric_reduce : str
-        How to reduce each metric series into a single value per run: ``last``,
-        ``min``, or ``max``.
+    step_start : Optional[int]
+        Starting step for metric extraction. If None, uses first available step.
+    step_end : Optional[int]
+        Ending step for metric extraction. If None, uses last available step.
+    metric_reduction : str
+        How to reduce metric values within the step range: ``last`` (default),
+        ``min``, ``max``, or ``mean``.
+    legend_hparams : List[str]
+        Hyperparameters to display in the legend table and use for grouping runs.
     """
 
     model_config = SettingsConfigDict(extra="forbid", cli_parse_args=True)
@@ -69,8 +68,14 @@ class Arguments(BaseSettings):
     log_dir: str = Field(default="logs", description="Directory with experiment logs to parse")
     out_dir: str = Field(default="figures/latenteval", description="Directory for output PDFs")
 
-    # Metric reduction
-    metric_reduce: str = Field(default="last", description="Reduction: last|min|max")
+    # Metric extraction
+    step_start: Optional[int] = Field(
+        default=None, description="Starting step for metric extraction (None=first available step)"
+    )
+    step_end: Optional[int] = Field(
+        default=None, description="Ending step for metric extraction (None=last available step)"
+    )
+    metric_reduction: str = Field(default="last", description="Reduction method over step range: last|min|max|mean")
 
     # Legend hyperparameters
     legend_hparams: List[str] = Field(
@@ -131,8 +136,29 @@ def _load_hparams(hp_file: Path) -> Dict[str, Any]:
     return flat
 
 
-def _load_metric_value(run_dir: Path, tag: str, reduce: str) -> Optional[float]:
-    """Load a scalar series for ``tag`` and reduce to a single value per run."""
+def _load_metric_value(
+    run_dir: Path, tag: str, step_start: Optional[int] = None, step_end: Optional[int] = None, reduction: str = "last"
+) -> Optional[float]:
+    """Load a scalar series for ``tag`` and extract a single value from step range.
+
+    Parameters
+    ----------
+    run_dir : Path
+        Directory containing TensorBoard event files.
+    tag : str
+        Metric tag to load.
+    step_start : Optional[int]
+        Starting step (inclusive). If None, uses first available step.
+    step_end : Optional[int]
+        Ending step (inclusive). If None, uses last available step.
+    reduction : str
+        Reduction method over the step range: 'last', 'min', 'max', or 'mean'.
+
+    Returns
+    -------
+    Optional[float]
+        Metric value, or None if not available.
+    """
     if event_accumulator is None:
         raise RuntimeError("tensorboard is not available. Please `pip install tensorboard`.")
 
@@ -149,14 +175,29 @@ def _load_metric_value(run_dir: Path, tag: str, reduce: str) -> Optional[float]:
     if not scalars:
         return None
 
-    values = [float(s.value) for s in scalars]
+    # Extract steps and values within the specified range
+    filtered_values: List[float] = []
+    for s in scalars:
+        step = int(s.step)
+        # Check if step is within range
+        if step_start is not None and step < step_start:
+            continue
+        if step_end is not None and step > step_end:
+            continue
+        filtered_values.append(float(s.value))
 
-    if reduce == "min":
-        return min(values)
-    elif reduce == "max":
-        return max(values)
+    if not filtered_values:
+        return None
+
+    # Apply reduction method
+    if reduction == "min":
+        return min(filtered_values)
+    elif reduction == "max":
+        return max(filtered_values)
+    elif reduction == "mean":
+        return sum(filtered_values) / len(filtered_values)
     else:  # "last" default
-        return values[-1]
+        return filtered_values[-1]
 
 
 def _load_all_metrics(run_dir: Path) -> List[str]:
@@ -282,6 +323,7 @@ def _plot_metric_by_latent_size(
     group_color_map: Dict[str, str],
     legend_hparams: List[str],
     out_path: Path,
+    step_info: str,
 ) -> None:
     """Create one PDF for a metric showing latent_size (x) vs metric (y) per group.
 
@@ -297,6 +339,8 @@ def _plot_metric_by_latent_size(
         Hyperparameter keys to display in legend.
     out_path : Path
         Output PDF file path.
+    step_info : str
+        Step information to display in title.
     """
     # Build group keys for each run
     group_key_for_run: Dict[str, str] = {}
@@ -347,7 +391,7 @@ def _plot_metric_by_latent_size(
 
     plot_ax.set_xlabel(HYPERPARAMETER_KEY)
     plot_ax.set_ylabel(metric_tag.split("/")[-1])
-    plot_ax.set_title(metric_tag)
+    plot_ax.set_title(f"{metric_tag} ({step_info})")
 
     # Build legend table rows with hyperparameters
     column_labels = ["", "Group"] + legend_hparams
@@ -461,6 +505,16 @@ def export_latent_eval_to_pdf(cfg: Arguments) -> None:
         print("[gen_latenteval] no metric tags found", file=sys.stderr)
         return
 
+    # Build step range info string for titles
+    if cfg.step_start is not None and cfg.step_end is not None:
+        step_info = f"steps={cfg.step_start}..{cfg.step_end}, {cfg.metric_reduction}"
+    elif cfg.step_start is not None:
+        step_info = f"steps={cfg.step_start}..end, {cfg.metric_reduction}"
+    elif cfg.step_end is not None:
+        step_info = f"steps=start..{cfg.step_end}, {cfg.metric_reduction}"
+    else:
+        step_info = f"steps=all, {cfg.metric_reduction}"
+
     # Build group keys and color map using folder + legend_hparams
     hparams_dict = {rn: hp for rn, hp in zip(run_names, run_hparams)}
     group_key_for_run = {rn: _build_group_key(rn, hparams_dict[rn], cfg.legend_hparams) for rn in run_names}
@@ -473,7 +527,7 @@ def export_latent_eval_to_pdf(cfg: Arguments) -> None:
         runs_with_metric: Dict[str, Tuple[Dict[str, Any], float]] = {}
 
         for run_dir, run_name, hparams in zip(run_dirs, run_names, run_hparams):
-            metric_val = _load_metric_value(run_dir, tag, cfg.metric_reduce)
+            metric_val = _load_metric_value(run_dir, tag, cfg.step_start, cfg.step_end, cfg.metric_reduction)
             if metric_val is None:
                 continue
             runs_with_metric[run_name] = (hparams, metric_val)
@@ -490,6 +544,7 @@ def export_latent_eval_to_pdf(cfg: Arguments) -> None:
             group_color_map,
             cfg.legend_hparams,
             out_path,
+            step_info,
         )
         print(f"[gen_latenteval] exported: {out_path}")
 
@@ -502,10 +557,21 @@ if __name__ == "__main__":
 
     Example
     -------
-    Export latent_size comparison plots for all metrics::
+    Export using last value from all steps (default)::
 
-        python -m figures.gen_latenteval --log_dir logs --out_dir figures/latenteval \\
-            --metric_reduce last
+        python -m figures.gen_latenteval --log_dir logs --out_dir figures/latenteval
+
+    Export using minimum value from steps 1000 to 5000::
+
+        python -m figures.gen_latenteval --step_start 1000 --step_end 5000 --metric_reduction min
+
+    Export using mean value from step 2000 onwards::
+
+        python -m figures.gen_latenteval --step_start 2000 --metric_reduction mean
+
+    Export using last value up to step 3000::
+
+        python -m figures.gen_latenteval --step_end 3000 --metric_reduction last
     """
     cfg = Arguments()
     export_latent_eval_to_pdf(cfg)
