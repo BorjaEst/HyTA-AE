@@ -57,7 +57,7 @@ class DFALayer(nn.Linear):
 
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
         currents = super().forward(*args, **kwargs)
-        self.activations = torch.tanh(nn.functional.gelu(currents))
+        self.activations = torch.tanh(currents)
         return self.activations.detach()  # enforce locality
 
     @property
@@ -119,7 +119,7 @@ class Autoencoder(pl.LightningModule):
 
         # Initialize encoder and decoder with DFA layers
         self.encoder = Encoder(n_inputs=25**2, n_h1=layer1_size, n_h2=layer2_size)
-        self.latent = nn.Linear(layer2_size, latent_size)
+        self.latent = DFALayer(layer2_size, latent_size, n_error=25**2)
         self.decoder = Decoder(latent_size, layer2_size, layer1_size, n_inputs=25**2)
         self.output = nn.Linear(layer1_size, out_features=25**2)
 
@@ -142,7 +142,7 @@ class Autoencoder(pl.LightningModule):
     def _encode(self, inputs: Tensor) -> Tensor:
         encoder_signals = self.encoder(flatten(inputs, start_dim=1))
         activations = self.latent(encoder_signals[-1])
-        return torch.tanh(nn.functional.relu(activations))
+        return nn.functional.relu(activations)
 
     @torch.inference_mode()
     def encode(self, sensors: Tensor) -> Tensor:
@@ -173,13 +173,14 @@ class Autoencoder(pl.LightningModule):
         completion = x_incomplete * mask + reconstruction * (1 - mask)
         error = reconstruction * mask - x_incomplete  # DFA feedback error only on visible pixels
 
-        # Train the autoencoder layers with dfa, sparsity, htl and standard loss
+        # Train the autoencoder layers with dfa, sparsity and standard loss
         local_l1 = self.encoder.feedback(flatten(error, start_dim=1))
         local_l2 = self.decoder.feedback(flatten(error, start_dim=1))
-        local_l3 = self.reconstruction_loss(reconstruction, completion.detach())
-        local_l4 = self.sparsity_loss(latent)
+        local_l3 = self.latent.feedback(flatten(error, start_dim=1))
+        local_l4 = self.reconstruction_loss(reconstruction, completion.detach())
+        local_l5 = self.sparsity_loss(latent)
 
-        return local_l1 + local_l2 + local_l3 + local_l4 * self.hparams.sparsity_lambda
+        return local_l1 + local_l2 + local_l3 + local_l4 + self.hparams.sparsity_lambda * local_l5
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
