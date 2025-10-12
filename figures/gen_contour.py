@@ -9,26 +9,19 @@ function of two selected hyperparameters (defaults: ``latent_size`` and
 One PDF is created per scalar metric tag discovered across runs.
 """
 
-from __future__ import annotations
-
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+import yaml
 from matplotlib.tri import Triangulation
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from tensorboard.backend.event_processing import event_accumulator
 
 from ehc_sn.utils.figures import assign_folder_based_colors, configure_matplotlib, extract_top_level_folder
-
-try:  # Optional dependency for reading YAML hparams
-    import yaml  # type: ignore
-except Exception:  # pragma: no cover - handled at runtime
-    yaml = None
-
 
 # -------------------------------------------------------------------------------------------
 # Constants
@@ -81,12 +74,8 @@ class Arguments(BaseSettings):
     out_dir: str = Field(default="figures/contours", description="Directory for output PDFs")
 
     # Metric extraction
-    step_start: Optional[int] = Field(
-        default=None, description="Starting step for metric extraction (None=first available step)"
-    )
-    step_end: Optional[int] = Field(
-        default=None, description="Ending step for metric extraction (None=last available step)"
-    )
+    step_start: Optional[int] = Field(default=None, description="Starting step for metric extraction")
+    step_end: Optional[int] = Field(default=None, description="Ending step for metric extraction")
     metric_reduction: str = Field(default="last", description="Reduction method over step range: last|min|max|mean")
 
     # Hyperparameters for axes
@@ -100,6 +89,9 @@ class Arguments(BaseSettings):
     annotate_points: bool = Field(default=False, description="Annotate each point with metric value")
     vmin: Optional[float] = Field(default=None, description="Lower bound for color scale")
     vmax: Optional[float] = Field(default=None, description="Upper bound for color scale")
+    # Axis scaling
+    log_x: bool = Field(default=False, description="Use logarithmic scale for x-axis (hparam_x)")
+    log_y: bool = Field(default=False, description="Use logarithmic scale for y-axis (hparam_y)")
 
 
 # -------------------------------------------------------------------------------------------
@@ -286,6 +278,7 @@ def _plot_contour_for_metric(
     points: List[Tuple[float, float, float, str]],
     out_path: Path,
     cfg: Arguments,
+    step_info: str,
 ) -> None:
     """Create one PDF for a metric showing z(tag) over (hparam_x, hparam_y).
 
@@ -333,7 +326,7 @@ def _plot_contour_for_metric(
 
     ax.set_xlabel(cfg.hparam_x)
     ax.set_ylabel(cfg.hparam_y)
-    ax.set_title(tag)
+    ax.set_title(f"{tag} ({step_info})")
 
     # Optional scatter overlay colored by folder for quick provenance
     if cfg.overlay_scatter:
@@ -347,6 +340,28 @@ def _plot_contour_for_metric(
                     ax.annotate(f"{z:.3g}", (x, y), textcoords="offset points", xytext=(3, 2), fontsize=8)
                 except Exception:
                     pass
+
+    # Apply axis scales (guard against non-positive values)
+    try:
+        if getattr(cfg, "log_x", False):
+            if np.any(X <= 0):
+                print(
+                    f"[gen_contour] non-positive values found on x-axis for tag={tag}; disabling log_x",
+                    file=sys.stderr,
+                )
+            else:
+                ax.set_xscale("log")
+        if getattr(cfg, "log_y", False):
+            if np.any(Y <= 0):
+                print(
+                    f"[gen_contour] non-positive values found on y-axis for tag={tag}; disabling log_y",
+                    file=sys.stderr,
+                )
+            else:
+                ax.set_yscale("log")
+    except Exception:
+        # Fail-safe: keep linear scales if log scaling fails
+        pass
 
     fig.tight_layout()
     fig.savefig(out_path)
@@ -423,6 +438,16 @@ def export_hp_contours_to_pdf(cfg: Arguments) -> None:
         print("[gen_contour] no metric tags found", file=sys.stderr)
         return
 
+    # Build step range info string for titles (match gen_latenteval style)
+    if cfg.step_start is not None and cfg.step_end is not None:
+        step_info = f"steps={cfg.step_start}..{cfg.step_end}, {cfg.metric_reduction}"
+    elif cfg.step_start is not None:
+        step_info = f"steps={cfg.step_start}..end, {cfg.metric_reduction}"
+    elif cfg.step_end is not None:
+        step_info = f"steps=start..{cfg.step_end}, {cfg.metric_reduction}"
+    else:
+        step_info = f"steps=all, {cfg.metric_reduction}"
+
     # For each metric tag, collect (x, y, z) across runs and draw a contour
     for tag in sorted(all_tags):
         points: List[Tuple[float, float, float, str]] = []  # (x, y, z, run_name)
@@ -451,7 +476,8 @@ def export_hp_contours_to_pdf(cfg: Arguments) -> None:
 
         tag_safe = tag.replace("/", "_")
         out_path = out_dir / f"{tag_safe}_contour.pdf"
-        _plot_contour_for_metric(tag, points, out_path, cfg)
+        _plot_contour_for_metric(tag, points, out_path, cfg, step_info)
+        print(f"[gen_contour] exported: {out_path}")
 
 
 # -------------------------------------------------------------------------------------------
