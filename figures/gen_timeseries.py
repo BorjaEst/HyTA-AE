@@ -63,6 +63,7 @@ class Arguments(BaseSettings):
     # Filtering & plotting
     smooth_alpha: float = Field(default=0.0, ge=0.0, lt=1.0, description="EMA smoothing factor (0=no smoothing)")
     combine_runs: bool = Field(default=True, description="Export one PDF per tag across runs")
+    log_scale: bool = Field(default=False, description="Use logarithmic scale for y-axis")
 
 
 # -------------------------------------------------------------------------------------------
@@ -301,6 +302,7 @@ def _plot_run_to_pdf(
     scalars: Dict[str, Tuple[List[int], List[float]]],
     pdf_path: Path,
     smooth_alpha: float,
+    log_scale: bool = False,
 ) -> None:
     """Create a multi-page PDF for one run; one page per tag.
 
@@ -314,6 +316,8 @@ def _plot_run_to_pdf(
         Output PDF file path.
     smooth_alpha : float
         EMA smoothing factor.
+    log_scale : bool
+        If True, use logarithmic scale for y-axis.
     """
     if not scalars:
         return
@@ -333,6 +337,8 @@ def _plot_run_to_pdf(
             plot_ax.set_xlabel("step")
             plot_ax.set_ylabel(tag.split("/")[-1])
             plot_ax.set_title(f"{tag} — {run_name}")
+            if log_scale:
+                plot_ax.set_yscale("log")
 
             # Get line color for swatch
             line_color = plot_ax.lines[-1].get_color() if plot_ax.lines else "black"
@@ -351,6 +357,7 @@ def _plot_by_tag_across_runs(
     runs: Dict[str, Dict[str, Tuple[List[int], List[float]]]],
     out_dir: Path,
     smooth_alpha: float,
+    log_scale: bool = False,
 ) -> None:
     """Export one PDF per tag, overlaying all runs.
 
@@ -362,6 +369,8 @@ def _plot_by_tag_across_runs(
         Output directory for PDFs.
     smooth_alpha : float
         EMA smoothing factor.
+    log_scale : bool
+        If True, use logarithmic scale for y-axis.
     """
     # Collect union of all tags across runs
     all_tags: set[str] = set()
@@ -402,6 +411,8 @@ def _plot_by_tag_across_runs(
         plot_ax.set_xlabel("step")
         plot_ax.set_ylabel(tag.split("/")[-1])
         plot_ax.set_title(tag)
+        if log_scale:
+            plot_ax.set_yscale("log")
 
         # Create statistics table
         _create_stats_table(table_ax, rows, colors)
@@ -471,7 +482,7 @@ def export_tensorboard_to_pdf(cfg: Arguments) -> None:
     # Export based on configuration
     if cfg.combine_runs:
         by_tag_dir = out_dir / "by_tag"
-        _plot_by_tag_across_runs(runs_data, by_tag_dir, float(cfg.smooth_alpha))
+        _plot_by_tag_across_runs(runs_data, by_tag_dir, float(cfg.smooth_alpha), cfg.log_scale)
         print(f"[gen_timeseries] exported PDFs by-tag under: {by_tag_dir}")
     else:
         for run_name, series in runs_data.items():
@@ -482,6 +493,7 @@ def export_tensorboard_to_pdf(cfg: Arguments) -> None:
                 scalars=series,
                 pdf_path=pdf_path,
                 smooth_alpha=float(cfg.smooth_alpha),
+                log_scale=cfg.log_scale,
             )
         print(f"[gen_timeseries] exported PDFs by-run under: {out_dir / 'by_run'}")
 
