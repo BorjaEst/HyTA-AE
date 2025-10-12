@@ -309,10 +309,9 @@ def _plot_contour_for_metric(
         return
 
     # Determine color limits
-    vmin = float(cfg.vmin) if cfg.vmin is not None else float(np.nanmin(Z))
-    vmax = float(cfg.vmax) if cfg.vmax is not None else float(np.nanmax(Z))
-    if not np.isfinite(vmin) or not np.isfinite(vmax):
-        vmin, vmax = None, None
+    # Use user-defined limits if provided, otherwise let matplotlib auto-scale
+    vmin = float(cfg.vmin) if cfg.vmin is not None else None
+    vmax = float(cfg.vmax) if cfg.vmax is not None else None
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -320,9 +319,18 @@ def _plot_contour_for_metric(
     fig, ax = plt.subplots(figsize=(7.5, 4.8))
 
     tri = Triangulation(X, Y)
-    cf = ax.tricontourf(tri, Z, levels=int(cfg.levels), cmap=cfg.cmap, vmin=vmin, vmax=vmax)
-    ax.tricontour(tri, Z, levels=int(cfg.levels), colors="k", linewidths=0.35, alpha=0.55)
-    cbar = fig.colorbar(cf, ax=ax, label=tag.split("/")[-1])
+
+    # Generate explicit contour levels within vmin/vmax range when both are user-defined
+    if cfg.vmin is not None and cfg.vmax is not None:
+        levels_array = np.linspace(vmin, vmax, int(cfg.levels))
+        cf = ax.tricontourf(tri, Z, levels=levels_array, cmap=cfg.cmap, vmin=vmin, vmax=vmax, extend="both")
+        ax.tricontour(tri, Z, levels=levels_array, colors="k", linewidths=0.35, alpha=0.55)
+    else:
+        # Auto-scale levels based on data when vmin/vmax not both specified
+        cf = ax.tricontourf(tri, Z, levels=int(cfg.levels), cmap=cfg.cmap, vmin=vmin, vmax=vmax)
+        ax.tricontour(tri, Z, levels=int(cfg.levels), colors="k", linewidths=0.35, alpha=0.55)
+
+    cbar = fig.colorbar(cf, ax=ax)
 
     ax.set_xlabel(cfg.hparam_x)
     ax.set_ylabel(cfg.hparam_y)
