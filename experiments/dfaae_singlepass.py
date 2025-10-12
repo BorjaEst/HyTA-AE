@@ -48,7 +48,6 @@ class Experiment(BaseSettings):
 # -------------------------------------------------------------------------------------------
 class DFALayer(nn.Linear):
     def __init__(self, n_in: int, n_out: int, n_error: int):
-
         super().__init__(in_features=n_in, out_features=n_out, bias=True)
         self.error_features = n_error
         self.register_buffer("activations", None)  # Starts without activation values

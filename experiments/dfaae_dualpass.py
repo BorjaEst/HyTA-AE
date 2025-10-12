@@ -56,7 +56,7 @@ class DFALayer(nn.Linear):
 
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
         currents = super().forward(*args, **kwargs)
-        self.activations = torch.tanh(nn.functional.gelu(currents))
+        self.activations = torch.tanh(currents)
         return self.activations.detach()  # enforce locality
 
     @property
@@ -69,7 +69,6 @@ class DFALayer(nn.Linear):
         return nn.functional.mse_loss(self.activations, target, reduction="mean")
 
     def reset_feedback(self) -> None:
-        """Reinitialize the fixed feedback matrix with a uniform distribution."""
         inv_limit = math.sqrt(self.error_features)
         self.fb_weight.bernoulli_(0.5).mul_(2).sub_(1).div_(inv_limit)
 
@@ -119,7 +118,7 @@ class Autoencoder(pl.LightningModule):
 
         # Initialize encoder and decoder with DFA layers
         self.encoder = Encoder(n_inputs=25**2, n_h1=ca1_size, n_h2=ca3_size)
-        self.latent = nn.Linear(ca3_size, dg_size)
+        self.latent = DFALayer(ca3_size, dg_size, n_error=25**2)
         self.decoder = Decoder(dg_size, ca3_size, ca1_size, n_inputs=25**2)
         self.output = nn.Linear(ca1_size, out_features=25**2)
 
@@ -142,7 +141,7 @@ class Autoencoder(pl.LightningModule):
     def _encode(self, inputs: Tensor) -> Tensor:
         encoder_signals = self.encoder(flatten(inputs, start_dim=1))
         activations = self.latent(encoder_signals[-1])
-        return torch.tanh(nn.functional.relu(activations))
+        return nn.functional.relu(activations)
 
     @torch.inference_mode()
     def encode(self, sensors: Tensor) -> Tensor:
