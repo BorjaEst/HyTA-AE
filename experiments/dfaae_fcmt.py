@@ -17,7 +17,7 @@ from ehc_sn.data.obstacle_maps import DataGenerator, DataParams
 from ehc_sn.figures.decoder_montage import DecoderMontageFigure
 from ehc_sn.figures.reconstruction_map import ReconstructionMapFigure
 from ehc_sn.figures.sparsity import SparsityFigure
-from ehc_sn.loss import HomeostaticActivityLoss as SparsityLoss
+from ehc_sn.loss import GramianOrthogonalityLoss as SparsityLoss
 from ehc_sn.metrics import MetricsLogger
 
 
@@ -25,11 +25,11 @@ from ehc_sn.metrics import MetricsLogger
 class Experiment(BaseSettings):
     model_config = SettingsConfigDict(extra="forbid", cli_parse_args=True)
 
-    # Encoder and decoder components
-    dg_size: PositiveInt = Field(default=2000, gt=0, description="Initial units on the pattern separator.")
-    ca3_size: PositiveInt = Field(default=400, gt=0, description="Number of units on the latent code.")
-    ca1_size: PositiveInt = Field(default=5000, gt=0, description="Number of units on the hidden layer.")
-    dg_sparsity: float = Field(default=0.2, ge=0.0, le=1.0, description="Sparsity level for the pattern separator.")
+    # Model architecture parameters
+    latent_size: PositiveInt = Field(default=2000, gt=0, description="Dimensionality of the latent code.")
+    layer2_size: PositiveInt = Field(default=400, gt=0, description="Number of hidden units in layer 2.")
+    layer1_size: PositiveInt = Field(default=5000, gt=0, description="Number of hidden units in layer 1.")
+    sparsity_lambda: float = Field(default=0.50, ge=0.0, le=1.0, description="Weight of the sparsity loss term.")
 
     # Data and augmentation parameters
     mask_ratio: float = Field(default=0.65, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
@@ -111,20 +111,20 @@ class Decoder(nn.Module):
 
 # -------------------------------------------------------------------------------------------
 class Autoencoder(pl.LightningModule):
-    def __init__(self, dg_size: int, dg_sparsity: float, ca3_size: int, ca1_size: int):
+    def __init__(self, latent_size: int, layer2_size: int, layer1_size: int, sparsity_lambda: float):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
 
         # Initialize encoder and decoder with DFA layers
-        self.encoder = Encoder(n_inputs=25**2, n_h1=ca1_size, n_h2=ca3_size)
-        self.latent = DFALayer(ca3_size, dg_size, n_error=25**2)
-        self.decoder = Decoder(dg_size, ca3_size, ca1_size, n_inputs=25**2)
-        self.output = nn.Linear(ca1_size, out_features=25**2)
+        self.encoder = Encoder(n_inputs=25**2, n_h1=layer1_size, n_h2=layer2_size)
+        self.latent = DFALayer(layer2_size, latent_size, n_error=25**2)
+        self.decoder = Decoder(latent_size, n_h2=layer2_size, n_h1=layer1_size, n_inputs=25**2)
+        self.output = nn.Linear(layer1_size, out_features=25**2)
 
         # Loss functions and metrics
-        self.reconstruction_loss = nn.BCELoss(reduction="mean")
-        self.sparsity_loss = SparsityLoss(target_rate=dg_sparsity, min_active=10)
+        self.reconstruction_loss = nn.BCELoss(reduction="none")  # Masked BCE loss
+        self.sparsity_loss = SparsityLoss(center=True)
         self.metrics = MetricsLogger(self)
 
     # -----------------------------------------------------------------------------------
@@ -163,52 +163,57 @@ class Autoencoder(pl.LightningModule):
         return reconstruction, latent
 
     # -----------------------------------------------------------------------------------
-    def feedback(self, first_prediction: Tensor, batch: Tuple[Tensor, Tensor]) -> Tensor:
+    def compute_loss(self, output: Tuple[Tensor, Tensor], batch: Tuple[Tensor, Tensor]) -> Tensor:
+        reconstruction, latent = output
         sensors, targets = batch
-        x_incomplete, mask = sensors[:, 0], sensors[:, 1]
+        mask = sensors[:, 1]  # 1 = visible, 0 = hidden
 
-        # Create completion target for encoder/decoder feedback paths
-        completion = x_incomplete * mask + first_prediction * (1 - mask)
-        error = first_prediction * mask - x_incomplete  # DFA feedback error only on visible pixels
+        # FCMT: Masked Error and BCE using weighted loss (only visible pixels contribute)
+        # Flatten spatial dimensions
+        recon_flat = reconstruction.flatten(start_dim=1)
+        target_flat = targets.flatten(start_dim=1)
+        mask_flat = mask.flatten(start_dim=1)
 
-        # Create targets and contexts for feedback paths
-        decoder_targets = self.encoder(flatten(completion, start_dim=1))
-        latent = self.latent(decoder_targets[-1])  # detached by DFALayer
+        # Normalize by number of visible pixels per sample (FCMT spec)
+        num_visible = mask_flat.sum(dim=1, keepdim=True).clamp(min=1.0)
 
-        # Second pass to update activations and reconstruction
-        reconstruction = self._decode(latent.detach())
+        # Compute normalized masked error for DFA feedback
+        error_per_pixel = (recon_flat - target_flat) * mask_flat / num_visible
 
-        # Train the autoencoder layers with dfa, sparsity, htl and standard loss
-        local_l1 = self.encoder.feedback(flatten(error, start_dim=1))
-        local_l2 = self.decoder.feedback(flatten(error, start_dim=1))
-        local_l3 = self.reconstruction_loss(reconstruction, completion.detach())
-        local_l4 = self.sparsity_loss(latent)
+        # Compute BCE loss only on visible pixels
+        bce_per_pixel = self.reconstruction_loss(recon_flat, target_flat)
+        loss_output = (bce_per_pixel * mask_flat).sum(dim=1) / num_visible.squeeze()
+        loss_output = loss_output.mean()  # Average over batch
 
-        return local_l1 + local_l2 + local_l3 + local_l4
+        # Train the autoencoder layers with DFA, sparsity and latent loss
+        loss_encoder = self.encoder.feedback(error_per_pixel)
+        loss_decoder = self.decoder.feedback(error_per_pixel)
+        loss_latent = self.latent.feedback(error_per_pixel)
+        loss_latent += self.hparams.sparsity_lambda * self.sparsity_loss(latent)
+
+        return loss_output + loss_encoder + loss_decoder + loss_latent
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
-        # First we produce the reconstruction, we ignore the latent obtained from targets
-        with torch.no_grad():
-            first_prediction, first_latent = self(batch)
-
-        # Now we train using feedback connections
         self.optimizers().zero_grad()
-        local_loss = self.feedback(first_prediction, batch)
-        self.manual_backward(local_loss)
+        output = reconstruction, latent = self(batch)
+        global_loss = self.compute_loss(output, batch)
+        self.manual_backward(global_loss)
         self.optimizers().step()
 
         # Log metrics using MetricsLogger
         _, targets = batch
-        self.metrics.log_all_training(first_prediction, first_latent, targets, include_stats=False)
+        self.metrics.log_all_training(reconstruction, latent, targets, include_stats=False)
 
     def validation_step(self, batch: Tensor, batch_idx: int) -> None:
         _, targets = batch
         reconstruction, latent = self(batch)
 
-        # Compute losses and signals for validation
-        loss_rec = self.reconstruction_loss(reconstruction, targets)
-        encoder_signals = self.encoder(flatten(reconstruction, start_dim=1))
+        # Compute validation loss (same masked BCE as training)
+        output = (reconstruction, latent)
+        global_loss = self.compute_loss(output, batch)
+
+        encoder_signals = self.encoder(flatten(targets, start_dim=1))
         decoder_signals = self.decoder(latent)
 
         # Log validation metrics using MetricsLogger
@@ -217,7 +222,7 @@ class Autoencoder(pl.LightningModule):
         self.metrics.log_layer_alignment(decoder_signals[1], encoder_signals[1], layer_idx=2, prefix="val")
 
         # HParams plugin: provide a single comparable metric
-        self.log("hp_metric", loss_rec, on_epoch=True, prog_bar=False)
+        self.log("hp_metric", global_loss, on_epoch=True, prog_bar=False)
 
 
 # -------------------------------------------------------------------------------------------
@@ -255,7 +260,7 @@ def gen_figures(model: Autoencoder, datamodule: BaseDataModule) -> None:
 
 # -------------------------------------------------------------------------------------------
 if __name__ == "__main__":
-    print(f"\n--- Running Data Completion with Feedback Experiment ---")
+    print(f"\n--- Running DFA Full-Context Masked Training (FCMT) Experiment ---")
 
     # Initialize experiment configuration
     experiment = Experiment()
@@ -270,10 +275,10 @@ if __name__ == "__main__":
 
     # Initialize model with specified architecture
     model = Autoencoder(
-        dg_size=experiment.dg_size,
-        dg_sparsity=experiment.dg_sparsity,
-        ca3_size=experiment.ca3_size,
-        ca1_size=experiment.ca1_size,
+        latent_size=experiment.latent_size,
+        layer2_size=experiment.layer2_size,
+        layer1_size=experiment.layer1_size,
+        sparsity_lambda=experiment.sparsity_lambda,
     )
 
     # Initialize trainer
