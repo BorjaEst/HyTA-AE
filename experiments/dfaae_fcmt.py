@@ -174,16 +174,12 @@ class Autoencoder(pl.LightningModule):
         target_flat = targets.flatten(start_dim=1)
         mask_flat = mask.flatten(start_dim=1)
 
-        # Normalize by number of visible pixels per sample (FCMT spec)
-        num_visible = mask_flat.sum(dim=1, keepdim=True).clamp(min=1.0)
-
         # Compute normalized masked error for DFA feedback
-        error_per_pixel = (recon_flat - target_flat) * mask_flat / num_visible
+        error_per_pixel = (recon_flat - target_flat) * mask_flat
 
         # Compute BCE loss only on visible pixels
         bce_per_pixel = self.reconstruction_loss(recon_flat, target_flat)
-        loss_output = (bce_per_pixel * mask_flat).sum(dim=1) / num_visible.squeeze()
-        loss_output = loss_output.mean()  # Average over batch
+        loss_output = (bce_per_pixel * mask_flat).sum(dim=1).mean()  # Average over batch
 
         # Train the autoencoder layers with DFA, sparsity and latent loss
         loss_encoder = self.encoder.feedback(error_per_pixel)

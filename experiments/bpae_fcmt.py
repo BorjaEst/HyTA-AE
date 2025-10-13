@@ -137,18 +137,14 @@ class Autoencoder(pl.LightningModule):
         target_flat = targets.flatten(start_dim=1)
         mask_flat = mask.flatten(start_dim=1)
 
-        # Normalize by number of visible pixels per sample (FCMT spec)
-        num_visible = mask_flat.sum(dim=1, keepdim=True).clamp(min=1.0)
-
         # Compute BCE loss only on visible pixels
         bce_per_pixel = self.reconstruction_loss(recon_flat, target_flat)
-        loss_reconstruction = (bce_per_pixel * mask_flat).sum(dim=1) / num_visible.squeeze()
-        loss_reconstruction = loss_reconstruction.mean()  # Average over batch
+        loss_rec = (bce_per_pixel * mask_flat).sum(dim=1).mean()  # Average over batch
 
         # Sparsity loss on latent
         loss_sparse = self.sparsity_loss(latent)
 
-        return loss_reconstruction + self.hparams.sparsity_lambda * loss_sparse
+        return loss_rec + self.hparams.sparsity_lambda * loss_sparse
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
