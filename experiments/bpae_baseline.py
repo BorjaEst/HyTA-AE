@@ -32,7 +32,7 @@ class Experiment(BaseSettings):
     sparsity_lambda: float = Field(default=0.00, ge=0.0, le=1.0, description="Weight of the sparsity loss term.")
 
     # Data and augmentation parameters
-    mask_ratio: float = Field(default=0.00, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
+    mask_ratio: float = Field(default=0.55, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
     seed: int = Field(default=0, ge=0, description="Random seed for reproducibility")
 
     # Training Settings
@@ -85,7 +85,7 @@ class Autoencoder(pl.LightningModule):
         self.output = nn.Linear(layer1_size, 25**2)
 
         # Loss functions and metrics
-        self.reconstruction_loss = nn.BCELoss(reduction="mean")
+        self.reconstruction_loss = nn.BCELoss(reduction="none")  # Masked BCE loss
         self.sparsity_loss = SparsityLoss(center=True)
         self.metrics = MetricsLogger(self)
 
@@ -120,8 +120,8 @@ class Autoencoder(pl.LightningModule):
         return self._decode(latent)
 
     def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
-        sensors, _targets = batch
-        latent = self._encode(sensors[:, 0])  # Use channel 0 with masked targets
+        _sensors, targets = batch
+        latent = self._encode(targets)  # We use full context for prediction
         reconstruction = self._decode(latent)  # Remove .detach() to allow gradients
         return reconstruction, latent
 
@@ -129,17 +129,22 @@ class Autoencoder(pl.LightningModule):
     def compute_loss(self, output: Tuple[Tensor, Tensor], batch: Tuple[Tensor, Tensor]) -> Tensor:
         reconstruction, latent = output
         sensors, targets = batch
-        x_incomplete, mask = sensors[:, 0], sensors[:, 1]
+        mask = sensors[:, 1]  # 1 = visible, 0 = hidden
 
-        # Create completion target for encoder/decoder feedback paths
-        completion = x_incomplete * mask + reconstruction * (1 - mask)
-        _error = reconstruction * mask - x_incomplete  # DFA feedback error only on visible pixels
+        # FCMT: Masked BCE using weighted loss (only visible pixels contribute)
+        # Flatten spatial dimensions
+        recon_flat = reconstruction.flatten(start_dim=1)
+        target_flat = targets.flatten(start_dim=1)
+        mask_flat = mask.flatten(start_dim=1)
 
-        # Compute losses
-        loss_reconstruction = self.reconstruction_loss(reconstruction, completion.detach())
+        # Compute BCE loss only on visible pixels
+        bce_per_pixel = self.reconstruction_loss(recon_flat, target_flat)
+        loss_rec = (bce_per_pixel * mask_flat).sum(dim=1).mean()  # Average over batch
+
+        # Sparsity loss on latent
         loss_sparse = self.sparsity_loss(latent)
 
-        return loss_reconstruction + self.hparams.sparsity_lambda * loss_sparse
+        return loss_rec + self.hparams.sparsity_lambda * loss_sparse
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
@@ -153,14 +158,15 @@ class Autoencoder(pl.LightningModule):
         _, targets = batch
         self.metrics.log_all_training(reconstruction, latent, targets, include_stats=False)
 
-    # -----------------------------------------------------------------------------------
     def validation_step(self, batch: Tensor, batch_idx: int) -> None:
         _sensors, targets = batch
         reconstruction, latent = self(batch)
 
-        # Compute losses for validation
-        loss_rec = self.reconstruction_loss(reconstruction, targets)
-        encoder_signals = self.encoder(flatten(reconstruction, start_dim=1))
+        # Compute validation loss (same masked BCE as training)
+        output = (reconstruction, latent)
+        global_loss = self.compute_loss(output, batch)
+
+        encoder_signals = self.encoder(flatten(targets, start_dim=1))
         decoder_signals = self.decoder(latent)
 
         # Log validation metrics using MetricsLogger
@@ -169,7 +175,7 @@ class Autoencoder(pl.LightningModule):
         self.metrics.log_layer_alignment(decoder_signals[1], encoder_signals[1], layer_idx=2, prefix="val")
 
         # HParams plugin: provide a single comparable metric
-        self.log("hp_metric", loss_rec, on_epoch=True, prog_bar=False)
+        self.log("hp_metric", global_loss, on_epoch=True, prog_bar=False)
 
 
 # -------------------------------------------------------------------------------------------
