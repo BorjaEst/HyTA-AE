@@ -9,6 +9,7 @@ Available figure types:
 - ReconstructionMapFigure: 2D spatial data reconstruction comparison
 - DecoderMontageFigure: Decoder weight montage showing individual latent unit reconstructions
 - BinaryMapFigure: Binary 2D spatial data visualization
+- MaskedMapFigure: Multi-panel visualization for masked (incomplete) maps
 - SparsityFigure: Neural activation sparsity analysis
 
 Key Features:
@@ -42,6 +43,7 @@ Extension:
 
 from ehc_sn.figures.binary_map import BinaryMapFigure, BinaryMapParams
 from ehc_sn.figures.decoder_montage import DecoderMontageFigure, DecoderMontageParams
+from ehc_sn.figures.masked_map import MaskedMapFigure, MaskedMapParams
 from ehc_sn.figures.reconstruction_1d import ReconstructionTraceFigure, ReconstructionTraceParams
 from ehc_sn.figures.reconstruction_map import ReconstructionMapFigure, ReconstructionMapParams
 from ehc_sn.figures.sparsity import SparsityFigure, SparsityParams
@@ -51,6 +53,8 @@ __all__ = [
     "BinaryMapParams",
     "DecoderMontageFigure",
     "DecoderMontageParams",
+    "MaskedMapFigure",
+    "MaskedMapParams",
     "ReconstructionTraceFigure",
     "ReconstructionTraceParams",
     "ReconstructionMapFigure",
