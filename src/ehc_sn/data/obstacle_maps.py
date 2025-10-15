@@ -1,8 +1,20 @@
-"""2D obstacle map generation using MiniGrid environments.
+"""2D obstacle map generation for spatial navigation and memory tasks.
 
-This module generates binary obstacle maps by extracting walls from MiniGrid environments.
-Maps where 1 represents obstacles/walls and 0 represents free space, providing realistic
-maze-like structures for spatial navigation testing.
+Generates binary obstacle maps by extracting wall patterns from MiniGrid gridworld
+environments, providing realistic maze-like structures for testing spatial reconstruction
+and navigation models.
+
+Data characteristics:
+    - Binary maps: 1 = obstacle/wall, 0 = free space
+    - Optional inversion: 1 = free space, 0 = wall
+    - Deterministic generation via per-sample seeding
+    - Dimensions determined by MiniGrid environment specification
+
+Use cases:
+    - Autoencoder training with spatial occlusion (FCMT)
+    - Pattern separation/completion evaluation
+    - Hippocampal circuit modeling with structured spatial inputs
+    - Compatible with confidence-weighted masked training protocols
 """
 
 from typing import Callable, Optional, Tuple

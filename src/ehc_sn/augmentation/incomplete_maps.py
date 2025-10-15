@@ -1,8 +1,36 @@
-"""Augmentation utilities using torchvision v2 for (incomplete) binary maps.
+"""Full-Context Masked Training (FCMT) augmentation for spatial maps.
 
-- Geometry ops (flip) are applied first.
-- Target is taken as the geometrically transformed map (clean).
-- Corruption (masking) is applied only to the input to create incomplete maps.
+Implements the FCMT protocol where models receive full-context inputs during forward
+passes but supervision (loss computation) is restricted to visible regions indicated
+by binary masks. This isolates the effects of partial supervision from input deprivation.
+
+Pipeline stages:
+    1. Geometry transforms (flips) applied to create spatially augmented targets
+    2. Random rectangular masking generates incomplete inputs via element-wise multiplication
+    3. Optional cyclic shifts prevent border bias in visibility patterns
+
+Output format:
+    - Input sensors: (C+1, H, W) where last channel is the visibility mask
+      * Channels 0:C contain masked map values (x * mask)
+      * Channel C contains mask (1.0=visible, mask_value=occluded)
+    - Target: (C, H, W) clean geometrically-transformed map
+
+Masking semantics (FCMT):
+    - Loss computed ONLY on visible positions (mask==1.0)
+    - Hidden positions (mask==mask_value) provide context but no supervision
+    - Prevents model from learning to overwrite unknown regions
+    - Maintains consistent gradient scales across different mask ratios (no normalization)
+
+Key parameters:
+    - mask_ratio: Fraction of spatial locations to occlude (e.g., 0.75 = 75% hidden)
+    - keep_rects: Number of visible rectangles (union creates irregular patterns)
+    - aspect_min/max: Control shape variability of visible regions
+    - wrap_shift: Random toroidal shift to uniformize pixel inclusion statistics
+
+Theoretical foundation:
+    Adapts masked autoencoding practices (BERT, MAE) to partial supervision setting.
+    Unlike MAE (loss on masked regions), FCMT computes loss on visible regions while
+    maintaining full-context features for pattern completion.
 """
 
 import math  # added

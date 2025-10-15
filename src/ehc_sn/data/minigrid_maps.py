@@ -1,8 +1,20 @@
-"""MiniGrid map generation following standard dataset patterns.
+"""MiniGrid map generation for spatial navigation tasks.
 
-Provides functional map generation compatible with existing datamodule architecture.
-Uses deterministic seeding per sample for reproducible training data.
-Environment ID determines output dimensions naturally.
+Generates 2D binary obstacle maps by extracting wall and goal positions from
+MiniGrid gridworld environments. Maps are generated deterministically using per-sample
+seeding for reproducible training data across runs.
+
+Output format:
+    - Shape: (2, H, W) float32 tensor
+    - Channel 0: walls (1=wall, 0=free space)
+    - Channel 1: goals (1=goal position, 0=other)
+    - Dimensions (H, W) determined by environment specification
+
+Integration:
+    - Compatible with PyTorch Lightning DataModule patterns
+    - Supports optional transforms for augmentation (masking, geometric transforms)
+    - Follows map-style Dataset interface (generates samples on-demand)
+    - No precomputation required (efficient for large datasets)
 """
 
 from typing import Callable, Optional, Tuple
