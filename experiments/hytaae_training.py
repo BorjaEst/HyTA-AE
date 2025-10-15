@@ -32,7 +32,7 @@ class Experiment(BaseSettings):
     dg_sparsity: float = Field(default=0.2, ge=0.0, le=1.0, description="Sparsity level for the pattern separator.")
 
     # Data and augmentation parameters
-    mask_ratio: float = Field(default=0.65, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
+    mask_ratio: float = Field(default=0.00, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
     seed: int = Field(default=0, ge=0, description="Random seed for reproducibility")
 
     # Training Settings

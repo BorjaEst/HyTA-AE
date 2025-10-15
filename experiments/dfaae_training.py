@@ -32,7 +32,7 @@ class Experiment(BaseSettings):
     sparsity_lambda: float = Field(default=0.00, ge=0.0, le=1.0, description="Weight of the sparsity loss term.")
 
     # Data and augmentation parameters
-    mask_ratio: float = Field(default=0.65, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
+    mask_ratio: float = Field(default=0.00, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
     seed: int = Field(default=0, ge=0, description="Random seed for reproducibility")
 
     # Training Settings
