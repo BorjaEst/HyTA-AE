@@ -141,7 +141,7 @@ class Autoencoder(pl.LightningModule):
     def _encode(self, inputs: Tensor) -> Tensor:
         encoder_signals = self.encoder(flatten(inputs, start_dim=1))
         activations = self.latent(encoder_signals[-1])
-        return nn.functional.relu(activations)
+        return activations
 
     @torch.inference_mode()
     def encode(self, sensors: Tensor) -> Tensor:
@@ -174,7 +174,7 @@ class Autoencoder(pl.LightningModule):
         target_flat = targets.flatten(start_dim=1)
         mask_flat = mask.flatten(start_dim=1)
 
-        # Compute normalized masked error for DFA feedback
+        # Compute masked error for DFA feedback
         error_per_pixel = (recon_flat - target_flat) * mask_flat
 
         # Compute BCE loss only on visible pixels
