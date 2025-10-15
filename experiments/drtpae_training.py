@@ -220,7 +220,7 @@ class Autoencoder(pl.LightningModule):
         self.metrics.log_layer_alignment(decoder_signals[1], encoder_signals[1], layer_idx=2, prefix="val")
 
         # HParams plugin: provide a single comparable metric
-        self.log("hp_metric", global_loss on_epoch=True, prog_bar=False)
+        self.log("hp_metric", global_loss, on_epoch=True, prog_bar=False)
 
 
 # -------------------------------------------------------------------------------------------
