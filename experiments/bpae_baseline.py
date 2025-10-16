@@ -119,34 +119,35 @@ class Autoencoder(pl.LightningModule):
     def decode(self, latent: Tensor) -> Tensor:
         return self._decode(latent)
 
-    def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
-        _sensors, targets = batch
-        latent_pre = self._encode(targets)  # We use full context for inference
-        patterns = nn.functional.gelu(self.separator(latent_pre))
-        state = latent_post = nn.functional.gelu(self.attractor(patterns))
-        reconstruction = self._decode(latent_post)
-        return reconstruction, patterns, state
+    def _expand(self, latent: Tensor) -> Tensor:
+        return nn.functional.gelu(self.separator(latent))
 
+    def _compress(self, patterns: Tensor) -> Tensor:
+        return nn.functional.gelu(self.attractor(patterns))
+
+    @torch.inference_mode()
+    def recall(self, latent: Tensor) -> Tensor:
+        patterns = self._expand(latent)
+        return self._compress(patterns)
+
+    # -----------------------------------------------------------------------------------
     def signals(self, batch: Tuple[Tensor, Tensor]) -> List[Tensor]:
-        """
-        Compute all intermediate activations for metrics logging.
-
-        Returns: [h1_enc, h2_enc, patterns, latent_post, h2_dec, reconstruction]
-        """
         _sensors, targets = batch
-        encoder_signals = self.encoder(self.flatten(targets))  # [h1, h2]
-        patterns = nn.functional.gelu(self.separator(encoder_signals[-1]))
-        latent_post = nn.functional.gelu(self.attractor(patterns))
-        decoder_signals = self.decoder(latent_post)  # [reconstruction_flat, h2_dec]
-        reconstruction = self.unflatten(decoder_signals[-1])
+        hidden_pre, latent_pre = self.encoder(self.flatten(targets))
+        patterns = self._expand(latent_pre)
+        latent_post = self._compress(patterns)
+        hidden_post, output = self.decoder(latent_post)
+        reconstruction = self.unflatten(output)
+        return [hidden_pre, latent_pre, patterns, latent_post, hidden_post, reconstruction]
 
-        # Return: [h1_enc, h2_enc, patterns, latent_post, h2_dec, reconstruction]
-        return [encoder_signals[0], encoder_signals[1], patterns, latent_post, decoder_signals[1], reconstruction]
+    def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
+        _, _, patterns, state, _, reconstruction = self.signals(batch)
+        return reconstruction, patterns, state
 
     # -----------------------------------------------------------------------------------
     def compute_loss(self, reconstruction: Tensor, patterns: Tensor, batch: Tuple[Tensor, Tensor]) -> Tensor:
         sensors, targets = batch
-        mask = sensors[:, 1:2]  # Shape (batch, 1, H, W); 1 = visible, 0 = hidden
+        mask = sensors[:, 1]  # Shape (batch, 1, H, W); 1 = visible, 0 = hidden
 
         # FCMT: Masked BCE using weighted loss (only visible pixels contribute)
         recon_flat = reconstruction.flatten(start_dim=1)
@@ -159,8 +160,9 @@ class Autoencoder(pl.LightningModule):
 
         # Sparsity loss on pattern separation layer
         loss_sparse = self.sparsity_loss(patterns)
+        loss_sparse *= self.hparams.sparsity_lambda
 
-        return loss_rec + self.hparams.sparsity_lambda * loss_sparse
+        return loss_rec + loss_sparse
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
@@ -187,7 +189,7 @@ def gen_figures(model: Autoencoder, datamodule: BaseDataModule) -> None:
     batch = next(iter(test_dataloader))
     _, targets = batch
     with torch.inference_mode():
-        reconstruction, patterns, latent_post = model(batch)
+        reconstruction, patterns, _latent = model(batch)
 
     # Figure 1: Reconstruction map comparing inputs and outputs
     fig_reconstruction = ReconstructionMapFigure()
