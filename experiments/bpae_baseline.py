@@ -91,7 +91,7 @@ class Autoencoder(pl.LightningModule):
         # Loss functions and metrics
         self.reconstruction_loss = nn.BCELoss(reduction="none")  # Masked BCE loss
         self.sparsity_loss = SparsityLoss(center=True)
-        self.metrics = MetricsLogger(self)
+        self.metrics = MetricsLogger(self, eps_sparsity=0.02)
 
     def configure_optimizers(self) -> Optimizer:
         optimizer_parameters = [
@@ -128,17 +128,25 @@ class Autoencoder(pl.LightningModule):
         return reconstruction, patterns, state
 
     def signals(self, batch: Tuple[Tensor, Tensor]) -> List[Tensor]:
+        """
+        Compute all intermediate activations for metrics logging.
+
+        Returns: [h1_enc, h2_enc, patterns, latent_post, h2_dec, reconstruction]
+        """
         _sensors, targets = batch
-        encoder_signals = self.encoder(self.flatten(targets))
-        patterns = self.separator(encoder_signals[-1])
-        latent_post = self.attractor(patterns)
-        decoder_signals = self.decoder(latent_post)
-        return [*encoder_signals, patterns, latent_post, *decoder_signals]
+        encoder_signals = self.encoder(self.flatten(targets))  # [h1, h2]
+        patterns = nn.functional.gelu(self.separator(encoder_signals[-1]))
+        latent_post = nn.functional.gelu(self.attractor(patterns))
+        decoder_signals = self.decoder(latent_post)  # [reconstruction_flat, h2_dec]
+        reconstruction = self.unflatten(decoder_signals[0])
+
+        # Return: [h1_enc, h2_enc, patterns, latent_post, h2_dec, reconstruction]
+        return [encoder_signals[0], encoder_signals[1], patterns, latent_post, decoder_signals[1], reconstruction]
 
     # -----------------------------------------------------------------------------------
     def compute_loss(self, reconstruction: Tensor, patterns: Tensor, batch: Tuple[Tensor, Tensor]) -> Tensor:
         sensors, targets = batch
-        mask = sensors[:, 1]  # 1 = visible, 0 = hidden
+        mask = sensors[:, 1:2]  # Shape (batch, 1, H, W); 1 = visible, 0 = hidden
 
         # FCMT: Masked BCE using weighted loss (only visible pixels contribute)
         recon_flat = reconstruction.flatten(start_dim=1)
@@ -157,16 +165,16 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
         self.optimizers().zero_grad()
-        output = self(batch)  # Forward pass to get model outputs
-        global_loss = self.compute_loss(output, batch)
+        output = self(batch)  # Forward pass to get (reconstruction, patterns, state)
+        reconstruction, patterns, state = output
+        global_loss = self.compute_loss(reconstruction, patterns, batch)
         self.manual_backward(global_loss)
         self.optimizers().step()
-        self.metrics.log_training(batch, output, global_loss)
+        self.metrics.log_training(batch, output)
 
     def validation_step(self, batch: Tensor, batch_idx: int) -> None:
-        all_signals = _, _, patterns, _, _, reconstruction = self.signals(batch)
-        global_loss = self.compute_loss(reconstruction, patterns, batch)
-        self.metrics.log_validation(batch, all_signals, global_loss)
+        all_signals = self.signals(batch)  # [h1_enc, h2_enc, patterns, latent_post, h2_dec, reconstruction]
+        self.metrics.log_validation(batch, all_signals)
 
 
 # -------------------------------------------------------------------------------------------
@@ -176,13 +184,14 @@ def gen_figures(model: Autoencoder, datamodule: BaseDataModule) -> None:
     datamodule.setup("test")
     test_dataloader = datamodule.test_dataloader()
 
-    _, targets = batch = next(iter(test_dataloader))
+    batch = next(iter(test_dataloader))
+    _, targets = batch
     with torch.inference_mode():
-        latent_pre, patterns, latent_post, reconstructions = model(batch)
+        reconstruction, patterns, latent_post = model(batch)
 
     # Figure 1: Reconstruction map comparing inputs and outputs
     fig_reconstruction = ReconstructionMapFigure()
-    _ = fig_reconstruction.plot(targets, reconstructions)
+    _ = fig_reconstruction.plot(targets, reconstruction)
     plt.show()
 
     # Figure 2: Sparsity plot showing patterns activations
