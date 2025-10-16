@@ -207,7 +207,7 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
         self.optimizers().zero_grad()
-        output = self(batch)  # Forward pass to get (reconstruction, patterns, state)
+        output = self(batch)  # Forward pass
         reconstruction, patterns, state = output
         global_loss = self.compute_loss(reconstruction, patterns, batch)
         self.manual_backward(global_loss)
@@ -215,7 +215,7 @@ class Autoencoder(pl.LightningModule):
         self.metrics.log_training(batch, output)
 
     def validation_step(self, batch: Tensor, batch_idx: int) -> None:
-        all_signals = self.signals(batch)  # [h1_enc, h2_enc, patterns, latent_post, h2_dec, reconstruction]
+        all_signals = self.signals(batch)
         self.metrics.log_validation(batch, all_signals)
 
 
