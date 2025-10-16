@@ -119,17 +119,24 @@ class Autoencoder(pl.LightningModule):
     def decode(self, latent: Tensor) -> Tensor:
         return self._decode(latent)
 
-    def forward(self, batch: Tuple[Tensor, Tensor]) -> List[Tensor]:
+    def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
         _sensors, targets = batch
         latent_pre = self._encode(targets)  # We use full context for inference
         patterns = nn.functional.gelu(self.separator(latent_pre))
-        latent_post = nn.functional.gelu(self.attractor(patterns))
+        state = latent_post = nn.functional.gelu(self.attractor(patterns))
         reconstruction = self._decode(latent_post)
-        return [latent_pre, patterns, latent_post, reconstruction]
+        return reconstruction, patterns, state
+
+    def signals(self, batch: Tuple[Tensor, Tensor]) -> List[Tensor]:
+        _sensors, targets = batch
+        encoder_signals = self.encoder(self.flatten(targets))
+        patterns = self.separator(encoder_signals[-1])
+        latent_post = self.attractor(patterns)
+        decoder_signals = self.decoder(latent_post)
+        return [*encoder_signals, patterns, latent_post, *decoder_signals]
 
     # -----------------------------------------------------------------------------------
-    def compute_loss(self, output: List[Tensor], batch: Tuple[Tensor, Tensor]) -> Tensor:
-        [latent_pre, patterns, latent_post, reconstruction] = output
+    def compute_loss(self, reconstruction: Tensor, patterns: Tensor, batch: Tuple[Tensor, Tensor]) -> Tensor:
         sensors, targets = batch
         mask = sensors[:, 1]  # 1 = visible, 0 = hidden
 
@@ -150,17 +157,16 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
         self.optimizers().zero_grad()
-        output = latent_pre, patterns, latent_post, reconstruction = self(batch)
+        output = self(batch)  # Forward pass to get model outputs
         global_loss = self.compute_loss(output, batch)
         self.manual_backward(global_loss)
         self.optimizers().step()
-
-        # TODO: Log training metrics using MetricsLogger
+        self.metrics.log_training(batch, output, global_loss)
 
     def validation_step(self, batch: Tensor, batch_idx: int) -> None:
-        _sensors, targets = batch
-
-        # TODO: Implement validation logic and logging
+        all_signals = _, _, patterns, _, _, reconstruction = self.signals(batch)
+        global_loss = self.compute_loss(reconstruction, patterns, batch)
+        self.metrics.log_validation(batch, all_signals, global_loss)
 
 
 # -------------------------------------------------------------------------------------------
