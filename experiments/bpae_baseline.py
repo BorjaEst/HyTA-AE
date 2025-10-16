@@ -8,7 +8,7 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from matplotlib import pyplot as plt
 from pydantic import Field, PositiveInt
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from torch import Tensor, flatten, nn, unflatten
+from torch import Tensor, nn
 from torch.optim import Adam, Optimizer
 
 from ehc_sn.augmentation.incomplete_maps import Augmentation, ComposeParams
@@ -28,7 +28,7 @@ class Experiment(BaseSettings):
     # Model architecture parameters
     separator_dim: PositiveInt = Field(default=2000, gt=0, description="Dimensionality of the separation layer.")
     latent_dim: PositiveInt = Field(default=400, gt=0, description="Number of units for latent representation.")
-    hidden1_dim: PositiveInt = Field(default=5000, gt=0, description="Number of units in the first hidden layer.")
+    hidden_dim: PositiveInt = Field(default=5000, gt=0, description="Number of units in the first hidden layer.")
     sparsity_lambda: float = Field(default=0.00, ge=0.0, le=1.0, description="Weight of the sparsity loss term.")
 
     # Data and augmentation parameters
@@ -68,21 +68,21 @@ class Decoder(nn.Module):
     def forward(self, latent: Tensor) -> List[Tensor]:
         h2 = nn.functional.gelu(self.layer2(latent))
         h1 = nn.functional.sigmoid(self.layer1(h2))
-        return [h1, h2]
+        return [h2, h1]
 
 
 # -------------------------------------------------------------------------------------------
 class Autoencoder(pl.LightningModule):
-    def __init__(self, separator_dim: int, latent_dim: int, hidden1_dim: int, sparsity_lambda: float):
+    def __init__(self, separator_dim: int, latent_dim: int, hidden_dim: int, sparsity_lambda: float):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
 
         # Initialize encoder and decoder
-        self.encoder = Encoder(latent_dim, hidden1_dim, n_inputs=25**2)
+        self.encoder = Encoder(latent_dim, hidden_dim, n_inputs=25**2)
         self.separator = nn.Linear(latent_dim, separator_dim)  # Pattern separation layer
         self.attractor = nn.Linear(separator_dim, latent_dim)  # Future work: Dynamics
-        self.decoder = Decoder(latent_dim, hidden1_dim, n_inputs=25**2)
+        self.decoder = Decoder(latent_dim, hidden_dim, n_inputs=25**2)
 
         # Input and output reshaping layers (25x25 maps)
         self.flatten = nn.Flatten()
@@ -112,7 +112,7 @@ class Autoencoder(pl.LightningModule):
         return self._encode(sensors)
 
     def _decode(self, latent: Tensor) -> Tensor:
-        outputs = self.decoder(latent)[0]
+        outputs = self.decoder(latent)[-1]
         return self.unflatten(outputs)  # Reshape vectors back to 25x25
 
     @torch.inference_mode()
@@ -138,7 +138,7 @@ class Autoencoder(pl.LightningModule):
         patterns = nn.functional.gelu(self.separator(encoder_signals[-1]))
         latent_post = nn.functional.gelu(self.attractor(patterns))
         decoder_signals = self.decoder(latent_post)  # [reconstruction_flat, h2_dec]
-        reconstruction = self.unflatten(decoder_signals[0])
+        reconstruction = self.unflatten(decoder_signals[-1])
 
         # Return: [h1_enc, h2_enc, patterns, latent_post, h2_dec, reconstruction]
         return [encoder_signals[0], encoder_signals[1], patterns, latent_post, decoder_signals[1], reconstruction]
@@ -228,7 +228,7 @@ if __name__ == "__main__":
     model = Autoencoder(
         separator_dim=experiment.separator_dim,
         latent_dim=experiment.latent_dim,
-        hidden1_dim=experiment.hidden1_dim,
+        hidden_dim=experiment.hidden_dim,
         sparsity_lambda=experiment.sparsity_lambda,
     )
 

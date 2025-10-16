@@ -46,9 +46,6 @@ class MetricsLogger:
         reconstruction, patterns, state = output
         sensors, targets = batch
 
-        # Extract mask: sensors[:, 1] is the visibility mask (1 = visible)
-        mask = sensors[:, 1:2] if sensors.shape[1] > 1 else torch.ones_like(targets)
-
         # Reconstruction MSE (full image)
         mse_full = F.mse_loss(reconstruction, targets)
         self.module.log("train/mse_reconstruction", mse_full, on_step=True, on_epoch=True, prog_bar=True)
@@ -85,7 +82,6 @@ class MetricsLogger:
 
         # Extract mask: sensors[:, 1] is the visibility mask (1 = visible, 0 = hidden)
         mask = sensors[:, 1:2] if sensors.shape[1] > 1 else torch.ones_like(targets)
-        hidden_mask = 1 - mask  # Inverse: 0 = visible, 1 = hidden
 
         # -----------------------------------------------------------------------------------
         # Reconstruction metrics
@@ -96,8 +92,8 @@ class MetricsLogger:
         self.module.log("val/mse_reconstruction", mse_full, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
         # Hidden-region MSE (FCMT completion metric)
-        mse_hidden = masked_mse(reconstruction, targets, hidden_mask)
-        self.module.log("val/mse_hidden", mse_hidden, on_step=False, on_epoch=True, sync_dist=True)
+        mse_masked = masked_mse(reconstruction, targets, 1 - mask)
+        self.module.log("val/mse_masked", mse_masked, on_step=False, on_epoch=True, sync_dist=True)
 
         # -----------------------------------------------------------------------------------
         # Pattern separation (DG)
@@ -138,7 +134,7 @@ class MetricsLogger:
         # Compare paired encoder/decoder hidden layers at same depth
         # h1_enc (first encoder layer) <-> h1_dec (first decoder layer)
         cka_h1 = linear_cka(h1_enc, h1_dec)
-        self.module.log("val/align_cka_hdden1", cka_h1, on_step=False, on_epoch=True, sync_dist=True)
+        self.module.log("val/align_cka_hidden", cka_h1, on_step=False, on_epoch=True, sync_dist=True)
 
 
 # -------------------------------------------------------------------------------------------

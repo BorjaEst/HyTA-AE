@@ -3,8 +3,8 @@
 This module scans TensorBoard log directories, reads hyperparameters from
 ``hparams.yaml`` files, extracts scalar metrics per run, and generates
 publication-ready filled contour plots showing how a metric varies as a
-function of two selected hyperparameters (defaults: ``latent_size`` and
-``layer2_size``).
+function of two selected hyperparameters (defaults: ``separator_dim`` and
+``latent_dim``).
 
 One PDF is created per scalar metric tag discovered across runs.
 """
@@ -26,8 +26,8 @@ from ehc_sn.utils.figures import assign_folder_based_colors, configure_matplotli
 # -------------------------------------------------------------------------------------------
 # Constants
 # -------------------------------------------------------------------------------------------
-DEFAULT_X_HPARAM = "latent_size"
-DEFAULT_Y_HPARAM = "layer2_size"
+DEFAULT_X_HPARAM = "separator_dim"
+DEFAULT_Y_HPARAM = "latent_dim"
 
 
 # -------------------------------------------------------------------------------------------
@@ -503,7 +503,7 @@ if __name__ == "__main__":
     Export using minimum value from steps 1000 to 5000 with custom axes::
 
         python -m figures.gen_contour --step_start 1000 --step_end 5000 \
-            --metric_reduction min --hparam_x latent_size --hparam_y layer2_size
+            --metric_reduction min --hparam_x separator_dim --hparam_y latent_dim
 
     """
     cfg = Arguments()
