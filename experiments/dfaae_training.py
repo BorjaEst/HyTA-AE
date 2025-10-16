@@ -47,11 +47,11 @@ class Experiment(BaseSettings):
 
 # -------------------------------------------------------------------------------------------
 class DFALayer(nn.Linear):
-    def __init__(self, n_in: int, n_out: int, n_output: int):
+    def __init__(self, n_in: int, n_out: int, n_targets: int):
         super().__init__(in_features=n_in, out_features=n_out, bias=True)
-        self.output_features = n_output
+        self.target_features = n_targets
         self.register_buffer("activations", None)  # Starts without activation values
-        self.register_buffer("fb_weight", torch.zeros(n_output, self.out_features))
+        self.register_buffer("fb_weight", torch.zeros(n_targets, self.out_features))
         self.reset_feedback()  # Initialize weights properly
 
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
@@ -65,7 +65,7 @@ class DFALayer(nn.Linear):
         return nn.functional.mse_loss(self.activations, target, reduction="mean")
 
     def reset_feedback(self) -> None:
-        inv_limit = math.sqrt(self.output_features)
+        inv_limit = math.sqrt(self.target_features)
         self.fb_weight.bernoulli_(0.5).mul_(2).sub_(1).div_(inv_limit)
 
 
@@ -73,8 +73,8 @@ class DFALayer(nn.Linear):
 class Encoder(nn.Module):
     def __init__(self, n_latent: int, n_h1: int, n_inputs: int):
         super().__init__()
-        self.layer1 = DFALayer(n_inputs, n_h1, n_output=n_inputs)
-        self.layer2 = DFALayer(n_h1, n_latent, n_output=n_inputs)
+        self.layer1 = DFALayer(n_inputs, n_h1, n_targets=n_inputs)
+        self.layer2 = DFALayer(n_h1, n_latent, n_targets=n_inputs)
 
     def forward(self, x: Tensor) -> List[Tensor]:
         h1 = self.layer1(x)
@@ -92,7 +92,7 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, n_latent: int, n_h1: int, n_inputs: int):
         super().__init__()
-        self.layer2 = DFALayer(n_latent, n_h1, n_output=n_inputs)
+        self.layer2 = DFALayer(n_latent, n_h1, n_targets=n_inputs)
         self.layer1 = nn.Linear(n_h1, n_inputs)  # Last layer trained with BP
 
     def forward(self, latent: Tensor) -> List[Tensor]:
@@ -116,8 +116,8 @@ class Autoencoder(pl.LightningModule):
 
         # Initialize encoder and decoder with DFA layers
         self.encoder = Encoder(latent_dim, hidden_dim, n_inputs=25**2)
-        self.separator = DFALayer(latent_dim, separator_dim, n_output=25**2)
-        self.attractor = DFALayer(separator_dim, latent_dim, n_output=25**2)
+        self.separator = DFALayer(latent_dim, separator_dim, n_targets=25**2)
+        self.attractor = DFALayer(separator_dim, latent_dim, n_targets=25**2)
         self.decoder = Decoder(latent_dim, hidden_dim, n_inputs=25**2)
 
         # Input and output reshaping layers (25x25 maps)
