@@ -70,41 +70,50 @@ class DFALayer(nn.Linear):
 
 
 # -------------------------------------------------------------------------------------------
-class Encoder(nn.Module):
-    def __init__(self, n_latent: int, n_h1: int, n_inputs: int):
-        super().__init__()
-        self.layer1 = DFALayer(n_inputs, n_h1, n_targets=n_inputs)
-        self.layer2 = DFALayer(n_h1, n_latent, n_targets=n_inputs)
+class DGLayer(nn.Linear):
+    def __init__(self, n_in: int, n_out: int, target_sparsity: float):
+        super().__init__(in_features=n_in, out_features=n_out, bias=True)
+        self.register_buffer("activations", None)  # Starts without activation values
+        self.sparsity_loss = SparsityLoss(target_sparsity, min_active=int(math.log2(n_out)))
 
-    def forward(self, x: Tensor) -> List[Tensor]:
-        h1 = self.layer1(x)
-        h2 = self.layer2(h1)
-        return [h1, h2]
+    def forward(self, *args: Any, **kwargs: Any) -> Tensor:
+        currents = super().forward(*args, **kwargs)
+        self.activations = torch.tanh(torch.relu(currents))
+        return self.activations.detach()  # enforce locality
 
-    def compute_loss(self, reconstruction: Tensor, targets: Tensor) -> Tensor:
-        reconstruction_err = (reconstruction - targets).detach()
-        loss_l1 = self.layer1.local_loss(reconstruction_err)
-        loss_l2 = self.layer2.local_loss(reconstruction_err)
-        return loss_l1 + loss_l2
+    def local_loss(self) -> Tensor:
+        return self.sparsity_loss(self.activations)
 
 
 # -------------------------------------------------------------------------------------------
-class Decoder(nn.Module):
-    def __init__(self, n_latent: int, n_h1: int, n_inputs: int):
-        super().__init__()
-        self.layer2 = DFALayer(n_latent, n_h1, n_targets=n_inputs)
-        self.layer1 = nn.Linear(n_h1, n_inputs)  # Last layer trained with BP
+class HTALayer(nn.Linear):
+    def __init__(self, n_in: int, n_out: int):
+        super().__init__(in_features=n_in, out_features=n_out, bias=True)
+        self.register_buffer("activations", None)  # Starts without activation values
 
-    def forward(self, latent: Tensor) -> List[Tensor]:
-        h2 = self.layer2(latent)
-        h1 = nn.functional.sigmoid(self.layer1(h2))
-        return [h2, h1]
+    def forward(self, *args: Any, **kwargs: Any) -> Tensor:
+        currents = super().forward(*args, **kwargs)
+        self.activations = torch.tanh(currents)
+        return self.activations.detach()  # enforce locality
 
-    def compute_loss(self, reconstruction: Tensor, targets: Tensor) -> Tensor:
-        reconstruction_err = (reconstruction - targets).detach()
-        loss_l2 = self.layer2.local_loss(reconstruction_err)
-        loss_l1 = nn.functional.binary_cross_entropy(reconstruction, targets, reduction="none")
-        return loss_l2 + loss_l1.sum(dim=1).mean()
+    def local_loss(self, target: Tensor) -> Tensor:
+        return nn.functional.mse_loss(self.activations, target, reduction="mean")
+
+
+# -------------------------------------------------------------------------------------------
+class OUTLayer(nn.Linear):
+    def __init__(self, n_in: int, n_out: int):
+        super().__init__(in_features=n_in, out_features=n_out, bias=True)
+        self.register_buffer("activations", None)  # Starts without activation values
+        self.reconstruction_loss = nn.BCELoss(reduction="none")
+
+    def forward(self, *args: Any, **kwargs: Any) -> Tensor:
+        currents = super().forward(*args, **kwargs)
+        self.activations = torch.sigmoid(currents)
+        return self.activations.detach()  # enforce locality
+
+    def local_loss(self, target: Tensor) -> Tensor:
+        return self.reconstruction_loss(self.activations, target).sum(dim=1).mean()
 
 
 # -------------------------------------------------------------------------------------------
@@ -113,75 +122,64 @@ class Autoencoder(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
+        self.metrics = MetricsLogger(self)
 
         # Initialize encoder and decoder with DFA layers
-        self.encoder = Encoder(ca3_dim, ca1_dim, n_inputs=25**2)
-        self.separator = nn.Linear(ca3_dim, dg_dim)
-        self.attractor = DFALayer(dg_dim, ca3_dim, n_targets=25**2)
-        self.decoder = Decoder(ca3_dim, ca1_dim, n_inputs=25**2)
+        self.encoder_l1 = DFALayer(n_in=25**2, n_out=ca1_dim, n_targets=25**2)
+        self.encoder_l2 = DFALayer(n_in=ca1_dim, n_out=ca3_dim, n_targets=25**2)
+        self.dg = DGLayer(n_in=ca3_dim, n_out=dg_dim, target_sparsity=dg_sparsity)
+        self.ca3 = HTALayer(n_in=dg_dim, n_out=ca3_dim)
+        self.ca1 = HTALayer(n_in=ca3_dim, n_out=ca1_dim)
+        self.output = OUTLayer(n_in=ca1_dim, n_out=25**2)
 
         # Input and output reshaping layers (25x25 maps)
         self.flatten = nn.Flatten()
         self.unflatten = nn.Unflatten(1, (25, 25))
 
-        # Loss functions and metrics
-        self.sparsity_loss = SparsityLoss(target_rate=dg_sparsity, min_active=int(math.log2(dg_dim)))
-        self.metrics = MetricsLogger(self)
-
     # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
         optimizer_parameters = [
-            {"params": self.encoder.parameters(), "lr": 2e-5},
-            {"params": self.separator.parameters(), "lr": 2e-5},
-            {"params": self.attractor.parameters(), "lr": 1e-3},
-            {"params": self.decoder.parameters(), "lr": 1e-3},
+            {"params": self.encoder_l1.parameters(), "lr": 2e-5},
+            {"params": self.encoder_l2.parameters(), "lr": 2e-5},
+            {"params": self.dg.parameters(), "lr": 2e-5},
+            {"params": self.ca3.parameters(), "lr": 1e-3},
+            {"params": self.ca1.parameters(), "lr": 1e-3},
+            {"params": self.output.parameters(), "lr": 1e-3},
         ]
         return Adam(optimizer_parameters)
 
     # -----------------------------------------------------------------------------------
-    def _encode(self, inputs: Tensor) -> Tensor:
-        inputs = self.flatten(inputs)  # Flatten 25x25 maps to vectors
-        return self.encoder(inputs)[-1]
+    def encode(self, inputs: Tensor) -> Tensor:
+        inputs = self.flatten(inputs)
+        hidden = self.encoder_l1(inputs)
+        return self.encoder_l2(hidden)
 
-    @torch.inference_mode()
-    def encode(self, sensors: Tensor) -> Tensor:
-        return self._encode(sensors)
-
-    def _decode(self, latent: Tensor) -> Tensor:
-        outputs = self.decoder(latent)[-1]
-        return self.unflatten(outputs)  # Reshape vectors back to 25x25
-
-    @torch.inference_mode()
     def decode(self, latent: Tensor) -> Tensor:
-        return self._decode(latent)
-
-    def _expand(self, latent: Tensor) -> Tensor:
-        return torch.relu(torch.tanh(self.separator(latent)))  # Enforce non-negativity
-
-    def _compress(self, patterns: Tensor) -> Tensor:
-        return self.attractor(patterns)  # Activation already applied in DFALayer
-
-    @torch.inference_mode()
-    def recall(self, latent: Tensor) -> Tensor:
-        patterns = self._expand(latent)
-        return self._compress(patterns)
+        hidden = self.ca1(latent)
+        outputs = self.output(hidden)
+        return self.unflatten(outputs)
 
     # -----------------------------------------------------------------------------------
+    def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
+        sensors, _targets = batch
+        latent = self.encode(sensors[:, 0])  # Use only the input channel
+        return self.decode(latent), latent
+
     def signals(self, batch: Tuple[Tensor, Tensor]) -> List[Tensor]:
         _sensors, targets = batch
-        hidden_pre, latent_pre = self.encoder(self.flatten(targets))
-        patterns = self._expand(latent_pre)
-        latent_post = self._compress(patterns)
-        hidden_post, output = self.decoder(latent_post)
+        inputs = self.flatten(targets)
+        hidden_pre = self.encoder_l1(inputs)
+        latent_pre = self.encoder_l2(hidden_pre)
+        patterns = self.dg(latent_pre)
+        latent_post = self.ca3(patterns)
+        hidden_post = self.ca1(latent_post)
+        output = self.output(hidden_post)
         reconstruction = self.unflatten(output)
         return [hidden_pre, latent_pre, patterns, latent_post, hidden_post, reconstruction]
 
-    def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
-        _, _, patterns, state, _, reconstruction = self.signals(batch)
-        return reconstruction, patterns, state
-
     # -----------------------------------------------------------------------------------
-    def compute_loss(self, reconstruction: Tensor, patterns: Tensor, batch: Tuple[Tensor, Tensor]) -> Tensor:
+    def compute_loss(self, signals: List[Tensor], batch: Tuple[Tensor, Tensor]) -> Tensor:
+        hidden_pre, latent_pre, _, _, _, reconstruction = signals
         sensors, targets = batch
         mask = sensors[:, 1]  # 1 = visible, 0 = hidden
 
@@ -190,28 +188,32 @@ class Autoencoder(pl.LightningModule):
         recon_flat = reconstruction.flatten(start_dim=1)
         target_flat = targets.flatten(start_dim=1)
         mask_flat = mask.flatten(start_dim=1)
+        completed_flat = recon_flat * (1 - mask_flat) + target_flat * mask_flat
 
         # Compute masked values for DFA feedback
         recon_masked = recon_flat * mask_flat
         target_masked = target_flat * mask_flat
 
-        # Compute losses per module and sum
-        loss_encoder = self.encoder.compute_loss(recon_masked, target_masked)
-        loss_separator = self.sparsity_loss(patterns)
-        loss_attractor = self.attractor.local_loss(recon_masked - target_masked)
-        loss_decoder = self.decoder.compute_loss(recon_masked, target_masked)
+        # Compute local losses for each module
+        losses = [
+            self.encoder_l1.local_loss(recon_masked - target_masked),
+            self.encoder_l2.local_loss(recon_masked - target_masked),
+            self.dg.local_loss(),
+            self.ca3.local_loss(latent_pre),
+            self.ca1.local_loss(hidden_pre),
+            self.output.local_loss(completed_flat),
+        ]
 
-        return loss_encoder + loss_separator + loss_attractor + loss_decoder
+        return sum(losses)  # Total global loss
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
         self.optimizers().zero_grad()
-        output = self(batch)  # Forward pass
-        reconstruction, patterns, state = output
-        global_loss = self.compute_loss(reconstruction, patterns, batch)
+        signals = _, _, patterns, latent, _, reconstruction = self.signals(batch)
+        global_loss = self.compute_loss(signals, batch)
         self.manual_backward(global_loss)
         self.optimizers().step()
-        self.metrics.log_training(batch, output)
+        self.metrics.log_training(batch, [reconstruction, patterns, latent])
 
     def validation_step(self, batch: Tensor, batch_idx: int) -> None:
         all_signals = self.signals(batch)
@@ -226,7 +228,7 @@ def gen_figures(model: Autoencoder, datamodule: BaseDataModule) -> None:
 
     _, targets = batch = next(iter(test_dataloader))
     with torch.inference_mode():
-        reconstruction, patterns, _latent = model(batch)
+        _, _, patterns, _, _, reconstruction = model.signals(batch)
 
     # Figure 1: Reconstruction map comparing inputs and outputs
     fig_reconstruction = ReconstructionMapFigure()
@@ -239,7 +241,7 @@ def gen_figures(model: Autoencoder, datamodule: BaseDataModule) -> None:
     plt.show()
 
     # Probe decoder by activating one latent (CA3) unit at a time
-    latents = torch.eye(model.hparams.ca3_dim)[:18]
+    latents = torch.eye(model.hparams.latent_dim)[:18]
     reconstructions = model.decode(latents)
 
     # Figure 3: Decoder montage showing individual latent unit reconstructions
@@ -250,7 +252,7 @@ def gen_figures(model: Autoencoder, datamodule: BaseDataModule) -> None:
 
 # -------------------------------------------------------------------------------------------
 if __name__ == "__main__":
-    print(f"\n--- Running HyTA Full-Context Masked Training (FCMT) Experiment ---")
+    print(f"\n--- Running DFA Full-Context Masked Training (FCMT) Experiment ---")
 
     # Initialize experiment configuration
     experiment = Experiment()
