@@ -276,7 +276,7 @@ if __name__ == "__main__":
         max_epochs=experiment.max_epochs,
         callbacks=[ModelCheckpoint(every_n_epochs=experiment.checkpoint_freq, save_weights_only=True)],
         logger=TensorBoardLogger(experiment.log_dir, name=experiment.experiment_name),
-        profiler="simple",
+        profiler=None,  # "simple" for basic profiling and "advanced" for detailed profiling
     )
 
     # Train till end of training or keyboard interup
