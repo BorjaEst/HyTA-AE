@@ -17,7 +17,7 @@ from ehc_sn.data.obstacle_maps import DataGenerator, DataParams
 from ehc_sn.figures.decoder_montage import DecoderMontageFigure
 from ehc_sn.figures.reconstruction_map import ReconstructionMapFigure
 from ehc_sn.figures.sparsity import SparsityFigure
-from ehc_sn.loss import GramianOrthogonalityLoss as SparsityLoss
+from ehc_sn.loss import HoyerActivityLoss as SparsityLoss
 from ehc_sn.metrics import MetricsLogger
 
 
@@ -90,7 +90,7 @@ class Autoencoder(pl.LightningModule):
 
         # Loss functions and metrics
         self.reconstruction_loss = nn.BCELoss(reduction="none")  # Masked BCE loss
-        self.sparsity_loss = SparsityLoss(center=True)
+        self.sparsity_loss = SparsityLoss()
         self.metrics = MetricsLogger(self, eps_sparsity=0.02)
 
     def configure_optimizers(self) -> Optimizer:

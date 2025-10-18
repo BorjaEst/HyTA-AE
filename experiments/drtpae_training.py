@@ -8,7 +8,7 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from matplotlib import pyplot as plt
 from pydantic import Field, PositiveInt
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from torch import Tensor, flatten, nn, unflatten
+from torch import Tensor, nn
 from torch.optim import Adam, Optimizer
 
 from ehc_sn.augmentation.incomplete_maps import Augmentation, ComposeParams
@@ -17,7 +17,7 @@ from ehc_sn.data.obstacle_maps import DataGenerator, DataParams
 from ehc_sn.figures.decoder_montage import DecoderMontageFigure
 from ehc_sn.figures.reconstruction_map import ReconstructionMapFigure
 from ehc_sn.figures.sparsity import SparsityFigure
-from ehc_sn.loss import GramianOrthogonalityLoss as SparsityLoss
+from ehc_sn.loss import HoyerActivityLoss as SparsityLoss
 from ehc_sn.metrics import MetricsLogger
 
 
@@ -123,7 +123,7 @@ class Autoencoder(pl.LightningModule):
         self.unflatten = nn.Unflatten(1, (25, 25))
 
         # Loss functions and metrics
-        self.sparsity_loss = SparsityLoss(center=True)
+        self.sparsity_loss = SparsityLoss()
         self.metrics = MetricsLogger(self)
 
     # -----------------------------------------------------------------------------------

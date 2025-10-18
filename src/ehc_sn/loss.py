@@ -10,12 +10,14 @@ Key Features:
     - Gramian orthogonality loss for decorrelated representations
     - Homeostatic activity loss for stable firing rate regulation
     - Target-based L1 sparsity with ReLU thresholding
+    - Hoyer sparsity loss for scale-invariant sparse representations
     - Scale-invariant formulations for stable training across dimensions
 
 Classes:
     GramianOrthogonalityLoss: Promotes orthogonal latent representations
     HomeostaticActivityLoss: Maintains target firing rates with minimum activity
     TargetL1SparsityLoss: Encourages sparse coding with baseline activity tolerance
+    HoyerActivityLoss: Scale-invariant sparsity using L1/L2 ratio
 
 Examples:
     >>> # Create combined loss for autoencoder training
@@ -344,3 +346,118 @@ class TargetL1SparsityLoss(nn.Module):
         # Compute mean absolute activation and apply ReLU threshold
         mean_abs_activation = z.abs().mean()
         return torch.relu(mean_abs_activation - self.target_rate)
+
+
+class HoyerActivityLoss(nn.Module):
+    """Hoyer sparsity loss for scale-invariant sparse representations.
+
+    This loss function promotes sparsity using the Hoyer measure, which is
+    the ratio of L1 norm to L2 norm. Unlike simple L1 regularization, the
+    Hoyer measure is scale-invariant: scaling all activations by a constant
+    does not change the loss value. This prevents the network from "cheating"
+    the sparsity penalty by simply shrinking activations and compensating
+    with larger decoder weights.
+
+    The Hoyer measure is related to the normalized Hoyer sparsity S+ used
+    in the metrics module, but for loss purposes we use the raw L1/L2 ratio
+    which is more directly interpretable and provides stronger gradients.
+
+    Mathematical formulation:
+        L_hoyer = mean_over_batch(||z||_1 / (||z||_2 + eps))
+
+    where z is the activation vector for each sample. Lower values indicate
+    sparser representations (fewer active units or more peaked distributions).
+
+    Scale Invariance:
+        For any scalar a ≠ 0: Hoyer(a·z) = Hoyer(z)
+        This makes the loss robust to weight rescaling between layers and
+        ensures consistent sparsity pressure across different architectures.
+
+    Biological Motivation:
+        Scale-invariant sparsity measures align better with biological
+        neural coding principles, where information is encoded in relative
+        rather than absolute firing rates. This loss encourages representations
+        where few neurons are strongly active (peaked distribution) rather
+        than uniform activity across all neurons.
+
+    Attributes:
+        eps: Small value for numerical stability in L2 norm computation
+            and division. Prevents issues with zero or near-zero activations.
+
+    Examples:
+        >>> # Standard Hoyer loss for scale-invariant sparsity
+        >>> loss_fn = HoyerActivityLoss(eps=1e-8)
+        >>> activations = torch.randn(32, 64).abs()  # (batch_size, features)
+        >>> loss = loss_fn(activations)
+        >>> print(f"Hoyer loss: {loss.item():.4f}")
+
+        >>> # Verify scale invariance
+        >>> scaled_acts = activations * 10.0
+        >>> scaled_loss = loss_fn(scaled_acts)
+        >>> assert torch.allclose(loss, scaled_loss, atol=1e-5)
+    """
+
+    def __init__(self, eps: float = 1e-8):
+        """Initialize Hoyer activity loss.
+
+        Args:
+            eps: Small epsilon value for numerical stability in L2 norm
+                computation and division. Prevents division by zero and
+                instability with near-zero activations. Default: 1e-8.
+        """
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """Compute Hoyer sparsity loss for scale-invariant representations.
+
+        This method calculates the mean Hoyer measure (L1/L2 ratio) across
+        a batch of activations. The Hoyer measure provides scale-invariant
+        sparsity: it only depends on the relative distribution of activations,
+        not their absolute magnitude.
+
+        The computation per sample:
+            hoyer_i = ||z_i||_1 / (||z_i||_2 + eps)
+
+        Then averaged across the batch:
+            L_hoyer = mean(hoyer_i)
+
+        For a vector with n elements:
+        - Minimum (1-sparse): sqrt(n) when only one element is nonzero
+        - Maximum (uniform): 1.0 when all elements have equal magnitude
+
+        The loss encourages distributions closer to the 1-sparse minimum.
+
+        Args:
+            z: Input activations tensor of shape (batch_size, num_features).
+                Should contain non-negative values (e.g., after GELU or ReLU).
+                For signed activations, absolute values are taken internally.
+
+        Returns:
+            Scalar loss tensor promoting sparse, scale-invariant representations.
+            Typical values range from 1.0 (uniform) to sqrt(num_features)
+            (maximally sparse). Lower training loss indicates sparser codes.
+
+        Raises:
+            AssertionError: If input tensor is not 2-dimensional (batch, features).
+
+        Note:
+            This loss works well with unbounded activations (GELU, ReLU) and
+            is compatible with normalization layers. For GELU activations, the
+            loss naturally encourages many units to be driven to near-zero
+            (where GELU ≈ 0) while allowing a few units to be strongly active.
+        """
+        assert z.dim() == 2, "z must be (B, D)"
+
+        # Flatten per sample and work with magnitudes
+        z_flat = z.flatten(start_dim=1).abs()
+
+        # Compute L1 and L2 norms per sample
+        l1_norm = z_flat.sum(dim=1)
+        l2_norm = torch.sqrt((z_flat**2).sum(dim=1) + self.eps)
+
+        # Hoyer ratio per sample: L1 / L2
+        hoyer_per_sample = l1_norm / (l2_norm + self.eps)
+
+        # Return mean across batch
+        return hoyer_per_sample.mean()
