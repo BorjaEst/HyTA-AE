@@ -110,10 +110,10 @@ class OUTLayer(nn.Linear):
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
         currents = super().forward(*args, **kwargs)
         self.activations = torch.sigmoid(currents)
-        return self.activations.detach()  # enforce locality
+        return self.activations
 
     def local_loss(self, target: Tensor) -> Tensor:
-        return self.reconstruction_loss(self.activations, target).sum(dim=1).mean()
+        return self.reconstruction_loss(self.activations, target)
 
 
 # -------------------------------------------------------------------------------------------
@@ -122,7 +122,7 @@ class Autoencoder(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
-        self.metrics = MetricsLogger(self)
+        self.metrics = MetricsLogger(self, eps_sparsity=0.02)
 
         # Initialize encoder and decoder with DFA layers
         self.encoder_l1 = DFALayer(n_in=25**2, n_out=ca1_dim, n_targets=25**2)
@@ -159,23 +159,27 @@ class Autoencoder(pl.LightningModule):
         outputs = self.output(hidden)
         return self.unflatten(outputs)
 
-    # -----------------------------------------------------------------------------------
-    def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
+    def forward(self, batch: Tuple[Tensor, Tensor]) -> Tensor:
         sensors, _targets = batch
         latent = self.encode(sensors[:, 0])  # Use only the input channel
-        return self.decode(latent), latent
+        return self.decode(latent)
 
+    # -----------------------------------------------------------------------------------
     def signals(self, batch: Tuple[Tensor, Tensor]) -> List[Tensor]:
-        _sensors, targets = batch
+        (_sensors, targets), signals = batch, []
         inputs = self.flatten(targets)
-        hidden_pre = self.encoder_l1(inputs)
-        latent_pre = self.encoder_l2(hidden_pre)
-        patterns = self.dg(latent_pre)
-        latent_post = self.ca3(patterns)
-        hidden_post = self.ca1(latent_post)
-        output = self.output(hidden_post)
+
+        signals.append(self.encoder_l1(inputs))  # hidden_pre
+        signals.append(self.encoder_l2(signals[-1]))  # latent_pre
+        signals.append(self.dg(signals[-1]))  # patterns
+        signals.append(self.ca3(signals[-1]))  # latent_post
+        signals.append(self.ca1(signals[-1]))  # hidden_post
+        output = self.output(signals[-1])
+
         reconstruction = self.unflatten(output)
-        return [hidden_pre, latent_pre, patterns, latent_post, hidden_post, reconstruction]
+        signals.append(reconstruction)  # reconstruction
+
+        return signals
 
     # -----------------------------------------------------------------------------------
     def compute_loss(self, signals: List[Tensor], batch: Tuple[Tensor, Tensor]) -> Tensor:
@@ -201,7 +205,7 @@ class Autoencoder(pl.LightningModule):
             self.dg.local_loss(),
             self.ca3.local_loss(latent_pre),
             self.ca1.local_loss(hidden_pre),
-            self.output.local_loss(completed_flat),
+            self.output.local_loss(completed_flat).sum(dim=1).mean(),
         ]
 
         return sum(losses)  # Total global loss
