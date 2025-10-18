@@ -27,9 +27,9 @@ class Experiment(BaseSettings):
 
     # Model architecture parameters
     separator_dim: PositiveInt = Field(default=2000, gt=0, description="Dimensionality of the separation layer.")
+    sparsity_lambda: float = Field(default=0.00, ge=0.0, le=1.0, description="Weight of the sparsity loss term.")
     latent_dim: PositiveInt = Field(default=400, gt=0, description="Number of units for latent representation.")
     hidden_dim: PositiveInt = Field(default=5000, gt=0, description="Number of units in the first hidden layer.")
-    sparsity_lambda: float = Field(default=0.00, ge=0.0, le=1.0, description="Weight of the sparsity loss term.")
 
     # Data and augmentation parameters
     mask_ratio: float = Field(default=0.00, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
@@ -46,133 +46,145 @@ class Experiment(BaseSettings):
 
 
 # -------------------------------------------------------------------------------------------
-class Encoder(nn.Module):
-    def __init__(self, n_latent: int, n_h1: int, n_inputs: int):
-        super().__init__()
-        self.layer1 = nn.Linear(n_inputs, n_h1)
-        self.layer2 = nn.Linear(n_h1, n_latent)
+class BPLayer(nn.Linear):
+    def __init__(self, n_in: int, n_out: int):
+        super().__init__(in_features=n_in, out_features=n_out, bias=True)
+        self.register_buffer("activations", None)  # Starts without activation values
 
-    def forward(self, x: Tensor) -> List[Tensor]:
-        h1 = nn.functional.gelu(self.layer1(x))
-        h2 = nn.functional.gelu(self.layer2(h1))
-        return [h1, h2]
+    def forward(self, *args: Any, **kwargs: Any) -> Tensor:
+        currents = super().forward(*args, **kwargs)
+        self.activations = nn.functional.gelu(currents)
+        return self.activations
 
 
 # -------------------------------------------------------------------------------------------
-class Decoder(nn.Module):
-    def __init__(self, n_latent: int, n_h1: int, n_inputs: int):
-        super().__init__()
-        self.layer2 = nn.Linear(n_latent, n_h1)
-        self.layer1 = nn.Linear(n_h1, n_inputs)
+class DGLayer(nn.Linear):
+    def __init__(self, n_in: int, n_out: int, sparsity_lambda: float):
+        super().__init__(in_features=n_in, out_features=n_out, bias=True)
+        self.register_buffer("activations", None)  # Starts without activation values
+        self.register_buffer("currents", None)  # Starts without current values
+        self.sparsity_loss = SparsityLoss()  # Hoyer sparsity loss
+        self.sparsity_lambda = sparsity_lambda
 
-    def forward(self, latent: Tensor) -> List[Tensor]:
-        h2 = nn.functional.gelu(self.layer2(latent))
-        h1 = nn.functional.sigmoid(self.layer1(h2))
-        return [h2, h1]
+    def forward(self, *args: Any, **kwargs: Any) -> Tensor:
+        self.currents = super().forward(*args, **kwargs)
+        self.activations = nn.functional.gelu(self.currents)
+        return self.activations
+
+    def local_loss(self) -> Tensor:
+        activations = nn.functional.gelu(self.currents.detach())
+        loss = self.sparsity_loss(activations)  # No sparsity on BP path
+        return self.sparsity_lambda * loss
+
+
+# -------------------------------------------------------------------------------------------
+class OUTLayer(nn.Linear):
+    def __init__(self, n_in: int, n_out: int):
+        super().__init__(in_features=n_in, out_features=n_out, bias=True)
+        self.register_buffer("activations", None)  # Starts without activation values
+        self.reconstruction_loss = nn.BCELoss(reduction="none")
+
+    def forward(self, *args: Any, **kwargs: Any) -> Tensor:
+        currents = super().forward(*args, **kwargs)
+        self.activations = torch.sigmoid(currents)
+        return self.activations
+
+    def local_loss(self, target: Tensor) -> Tensor:
+        return self.reconstruction_loss(self.activations, target.detach())
 
 
 # -------------------------------------------------------------------------------------------
 class Autoencoder(pl.LightningModule):
-    def __init__(self, separator_dim: int, latent_dim: int, hidden_dim: int, sparsity_lambda: float):
+    def __init__(self, separator_dim: int, sparsity_lambda: float, latent_dim: int, hidden_dim: int):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
+        self.metrics = MetricsLogger(self, eps_sparsity=0.02)
 
         # Initialize encoder and decoder
-        self.encoder = Encoder(latent_dim, hidden_dim, n_inputs=25**2)
-        self.separator = nn.Linear(latent_dim, separator_dim)  # Pattern separation layer
-        self.attractor = nn.Linear(separator_dim, latent_dim)  # Future work: Dynamics
-        self.decoder = Decoder(latent_dim, hidden_dim, n_inputs=25**2)
+        self.encoder_l1 = BPLayer(25**2, hidden_dim)
+        self.encoder_l2 = BPLayer(hidden_dim, latent_dim)
+        self.separator = DGLayer(latent_dim, separator_dim, sparsity_lambda)
+        self.attractor = BPLayer(separator_dim, latent_dim)
+        self.decoder_l1 = BPLayer(latent_dim, hidden_dim)
+        self.output = OUTLayer(hidden_dim, 25**2)
 
         # Input and output reshaping layers (25x25 maps)
         self.flatten = nn.Flatten()
         self.unflatten = nn.Unflatten(1, (25, 25))
 
-        # Loss functions and metrics
-        self.reconstruction_loss = nn.BCELoss(reduction="none")  # Masked BCE loss
-        self.sparsity_loss = SparsityLoss()
-        self.metrics = MetricsLogger(self, eps_sparsity=0.02)
-
     def configure_optimizers(self) -> Optimizer:
         optimizer_parameters = [
-            {"params": self.encoder.parameters(), "lr": 2e-5},
+            {"params": self.encoder_l1.parameters(), "lr": 2e-5},
+            {"params": self.encoder_l2.parameters(), "lr": 2e-5},
             {"params": self.separator.parameters(), "lr": 2e-5},
             {"params": self.attractor.parameters(), "lr": 1e-3},
-            {"params": self.decoder.parameters(), "lr": 1e-3},
+            {"params": self.decoder_l1.parameters(), "lr": 1e-3},
+            {"params": self.output.parameters(), "lr": 1e-3},
         ]
         return Adam(optimizer_parameters)
 
     # -----------------------------------------------------------------------------------
-    def _encode(self, inputs: Tensor) -> Tensor:
-        inputs = self.flatten(inputs)  # Flatten 25x25 maps to vectors
-        return self.encoder(inputs)[-1]
+    def encode(self, inputs: Tensor) -> Tensor:
+        inputs = self.flatten(inputs)
+        hidden = self.encoder_l1(inputs)
+        return self.encoder_l2(hidden)
 
-    @torch.inference_mode()
-    def encode(self, sensors: Tensor) -> Tensor:
-        return self._encode(sensors)
-
-    def _decode(self, latent: Tensor) -> Tensor:
-        outputs = self.decoder(latent)[-1]
-        return self.unflatten(outputs)  # Reshape vectors back to 25x25
-
-    @torch.inference_mode()
     def decode(self, latent: Tensor) -> Tensor:
-        return self._decode(latent)
+        hidden = self.decoder_l1(latent)
+        output = self.output(hidden)
+        return self.unflatten(output)
 
-    def _expand(self, latent: Tensor) -> Tensor:
-        return nn.functional.gelu(self.separator(latent))
-
-    def _compress(self, patterns: Tensor) -> Tensor:
-        return nn.functional.gelu(self.attractor(patterns))
-
-    @torch.inference_mode()
-    def recall(self, latent: Tensor) -> Tensor:
-        patterns = self._expand(latent)
-        return self._compress(patterns)
+    def forward(self, batch: Tuple[Tensor, Tensor]) -> Tensor:
+        sensors, _targets = batch
+        latent = self.encode(sensors[:, 0])  # Use only the input channel
+        return self.decode(latent)
 
     # -----------------------------------------------------------------------------------
     def signals(self, batch: Tuple[Tensor, Tensor]) -> List[Tensor]:
-        _sensors, targets = batch
-        hidden_pre, latent_pre = self.encoder(self.flatten(targets))
-        patterns = self._expand(latent_pre)
-        latent_post = self._compress(patterns)
-        hidden_post, output = self.decoder(latent_post)
-        reconstruction = self.unflatten(output)
-        return [hidden_pre, latent_pre, patterns, latent_post, hidden_post, reconstruction]
+        (_sensors, targets), signals = batch, []
+        inputs = self.flatten(targets)
 
-    def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
-        _, _, patterns, state, _, reconstruction = self.signals(batch)
-        return reconstruction, patterns, state
+        signals.append(self.encoder_l1(inputs))  # hidden_pre
+        signals.append(self.encoder_l2(signals[-1]))  # latent_pre
+        signals.append(self.separator(signals[-1]))  # patterns
+        signals.append(self.attractor(signals[-1]))  # latent_post
+        signals.append(self.decoder_l1(signals[-1]))  # hidden_post
+        output = self.output(signals[-1])
+
+        reconstruction = self.unflatten(output)
+        signals.append(reconstruction)  # reconstruction
+
+        return signals
 
     # -----------------------------------------------------------------------------------
-    def compute_loss(self, reconstruction: Tensor, patterns: Tensor, batch: Tuple[Tensor, Tensor]) -> Tensor:
-        sensors, targets = batch
-        mask = sensors[:, 1]  # Shape (batch, 1, H, W); 1 = visible, 0 = hidden
+    def compute_loss(self, signals: List[Tensor], batch: Tuple[Tensor, Tensor]) -> Tensor:
+        _, _, _, _, _, reconstruction = signals
+        sensors, _targets = batch
 
         # FCMT: Masked BCE using weighted loss (only visible pixels contribute)
+        # Flatten spatial dimensions
         recon_flat = reconstruction.flatten(start_dim=1)
-        target_flat = targets.flatten(start_dim=1)
-        mask_flat = mask.flatten(start_dim=1)
+        sensors_flat = sensors[:, 0].flatten(start_dim=1)
+        mask_flat = sensors[:, 1].flatten(start_dim=1)
+        completed_flat = sensors_flat + (1 - mask_flat) * recon_flat  # Fill in missing
 
-        # Compute BCE loss only on visible pixels
-        bce_per_pixel = self.reconstruction_loss(recon_flat, target_flat)
-        loss_rec = (bce_per_pixel * mask_flat).sum(dim=1).mean()  # Average over batch
+        # Compute local losses for each module (they backprop)
+        losses = [
+            self.separator.local_loss(),  # This does not backprop to previous layers
+            self.output.local_loss(completed_flat).sum(dim=1).mean(),  # BP
+        ]
 
-        # Sparsity loss on pattern separation layer
-        loss_sparse = self.sparsity_loss(patterns)
-        loss_sparse *= self.hparams.sparsity_lambda
-
-        return loss_rec + loss_sparse
+        return sum(losses)  # Total global loss
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
         self.optimizers().zero_grad()
-        output = self(batch)  # Forward pass to get (reconstruction, patterns, state)
-        reconstruction, patterns, state = output
-        global_loss = self.compute_loss(reconstruction, patterns, batch)
+        signals = _, _, patterns, latent, _, reconstruction = self.signals(batch)
+        global_loss = self.compute_loss(signals, batch)
         self.manual_backward(global_loss)
         self.optimizers().step()
-        self.metrics.log_training(batch, output)
+        self.metrics.log_training(batch, [reconstruction, patterns, latent])
 
     def validation_step(self, batch: Tensor, batch_idx: int) -> None:
         all_signals = self.signals(batch)  # [h1_enc, h2_enc, patterns, latent_post, h2_dec, reconstruction]
@@ -189,7 +201,7 @@ def gen_figures(model: Autoencoder, datamodule: BaseDataModule) -> None:
     batch = next(iter(test_dataloader))
     _, targets = batch
     with torch.inference_mode():
-        reconstruction, patterns, _latent = model(batch)
+        _, _, patterns, _, _, reconstruction = model.signals(batch)
 
     # Figure 1: Reconstruction map comparing inputs and outputs
     fig_reconstruction = ReconstructionMapFigure()
@@ -229,9 +241,9 @@ if __name__ == "__main__":
     # Initialize model with specified architecture
     model = Autoencoder(
         separator_dim=experiment.separator_dim,
+        sparsity_lambda=experiment.sparsity_lambda,
         latent_dim=experiment.latent_dim,
         hidden_dim=experiment.hidden_dim,
-        sparsity_lambda=experiment.sparsity_lambda,
     )
 
     # Initialize trainer
