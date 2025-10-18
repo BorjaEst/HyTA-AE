@@ -113,7 +113,7 @@ class OUTLayer(nn.Linear):
         return self.activations
 
     def local_loss(self, target: Tensor) -> Tensor:
-        return self.reconstruction_loss(self.activations, target)
+        return self.reconstruction_loss(self.activations, target.detach())
 
 
 # -------------------------------------------------------------------------------------------
@@ -184,24 +184,19 @@ class Autoencoder(pl.LightningModule):
     # -----------------------------------------------------------------------------------
     def compute_loss(self, signals: List[Tensor], batch: Tuple[Tensor, Tensor]) -> Tensor:
         hidden_pre, latent_pre, _, _, _, reconstruction = signals
-        sensors, targets = batch
-        mask = sensors[:, 1]  # 1 = visible, 0 = hidden
+        sensors, _targets = batch
 
         # FCMT: Masked Error and BCE using weighted loss (only visible pixels contribute)
         # Flatten spatial dimensions
         recon_flat = reconstruction.flatten(start_dim=1)
-        target_flat = targets.flatten(start_dim=1)
-        mask_flat = mask.flatten(start_dim=1)
-        completed_flat = recon_flat * (1 - mask_flat) + target_flat * mask_flat
-
-        # Compute masked values for DFA feedback
-        recon_masked = recon_flat * mask_flat
-        target_masked = target_flat * mask_flat
+        sensors_flat = sensors[:, 0].flatten(start_dim=1)
+        mask_flat = sensors[:, 1].flatten(start_dim=1)
+        completed_flat = sensors_flat + (1 - mask_flat) * recon_flat  # Fill in missing
 
         # Compute local losses for each module
         losses = [
-            self.encoder_l1.local_loss(recon_masked - target_masked),
-            self.encoder_l2.local_loss(recon_masked - target_masked),
+            self.encoder_l1.local_loss(recon_flat - sensors_flat),
+            self.encoder_l2.local_loss(recon_flat - sensors_flat),
             self.dg.local_loss(),
             self.ca3.local_loss(latent_pre),
             self.ca1.local_loss(hidden_pre),
