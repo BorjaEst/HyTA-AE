@@ -167,7 +167,7 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def compute_loss(self, signals: List[Tensor], batch: Tuple[Tensor, Tensor]) -> Tensor:
-        hidden_pre, latent_pre, _, _, _, reconstruction = signals
+        _, _, _, _, _, reconstruction = signals
         sensors, _targets = batch
 
         # FCMT: Masked BCE using weighted loss (only visible pixels contribute)
@@ -180,11 +180,11 @@ class Autoencoder(pl.LightningModule):
         # Compute local losses for each module
         # We could use parallelization here to speed up, but for clarity we keep it simple
         losses = [
-            self.encoder_l1.local_loss(recon_flat - sensors_flat),
-            self.encoder_l2.local_loss(recon_flat - sensors_flat),
-            self.separator.local_loss(recon_flat - sensors_flat),
-            self.attractor.local_loss(recon_flat - sensors_flat),
-            self.decoder_l1.local_loss(recon_flat - sensors_flat),
+            self.encoder_l1.local_loss(recon_flat - completed_flat),
+            self.encoder_l2.local_loss(recon_flat - completed_flat),
+            self.separator.local_loss(recon_flat - completed_flat),
+            self.attractor.local_loss(recon_flat - completed_flat),
+            self.decoder_l1.local_loss(recon_flat - completed_flat),
             self.output.local_loss(completed_flat).sum(dim=1).mean(),
         ]
 
