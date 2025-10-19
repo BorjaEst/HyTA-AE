@@ -97,7 +97,7 @@ class OUTLayer(nn.Linear):
 
 # -------------------------------------------------------------------------------------------
 class Autoencoder(pl.LightningModule):
-    def __init__(self, separator_dim: int, sparsity_lambda: float, latent_dim: int, hidden_dim: int):
+    def __init__(self, separator_dim: int, sparsity_lambda: float, latent_dim: int, hidden_dim: int, **kwargs):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
@@ -246,6 +246,8 @@ if __name__ == "__main__":
         sparsity_lambda=experiment.sparsity_lambda,
         latent_dim=experiment.latent_dim,
         hidden_dim=experiment.hidden_dim,
+        mask_ratio=experiment.mask_ratio,
+        batch_size=experiment.batch_size,
     )
 
     # Initialize trainer
