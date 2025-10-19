@@ -62,17 +62,19 @@ class DGLayer(nn.Linear):
     def __init__(self, n_in: int, n_out: int, sparsity_lambda: float):
         super().__init__(in_features=n_in, out_features=n_out, bias=True)
         self.register_buffer("activations", None)  # Starts without activation values
-        self.register_buffer("currents", None)  # Starts without current values
+        self.register_buffer("last_input", None)  # Starts without current values
         self.sparsity_loss = SparsityLoss()  # Hoyer sparsity loss
         self.sparsity_lambda = sparsity_lambda
 
-    def forward(self, *args: Any, **kwargs: Any) -> Tensor:
-        self.currents = super().forward(*args, **kwargs)
-        self.activations = nn.functional.gelu(self.currents)
+    def forward(self, input: Tensor) -> Tensor:
+        self.last_input = input  # For local loss computation
+        currents = super().forward(self.last_input)
+        self.activations = nn.functional.gelu(currents)
         return self.activations
 
     def local_loss(self) -> Tensor:
-        activations = nn.functional.gelu(self.currents.detach())
+        currents = super().forward(self.last_input.detach())
+        activations = nn.functional.gelu(currents)
         loss = self.sparsity_loss(activations)  # No sparsity on BP path
         return self.sparsity_lambda * loss
 
