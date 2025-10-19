@@ -196,8 +196,8 @@ class Autoencoder(pl.LightningModule):
         # Compute local losses for each module
         # We could use parallelization here to speed up, but for clarity we keep it simple
         losses = [
-            self.encoder_l1.local_loss(recon_flat - sensors_flat),
-            self.encoder_l2.local_loss(recon_flat - sensors_flat),
+            self.encoder_l1.local_loss(recon_flat - completed_flat),
+            self.encoder_l2.local_loss(recon_flat - completed_flat),
             self.dg.local_loss(),
             self.ca3.local_loss(latent_pre),
             self.ca1.local_loss(hidden_pre),
