@@ -172,6 +172,7 @@ class Autoencoder(pl.LightningModule):
         completed_flat = sensors_flat + (1 - mask_flat) * recon_flat  # Fill in missing
 
         # Compute local losses for each module (they backprop)
+        # BP prevents much gain on speed via parallelization here
         losses = [
             self.separator.local_loss(),  # This does not backprop to previous layers
             self.output.local_loss(completed_flat).sum(dim=1).mean(),  # BP
@@ -246,8 +247,8 @@ if __name__ == "__main__":
         sparsity_lambda=experiment.sparsity_lambda,
         latent_dim=experiment.latent_dim,
         hidden_dim=experiment.hidden_dim,
-        mask_ratio=experiment.mask_ratio,
-        batch_size=experiment.batch_size,
+        mask_ratio=experiment.mask_ratio,  # Logged via kwargs
+        batch_size=experiment.batch_size,  # Logged via kwargs
     )
 
     # Initialize trainer
