@@ -70,150 +70,137 @@ class DRTPLayer(nn.Linear):
 
 
 # -------------------------------------------------------------------------------------------
-class Encoder(nn.Module):
-    def __init__(self, n_latent: int, n_h1: int, n_inputs: int):
-        super().__init__()
-        self.layer1 = DRTPLayer(n_inputs, n_h1, n_targets=n_inputs)
-        self.layer2 = DRTPLayer(n_h1, n_latent, n_targets=n_inputs)
+class DGLayer(DRTPLayer):
+    def __init__(self, n_in: int, n_out: int, n_targets: int, sparsity_lambda: float):
+        super().__init__(n_in, n_out, n_targets)
+        self.sparsity_loss = SparsityLoss()  # Hoyer sparsity loss
+        self.sparsity_lambda = sparsity_lambda
 
-    def forward(self, x: Tensor) -> List[Tensor]:
-        h1 = self.layer1(x)
-        h2 = self.layer2(h1)
-        return [h1, h2]
+    def forward(self, input: Tensor) -> Tensor:
+        return super().forward(input)  # Note that DRTP detaches activations
 
-    def compute_loss(self, reconstruction: Tensor, targets: Tensor) -> Tensor:
-        loss_l1 = self.layer1.local_loss(targets)
-        loss_l2 = self.layer2.local_loss(targets)
-        return loss_l1 + loss_l2
+    def local_loss(self, targets: Tensor) -> Tensor:
+        drtp_loss = super().local_loss(targets)
+        sparsity_loss = self.sparsity_loss(self.activations)
+        return drtp_loss + self.sparsity_lambda * sparsity_loss
 
 
 # -------------------------------------------------------------------------------------------
-class Decoder(nn.Module):
-    def __init__(self, n_latent: int, n_h1: int, n_inputs: int):
-        super().__init__()
-        self.layer2 = DRTPLayer(n_latent, n_h1, n_targets=n_inputs)
-        self.layer1 = nn.Linear(n_h1, n_inputs)  # Last layer trained with BP
+class OUTLayer(nn.Linear):
+    def __init__(self, n_in: int, n_out: int):
+        super().__init__(in_features=n_in, out_features=n_out, bias=True)
+        self.register_buffer("activations", None)  # Starts without activation values
+        self.reconstruction_loss = nn.BCELoss(reduction="none")
 
-    def forward(self, latent: Tensor) -> List[Tensor]:
-        h2 = self.layer2(latent)
-        h1 = nn.functional.sigmoid(self.layer1(h2))
-        return [h2, h1]
+    def forward(self, *args: Any, **kwargs: Any) -> Tensor:
+        currents = super().forward(*args, **kwargs)
+        self.activations = torch.sigmoid(currents)
+        return self.activations
 
-    def compute_loss(self, reconstruction: Tensor, targets: Tensor) -> Tensor:
-        loss_l2 = self.layer2.local_loss(targets)
-        loss_l1 = nn.functional.binary_cross_entropy(reconstruction, targets, reduction="none")
-        return loss_l2 + loss_l1.sum(dim=1).mean()
+    def local_loss(self, target: Tensor) -> Tensor:
+        return self.reconstruction_loss(self.activations, target.detach())
 
 
 # -------------------------------------------------------------------------------------------
 class Autoencoder(pl.LightningModule):
-    def __init__(self, separator_dim: int, latent_dim: int, hidden_dim: int, sparsity_lambda: float):
+    def __init__(self, separator_dim: int, sparsity_lambda: float, latent_dim: int, hidden_dim: int, **kwargs):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
+        self.metrics = MetricsLogger(self, eps_sparsity=0.02)
 
-        # Initialize encoder and decoder with DFA layers
-        self.encoder = Encoder(latent_dim, hidden_dim, n_inputs=25**2)
-        self.separator = DRTPLayer(latent_dim, separator_dim, n_targets=25**2)
+        # Initialize encoder and decoder with DRTP layers
+        self.encoder_l1 = DRTPLayer(25**2, hidden_dim, n_targets=25**2)
+        self.encoder_l2 = DRTPLayer(hidden_dim, latent_dim, n_targets=25**2)
+        self.separator = DGLayer(latent_dim, separator_dim, 25**2, sparsity_lambda)
         self.attractor = DRTPLayer(separator_dim, latent_dim, n_targets=25**2)
-        self.decoder = Decoder(latent_dim, hidden_dim, n_inputs=25**2)
+        self.decoder_l1 = DRTPLayer(latent_dim, hidden_dim, n_targets=25**2)
+        self.output = OUTLayer(hidden_dim, 25**2)
 
         # Input and output reshaping layers (25x25 maps)
         self.flatten = nn.Flatten()
         self.unflatten = nn.Unflatten(1, (25, 25))
 
-        # Loss functions and metrics
-        self.sparsity_loss = SparsityLoss()
-        self.metrics = MetricsLogger(self)
-
-    # -----------------------------------------------------------------------------------
     def configure_optimizers(self) -> Optimizer:
         optimizer_parameters = [
-            {"params": self.encoder.parameters(), "lr": 2e-5},
+            {"params": self.encoder_l1.parameters(), "lr": 2e-5},
+            {"params": self.encoder_l2.parameters(), "lr": 2e-5},
             {"params": self.separator.parameters(), "lr": 2e-5},
             {"params": self.attractor.parameters(), "lr": 1e-3},
-            {"params": self.decoder.parameters(), "lr": 1e-3},
+            {"params": self.decoder_l1.parameters(), "lr": 1e-3},
+            {"params": self.output.parameters(), "lr": 1e-3},
         ]
         return Adam(optimizer_parameters)
 
     # -----------------------------------------------------------------------------------
-    def _encode(self, inputs: Tensor) -> Tensor:
-        inputs = self.flatten(inputs)  # Flatten 25x25 maps to vectors
-        return self.encoder(inputs)[-1]
+    def encode(self, inputs: Tensor) -> Tensor:
+        inputs = self.flatten(inputs)
+        hidden = self.encoder_l1(inputs)
+        return self.encoder_l2(hidden)
 
-    @torch.inference_mode()
-    def encode(self, sensors: Tensor) -> Tensor:
-        return self._encode(sensors)
-
-    def _decode(self, latent: Tensor) -> Tensor:
-        outputs = self.decoder(latent)[-1]
-        return self.unflatten(outputs)  # Reshape vectors back to 25x25
-
-    @torch.inference_mode()
     def decode(self, latent: Tensor) -> Tensor:
-        return self._decode(latent)
+        hidden = self.decoder_l1(latent)
+        output = self.output(hidden)
+        return self.unflatten(output)
 
-    def _expand(self, latent: Tensor) -> Tensor:
-        return self.separator(latent)  # Activation already applied in DFALayer
-
-    def _compress(self, patterns: Tensor) -> Tensor:
-        return self.attractor(patterns)  # Activation already applied in DFALayer
-
-    @torch.inference_mode()
-    def recall(self, latent: Tensor) -> Tensor:
-        patterns = self._expand(latent)
-        return self._compress(patterns)
+    def forward(self, batch: Tuple[Tensor, Tensor]) -> Tensor:
+        sensors, _targets = batch
+        latent = self.encode(sensors[:, 0])  # Use only the input channel
+        return self.decode(latent)
 
     # -----------------------------------------------------------------------------------
     def signals(self, batch: Tuple[Tensor, Tensor]) -> List[Tensor]:
-        _sensors, targets = batch
-        hidden_pre, latent_pre = self.encoder(self.flatten(targets))
-        patterns = self._expand(latent_pre)
-        latent_post = self._compress(patterns)
-        hidden_post, output = self.decoder(latent_post)
-        reconstruction = self.unflatten(output)
-        return [hidden_pre, latent_pre, patterns, latent_post, hidden_post, reconstruction]
+        (_sensors, targets), signals = batch, []
+        inputs = self.flatten(targets)
 
-    def forward(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
-        _, _, patterns, state, _, reconstruction = self.signals(batch)
-        return reconstruction, patterns, state
+        signals.append(self.encoder_l1(inputs))  # hidden_pre
+        signals.append(self.encoder_l2(signals[-1]))  # latent_pre
+        signals.append(self.separator(signals[-1]))  # patterns
+        signals.append(self.attractor(signals[-1]))  # latent_post
+        signals.append(self.decoder_l1(signals[-1]))  # hidden_post
+        output = self.output(signals[-1])
+
+        reconstruction = self.unflatten(output)
+        signals.append(reconstruction)  # reconstruction
+
+        return signals
 
     # -----------------------------------------------------------------------------------
-    def compute_loss(self, reconstruction: Tensor, patterns: Tensor, batch: Tuple[Tensor, Tensor]) -> Tensor:
-        sensors, targets = batch
-        mask = sensors[:, 1]  # 1 = visible, 0 = hidden
+    def compute_loss(self, signals: List[Tensor], batch: Tuple[Tensor, Tensor]) -> Tensor:
+        hidden_pre, latent_pre, _, _, _, reconstruction = signals
+        sensors, _targets = batch
 
-        # FCMT: Masked Error and BCE using weighted loss (only visible pixels contribute)
+        # FCMT: Masked BCE using weighted loss (only visible pixels contribute)
         # Flatten spatial dimensions
         recon_flat = reconstruction.flatten(start_dim=1)
-        target_flat = targets.flatten(start_dim=1)
-        mask_flat = mask.flatten(start_dim=1)
+        sensors_flat = sensors[:, 0].flatten(start_dim=1)
+        mask_flat = sensors[:, 1].flatten(start_dim=1)
+        completed_flat = sensors_flat + (1 - mask_flat) * recon_flat  # Fill in missing
 
-        # Compute masked values for DFA feedback
-        recon_masked = recon_flat * mask_flat
-        target_masked = target_flat * mask_flat
+        # Compute local losses for each module
+        # We could use parallelization here to speed up, but for clarity we keep it simple
+        losses = [
+            self.encoder_l1.local_loss(completed_flat),
+            self.encoder_l2.local_loss(completed_flat),
+            self.separator.local_loss(completed_flat),
+            self.attractor.local_loss(completed_flat),
+            self.decoder_l1.local_loss(completed_flat),
+            self.output.local_loss(completed_flat).sum(dim=1).mean(),
+        ]
 
-        # Compute losses per module and sum
-        loss_encoder = self.encoder.compute_loss(recon_masked, target_masked)
-        loss_separator = self.separator.local_loss(target_masked)
-        loss_separator += self.hparams.sparsity_lambda * self.sparsity_loss(patterns)
-        loss_attractor = self.attractor.local_loss(target_masked)
-        loss_decoder = self.decoder.compute_loss(recon_masked, target_masked)
-
-        return loss_encoder + loss_separator + loss_attractor + loss_decoder
+        return sum(losses)  # Total global loss
 
     # -----------------------------------------------------------------------------------
     def training_step(self, batch: Tensor, batch_idx: int) -> None:
         self.optimizers().zero_grad()
-        output = self(batch)  # Forward pass to get (reconstruction, patterns, state)
-        reconstruction, patterns, state = output
-        global_loss = self.compute_loss(reconstruction, patterns, batch)
+        signals = _, _, patterns, latent, _, reconstruction = self.signals(batch)
+        global_loss = self.compute_loss(signals, batch)
         self.manual_backward(global_loss)
         self.optimizers().step()
-        self.metrics.log_training(batch, output)
+        self.metrics.log_training(batch, [reconstruction, patterns, latent])
 
     def validation_step(self, batch: Tensor, batch_idx: int) -> None:
-        all_signals = self.signals(batch)  # [h1_enc, h2_enc, patterns, latent_post, h2_dec, reconstruction]
+        all_signals = self.signals(batch)
         self.metrics.log_validation(batch, all_signals)
 
 
@@ -225,7 +212,7 @@ def gen_figures(model: Autoencoder, datamodule: BaseDataModule) -> None:
 
     _, targets = batch = next(iter(test_dataloader))
     with torch.inference_mode():
-        reconstruction, patterns, _latent = model(batch)
+        _, _, patterns, _, _, reconstruction = model.signals(batch)
 
     # Figure 1: Reconstruction map comparing inputs and outputs
     fig_reconstruction = ReconstructionMapFigure()
@@ -249,7 +236,7 @@ def gen_figures(model: Autoencoder, datamodule: BaseDataModule) -> None:
 
 # -------------------------------------------------------------------------------------------
 if __name__ == "__main__":
-    print(f"\n--- Running Data Completion with Feedback Experiment ---")
+    print(f"\n--- Running DRTP Full-Context Masked Training (FCMT) Experiment ---")
 
     # Initialize experiment configuration
     experiment = Experiment()
@@ -265,9 +252,11 @@ if __name__ == "__main__":
     # Initialize model with specified architecture
     model = Autoencoder(
         separator_dim=experiment.separator_dim,
+        sparsity_lambda=experiment.sparsity_lambda,
         latent_dim=experiment.latent_dim,
         hidden_dim=experiment.hidden_dim,
-        sparsity_lambda=experiment.sparsity_lambda,
+        mask_ratio=experiment.mask_ratio,  # Logged via kwargs
+        batch_size=experiment.batch_size,  # Logged via kwargs
     )
 
     # Initialize trainer
