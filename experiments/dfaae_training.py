@@ -255,7 +255,7 @@ if __name__ == "__main__":
         sparsity_lambda=experiment.sparsity_lambda,
         latent_dim=experiment.latent_dim,
         hidden_dim=experiment.hidden_dim,
-        mask_ratio=experiment.mask_ratio,  # Logged via kwargs
+        data_ratio=(1.0 - experiment.mask_ratio),  # Logged via kwargs
         batch_size=experiment.batch_size,  # Logged via kwargs
     )
 
