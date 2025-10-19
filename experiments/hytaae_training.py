@@ -118,7 +118,7 @@ class OUTLayer(nn.Linear):
 
 # -------------------------------------------------------------------------------------------
 class Autoencoder(pl.LightningModule):
-    def __init__(self, dg_dim: int, dg_sparsity: float, ca3_dim: int, ca1_dim: int):
+    def __init__(self, dg_dim: int, dg_sparsity: float, ca3_dim: int, ca1_dim: int, **kwargs):
         super().__init__()
         self.save_hyperparameters()
         self.automatic_optimization = False
@@ -194,6 +194,7 @@ class Autoencoder(pl.LightningModule):
         completed_flat = sensors_flat + (1 - mask_flat) * recon_flat  # Fill in missing
 
         # Compute local losses for each module
+        # We could use parallelization here to speed up, but for clarity we keep it simple
         losses = [
             self.encoder_l1.local_loss(recon_flat - sensors_flat),
             self.encoder_l2.local_loss(recon_flat - sensors_flat),
@@ -270,6 +271,8 @@ if __name__ == "__main__":
         dg_sparsity=experiment.dg_sparsity,
         ca3_dim=experiment.ca3_dim,
         ca1_dim=experiment.ca1_dim,
+        mask_ratio=experiment.mask_ratio,  # Logged via kwargs
+        batch_size=experiment.batch_size,  # Logged via kwargs
     )
 
     # Initialize trainer
