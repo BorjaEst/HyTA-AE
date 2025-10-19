@@ -56,7 +56,7 @@ class DFALayer(nn.Linear):
 
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
         currents = super().forward(*args, **kwargs)
-        self.activations = torch.tanh(currents)
+        self.activations = torch.tanh(nn.functional.gelu(currents))
         return self.activations.detach()  # enforce locality
 
     def local_loss(self, error: Tensor) -> Tensor:
@@ -93,7 +93,7 @@ class HTALayer(nn.Linear):
 
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
         currents = super().forward(*args, **kwargs)
-        self.activations = torch.tanh(currents)
+        self.activations = torch.tanh(nn.functional.gelu(currents))
         return self.activations.detach()  # enforce locality
 
     def local_loss(self, target: Tensor) -> Tensor:
