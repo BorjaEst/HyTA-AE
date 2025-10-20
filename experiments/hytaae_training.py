@@ -27,7 +27,7 @@ class Experiment(BaseSettings):
 
     # Model architecture parameters
     dg_dim: PositiveInt = Field(default=2000, gt=0, description="Dimensionality of the separation layer.")
-    dg_sparsity: float = Field(default=0.05, ge=0.0, le=1.0, description="Sparsity target for pattern separator.")
+    dg_sparsity: float = Field(default=0.20, ge=0.0, le=1.0, description="Sparsity target for pattern separator.")
     ca3_dim: PositiveInt = Field(default=400, gt=0, description="Number of units for latent representation.")
     ca1_dim: PositiveInt = Field(default=5000, gt=0, description="Number of units in the first hidden layer.")
 
@@ -96,8 +96,10 @@ class HTALayer(nn.Linear):
         self.activations = torch.tanh(nn.functional.gelu(currents))
         return self.activations.detach()  # enforce locality
 
-    def local_loss(self, target: Tensor) -> Tensor:
-        return nn.functional.mse_loss(self.activations, target, reduction="mean")
+    def local_loss(self, target: Tensor, context: Tensor) -> Tensor:
+        output = super().forward(context)
+        output = torch.tanh(nn.functional.gelu(output))
+        return nn.functional.mse_loss(output, target, reduction="mean")
 
 
 # -------------------------------------------------------------------------------------------
@@ -183,7 +185,7 @@ class Autoencoder(pl.LightningModule):
 
     # -----------------------------------------------------------------------------------
     def compute_loss(self, signals: List[Tensor], batch: Tuple[Tensor, Tensor]) -> Tensor:
-        hidden_pre, latent_pre, _, _, _, reconstruction = signals
+        hidden_pre, latent_pre, patterns, _, _, reconstruction = signals
         sensors, _targets = batch
 
         # FCMT: Masked Error and BCE using weighted loss (only visible pixels contribute)
@@ -199,8 +201,8 @@ class Autoencoder(pl.LightningModule):
             self.encoder_l1.local_loss(recon_flat - completed_flat),
             self.encoder_l2.local_loss(recon_flat - completed_flat),
             self.dg.local_loss(),
-            self.ca3.local_loss(latent_pre),
-            self.ca1.local_loss(hidden_pre),
+            self.ca3.local_loss(latent_pre, patterns),
+            self.ca1.local_loss(hidden_pre, latent_pre),
             self.output.local_loss(completed_flat).sum(dim=1).mean(),
         ]
 
