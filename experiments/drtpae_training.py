@@ -27,9 +27,9 @@ class Experiment(BaseSettings):
 
     # Model architecture parameters
     separator_dim: PositiveInt = Field(default=2000, gt=0, description="Dimensionality of the separation layer.")
+    sparsity_lambda: float = Field(default=0.00, ge=0.0, le=1.0, description="Weight of the sparsity loss term.")
     latent_dim: PositiveInt = Field(default=400, gt=0, description="Number of units for latent representation.")
     hidden_dim: PositiveInt = Field(default=5000, gt=0, description="Number of units in the first hidden layer.")
-    sparsity_lambda: float = Field(default=0.00, ge=0.0, le=1.0, description="Weight of the sparsity loss term.")
 
     # Data and augmentation parameters
     mask_ratio: float = Field(default=0.00, ge=0.0, le=1.0, description="Fraction of spatial locations to mask")
