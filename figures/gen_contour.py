@@ -308,6 +308,15 @@ def _plot_contour_for_metric(
         print(f"[gen_contour] insufficient points for tricontourf: {len(Z)} for tag={tag}", file=sys.stderr)
         return
 
+    # Validate that points are not collinear (required for Delaunay triangulation)
+    if len(np.unique(X)) < 2 or len(np.unique(Y)) < 2:
+        print(
+            f"[gen_contour] collinear points detected for tag={tag}: "
+            f"unique_x={len(np.unique(X))}, unique_y={len(np.unique(Y))}",
+            file=sys.stderr,
+        )
+        return
+
     # Determine color limits
     # Use user-defined limits if provided, otherwise let matplotlib auto-scale
     vmin = float(cfg.vmin) if cfg.vmin is not None else None
