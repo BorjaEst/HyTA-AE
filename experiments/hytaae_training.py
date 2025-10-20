@@ -241,7 +241,7 @@ def gen_figures(model: Autoencoder, datamodule: BaseDataModule) -> None:
     plt.show()
 
     # Probe decoder by activating one latent (CA3) unit at a time
-    latents = torch.eye(model.hparams.latent_dim)[:18]
+    latents = torch.eye(model.hparams.ca3_dim)[:18]
     reconstructions = model.decode(latents)
 
     # Figure 3: Decoder montage showing individual latent unit reconstructions
