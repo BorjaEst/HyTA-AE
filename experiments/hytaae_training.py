@@ -74,7 +74,7 @@ class DGLayer(nn.Linear):
     def __init__(self, n_in: int, n_out: int, target_sparsity: float):
         super().__init__(in_features=n_in, out_features=n_out, bias=True)
         self.register_buffer("activations", None)  # Starts without activation values
-        self.sparsity_loss = SparsityLoss(target_sparsity, min_active=int(math.log2(n_out)))
+        self.sparsity_loss = SparsityLoss(target_sparsity, min_active=0)
 
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
         currents = super().forward(*args, **kwargs)
