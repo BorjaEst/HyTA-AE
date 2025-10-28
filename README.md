@@ -106,16 +106,6 @@ python figures/gen_contour.py
 python figures/gen_heatmap.py
 ```
 
-## LaTeX build (paper and supplement)
-
-Compile the supplement first to generate the AUX file used by the main document’s cross-references, then compile the main paper:
-
-```bash
-cd article
-latexmk -pdf -interaction=nonstopmode suplemental/supplemental.tex
-latexmk -pdf -interaction=nonstopmode main.tex
-```
-
 ## License
 
 This project is licensed under the GNU GPLv3 (see `LICENSE`).
