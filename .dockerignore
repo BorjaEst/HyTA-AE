@@ -1,0 +1,35 @@
+# VCS and local env
+.git/
+.gitignore
+.venv/
+
+# Python caches
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# Logs and checkpoints
+logs/
+logs_backup_*/
+**/*.ckpt
+
+# Large generated figures and PDFs
+figures/*/*.pdf
+figures/*/*.png
+
+# LaTeX build artifacts
+article/*.aux
+article/*.bbl
+article/*.blg
+article/*.fdb_latexmk
+article/*.fls
+article/*.log
+article/*.out
+article/main.aux
+article/main.bbl
+article/main.blg
+article/main.fdb_latexmk
+article/main.fls
+
+# Byte-compiled metadata
+*.egg-info/
